@@ -106,11 +106,60 @@ def _grayscale(t):
     return [v, v, v]
 
 
+# ── GOES IR4 (true ABI Band 13 standard enhancement) ────────────────────────
+# Sourced from satpy's (pytroll/satpy, the standard open-source ABI/AHI
+# processing library) `colorized_ir_clouds` enhancement in
+# satpy/etc/enhancements/generic.yaml: greyscale from 253.15-303.15K
+# (-20C to +30C), colorized 193.15-253.15K (-80C to -20C) using the
+# ColorBrewer "Spectral" 11-class diverging palette (colorbrewer2.org),
+# coldest=dark red -> warmest-of-band=purple. This is the closest publicly
+# documented match to the "color IR" enhancement used on NOAA/STAR's GOES
+# Image Viewer and most public satellite loops, rather than an in-house
+# approximation like the other LUTs in this module.
+_SPECTRAL_11 = [
+    (158, 1, 66),     # coldest: dark red    #9e0142
+    (213, 62, 79),    #          red         #d53e4f
+    (244, 109, 67),   #          orange-red  #f46d43
+    (253, 174, 97),   #          orange      #fdae61
+    (254, 224, 139),  #          pale orange #fee08b
+    (255, 255, 191),  #          pale yellow #ffffbf
+    (230, 245, 152),  #          yellow-green#e6f598
+    (171, 221, 164),  #          light green #abdda4
+    (102, 194, 165),  #          teal        #66c2a5
+    (50, 136, 189),   #          blue        #3288bd
+    (94, 79, 162),    # warmest-of-band: purple #5e4fa2
+]
+_IR4_GREY_MIN_K = 253.15   # -20C — boundary between greyscale and color band
+_IR4_GREY_MAX_K = 303.15   # +30C — warmest, clipped to black
+_IR4_COLOR_MIN_K = 193.15  # -80C — coldest, clipped to dark red
+
+
+def _spectral_interp(frac):
+    frac = min(1.0, max(0.0, frac))
+    pos = frac * (len(_SPECTRAL_11) - 1)
+    i0 = int(math.floor(pos))
+    i1 = min(i0 + 1, len(_SPECTRAL_11) - 1)
+    t = pos - i0
+    c0, c1 = _SPECTRAL_11[i0], _SPECTRAL_11[i1]
+    return [int(round(c0[k] + (c1[k] - c0[k]) * t)) for k in range(3)]
+
+
+def _goes_ir4(t):
+    if t >= _IR4_GREY_MAX_K:
+        return [0, 0, 0]
+    if t >= _IR4_GREY_MIN_K:
+        v = _lerp(t, _IR4_GREY_MIN_K, _IR4_GREY_MAX_K, 255, 0)
+        return [v, v, v]
+    frac = (t - _IR4_COLOR_MIN_K) / (_IR4_GREY_MIN_K - _IR4_COLOR_MIN_K)
+    return _spectral_interp(frac)
+
+
 LUTS = {
     "bd": _build_lut(_bd),
     "enhanced": _build_lut(_enhanced),
     "nrl": _build_lut(_nrl),
     "grayscale": _build_lut(_grayscale),
+    "ir4": _build_lut(_goes_ir4),
 }
 
 
@@ -255,6 +304,52 @@ def ensure_downloaded(resolved: ResolvedScan, nc_cache_dir: Path) -> Path:
     return local_path
 
 
+# ── Bounding-box requests ───────────────────────────────────────────────────
+# Native ground sample distance for the "2km" ABI bands this service handles.
+# Used as the default (highest-fidelity) render resolution for a bbox request,
+# and as the floor for the `resolution_km` coarsening param.
+NATIVE_GSD_KM = {9: 2.0, 13: 2.0}
+
+KM_PER_DEG_LAT = 111.32
+MIN_BBOX_WIDTH_KM = 10.0
+MAX_BBOX_WIDTH_KM = 8000.0
+MIN_OUT_SIZE = 64
+MAX_OUT_SIZE = 4096
+# Sparse grid for the cheap "locate" pass before cropping to native resolution.
+# 160x160 = 25,600 points vs. ~4.6M for the old full-disk coarse pass — this
+# is what actually makes a bbox request faster to *process* than a full-disk
+# one (the S3 download itself is unchanged; see README "Known limitations").
+LOCATE_GRID = 160
+
+
+@dataclass
+class BBoxRequest:
+    center_lat: float
+    center_lon: float
+    width_km: float
+    resolution_km: float
+
+
+def resolve_bbox_request(
+    center_lat: float, center_lon: float, width_km: float, resolution_km: float | None, band: int
+) -> BBoxRequest:
+    """Validate and clamp a bbox request's parameters."""
+    if not (-90.0 <= center_lat <= 90.0):
+        raise ValueError(f"center latitude {center_lat} out of range [-90, 90]")
+    if not (-180.0 <= center_lon <= 180.0):
+        raise ValueError(f"center longitude {center_lon} out of range [-180, 180]")
+    width_km = float(np.clip(width_km, MIN_BBOX_WIDTH_KM, MAX_BBOX_WIDTH_KM))
+
+    native = NATIVE_GSD_KM.get(band, 2.0)
+    if resolution_km is None:
+        resolution_km = native
+    else:
+        # Can't resolve finer than the sensor's native pixel size.
+        resolution_km = max(float(resolution_km), native)
+
+    return BBoxRequest(center_lat=center_lat, center_lon=center_lon, width_km=width_km, resolution_km=resolution_km)
+
+
 # ── Core render ──────────────────────────────────────────────────────────
 def fill_gaps(data: np.ndarray, iterations: int = 6) -> np.ndarray:
     """Fill NaN holes via nearest-neighbor expansion (4-directional, N passes)."""
@@ -267,15 +362,25 @@ def fill_gaps(data: np.ndarray, iterations: int = 6) -> np.ndarray:
     return result
 
 
-def render_to_png(
-    nc_path: Path,
-    cmap_name: str,
-    out_png: Path,
-    out_size: int = 2048,
-    downsample_step: int | None = None,
-) -> dict:
-    """Read GOES ABI L2 CMI NetCDF, reproject to EPSG:4326, apply the color
-    LUT, save a georeferenced RGBA PNG. Returns bounds/metadata."""
+def _colorize(output: np.ndarray, cmap_name: str, out_png: Path) -> None:
+    lut = LUTS.get(cmap_name, LUTS["bd"])
+    idx = _t2i(output)
+    good = np.isfinite(output)
+
+    out_size = output.shape[0]
+    rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
+    rgba[good, 0] = lut[idx[good], 0]
+    rgba[good, 1] = lut[idx[good], 1]
+    rgba[good, 2] = lut[idx[good], 2]
+    rgba[good, 3] = 220
+    rgba[~good, 3] = 0
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgba, "RGBA").save(str(out_png), optimize=False)
+    log.info("Saved PNG: %s", out_png)
+
+
+def _read_source(nc_path: Path):
     import netCDF4 as nc4
 
     log.info("Reading %s", nc_path)
@@ -284,7 +389,6 @@ def render_to_png(
         cmi_raw = ds.variables["CMI"][:]
         x_rad = ds.variables["x"][:]
         y_rad = ds.variables["y"][:]
-
         proj = ds.variables["goes_imager_projection"]
         sat_lon = float(proj.longitude_of_projection_origin)
         h = float(proj.perspective_point_height)
@@ -292,6 +396,19 @@ def render_to_png(
         r_pol = float(proj.semi_minor_axis)
     finally:
         ds.close()
+    return cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol
+
+
+def render_to_png(
+    nc_path: Path,
+    cmap_name: str,
+    out_png: Path,
+    out_size: int = 2048,
+    downsample_step: int | None = None,
+) -> dict:
+    """Read GOES ABI L2 CMI NetCDF, reproject the full disk to EPSG:4326,
+    apply the color LUT, save a georeferenced RGBA PNG. Returns bounds/metadata."""
+    cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol = _read_source(nc_path)
 
     ny, nx = cmi_raw.shape
     if downsample_step is None:
@@ -329,32 +446,109 @@ def render_to_png(
     log.info("Painted %d / %d source pixels", int(valid.sum()), int(valid.size))
 
     output = fill_gaps(output, iterations=6)
-
-    lut = LUTS.get(cmap_name, LUTS["bd"])
-    idx = _t2i(output)
-    good = np.isfinite(output)
-
-    rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
-    rgba[good, 0] = lut[idx[good], 0]
-    rgba[good, 1] = lut[idx[good], 1]
-    rgba[good, 2] = lut[idx[good], 2]
-    rgba[good, 3] = 220
-    rgba[~good, 3] = 0
-
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(rgba, "RGBA").save(str(out_png), optimize=False)
-    log.info("Saved PNG: %s", out_png)
+    _colorize(output, cmap_name, out_png)
 
     return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
 
 
-def render_and_store(resolved: ResolvedScan, cmap_name: str, key: str, nc_cache_dir: Path, cache) -> None:
+def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, bbox: BBoxRequest) -> dict:
+    """Like render_to_png, but crops to a center+width bounding box and
+    renders at (up to) the sensor's native resolution instead of the full
+    disk. Two passes: a cheap sparse "locate" pass finds which slice of the
+    source array covers the requested area, then a fine pass reprojects only
+    that crop — avoiding the full-disk reprojection cost for a small area."""
+    cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol = _read_source(nc_path)
+    ny, nx = cmi_raw.shape
+
+    half_km = bbox.width_km / 2.0
+    lat_half_deg = half_km / KM_PER_DEG_LAT
+    lon_half_deg = half_km / (KM_PER_DEG_LAT * max(0.01, math.cos(math.radians(bbox.center_lat))))
+    lat_S, lat_N = bbox.center_lat - lat_half_deg, bbox.center_lat + lat_half_deg
+    lon_W, lon_E = bbox.center_lon - lon_half_deg, bbox.center_lon + lon_half_deg
+
+    # ---- Pass 1: sparse locate ----
+    step_y = max(1, ny // LOCATE_GRID)
+    step_x = max(1, nx // LOCATE_GRID)
+    XXs, YYs = np.meshgrid(x_rad[::step_x], y_rad[::step_y])
+    LONs, LATs = abi_to_latlon(XXs, YYs, sat_lon, h, r_eq, r_pol)
+
+    mask = (
+        np.isfinite(LONs) & np.isfinite(LATs)
+        & (LONs >= lon_W) & (LONs <= lon_E)
+        & (LATs >= lat_S) & (LATs <= lat_N)
+    )
+    if not mask.any():
+        raise ValueError(
+            f"Requested area ({lat_S:.2f},{lon_W:.2f})-({lat_N:.2f},{lon_E:.2f}) "
+            "is outside this scan's visible disk"
+        )
+
+    rows_sparse, cols_sparse = np.where(mask)
+    pad_y, pad_x = step_y * 2, step_x * 2
+    row_lo = max(0, rows_sparse.min() * step_y - pad_y)
+    row_hi = min(ny, (rows_sparse.max() + 1) * step_y + pad_y)
+    col_lo = max(0, cols_sparse.min() * step_x - pad_x)
+    col_hi = min(nx, (cols_sparse.max() + 1) * step_x + pad_x)
+
+    # ---- Pass 2: fine crop at native (or coarsened) resolution ----
+    gsd_km = NATIVE_GSD_KM.get(band, 2.0)
+    fine_step = max(1, round(bbox.resolution_km / gsd_km))
+
+    x_crop = x_rad[col_lo:col_hi:fine_step]
+    y_crop = y_rad[row_lo:row_hi:fine_step]
+    cmi_slice = cmi_raw[row_lo:row_hi:fine_step, col_lo:col_hi:fine_step]
+    if isinstance(cmi_raw, np.ma.MaskedArray):
+        cmi_crop = cmi_slice.filled(np.nan).astype(np.float32)
+    else:
+        cmi_crop = cmi_slice.astype(np.float32)
+
+    log.info(
+        "BBox crop %dx%d native px (rows %d:%d, cols %d:%d, step=%d) for %.0fkm box @ %.1fkm/px",
+        cmi_crop.shape[0], cmi_crop.shape[1], row_lo, row_hi, col_lo, col_hi, fine_step,
+        bbox.width_km, bbox.resolution_km,
+    )
+
+    XX, YY = np.meshgrid(x_crop, y_crop)
+    LON, LAT = abi_to_latlon(XX, YY, sat_lon, h, r_eq, r_pol)
+
+    out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
+
+    output = np.full((out_size, out_size), np.nan, dtype=np.float32)
+    col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
+    row = ((lat_N - LAT) / (lat_N - lat_S) * out_size).astype(np.int32)
+    valid = (
+        np.isfinite(LON) & np.isfinite(LAT) & np.isfinite(cmi_crop)
+        & (col >= 0) & (col < out_size) & (row >= 0) & (row < out_size)
+    )
+    if not valid.any():
+        raise ValueError("Requested area has no valid data in this scan (off-disk or no-data)")
+    output[row[valid], col[valid]] = cmi_crop[valid]
+    log.info("Painted %d / %d source pixels into %dx%d output", int(valid.sum()), int(valid.size), out_size, out_size)
+
+    output = fill_gaps(output, iterations=6)
+    _colorize(output, cmap_name, out_png)
+
+    return {
+        "bounds": [[lat_S, lon_W], [lat_N, lon_E]],
+        "sat_lon": round(sat_lon, 1),
+        "resolution_km": bbox.resolution_km,
+        "out_size": out_size,
+    }
+
+
+def render_and_store(
+    resolved: ResolvedScan, cmap_name: str, key: str, nc_cache_dir: Path, cache, bbox: BBoxRequest | None = None
+) -> None:
     """Entry point for a FastAPI BackgroundTask: download (if needed),
     render, and write the result into the shared ResultCache."""
     try:
         nc_path = ensure_downloaded(resolved, nc_cache_dir)
         out_png = cache.output_path(key, "png")
-        render_meta = render_to_png(nc_path, cmap_name, out_png)
+        if bbox is None:
+            render_meta = render_to_png(nc_path, cmap_name, out_png)
+        else:
+            render_meta = render_bbox_to_png(nc_path, resolved.band, cmap_name, out_png, bbox)
+
         meta = {
             "status": "ready",
             "key": key,
@@ -366,6 +560,10 @@ def render_and_store(resolved: ResolvedScan, cmap_name: str, key: str, nc_cache_
             "sat_lon": render_meta["sat_lon"],
             "scan_start": resolved.scan_start.isoformat(),
         }
+        if bbox is not None:
+            meta["center"] = [bbox.center_lat, bbox.center_lon]
+            meta["width_km"] = bbox.width_km
+            meta["resolution_km"] = render_meta["resolution_km"]
         cache.write_result(key, meta)
     except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
         log.exception("GOES render failed for key=%s", key)

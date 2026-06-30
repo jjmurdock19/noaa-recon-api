@@ -15,3 +15,6 @@ class TileStatus(BaseModel):
     scan_start: Optional[str] = None
     elapsed: Optional[int] = None
     message: Optional[str] = None
+    center: Optional[list[float]] = None
+    width_km: Optional[float] = None
+    resolution_km: Optional[float] = None
