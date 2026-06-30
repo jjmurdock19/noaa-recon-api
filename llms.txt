@@ -1,0 +1,43 @@
+# noaa-recon-api
+
+> Open-source HTTP API serving archival GOES satellite imagery and NOAA Tail
+> Doppler Radar (TDR) data as georeferenced map tiles, plus a raw-netCDF
+> passthrough for client-side rendering. CORS-open, no auth, free to call
+> from any web app.
+
+Live base URL: https://joshmurdock.net/api
+Local dev base URL: http://127.0.0.1:8000
+OpenAPI schema (machine-readable, authoritative): {base}/openapi.json
+Interactive docs: {base}/docs
+
+## Live endpoints
+
+- GET /v1/health: Liveness check. Returns {"status":"ok"}.
+- GET /v1/satellite/tile?time=ISO8601Z&band=13|9&cmap=bd|enhanced|nrl|grayscale: Requests a georeferenced GOES IR/WV PNG tile for the nearest actual satellite scan to an arbitrary UTC timestamp (~10-min resolution). Async: first call returns {"status":"generating","key":...}; poll the status endpoint below until ready. Full param/response reference: API.md#get-v1satellitetile
+- GET /v1/satellite/status/{key}: Poll for a tile job's result. Returns status ready|generating|error|idle, and on ready: png_url (relative — prefix with the base URL), bounds (Leaflet-format [[lat_s,lon_w],[lat_n,lon_e]]), band, cmap, satellite, scan_start.
+- GET /demo/netcdf-three/: Static demo page rendering netCDF data client-side via Three.js/WebGL (netcdf-three library). Currently loads sample data only.
+
+## Planned endpoints (return 501 today, shape documented for forward compatibility)
+
+- GET /v1/tdr/missions, GET /v1/tdr/sweep: Tail Doppler Radar data from NOAA's raw aircraft archive. Not yet implemented — see API.md and app/services/tdr.py for the planned design.
+- GET /v1/raw/netcdf: Server-side netCDF subsetting by center/dimensions for client-side rendering. Not yet implemented — see API.md and app/routers/raw.py.
+- GET /v1/satellite/tile with band=2 (visible) or a geocolor product: Not yet accepted — only band=13 (Clean IR) and band=9 (Water Vapor) work today.
+
+## Full documentation
+
+- [API.md](API.md): Complete endpoint reference, response shapes, color table descriptions, and copy-pasteable integration examples in curl, JavaScript (Leaflet), and Python.
+- [README.md](README.md): Setup, architecture, deployment, and contributor/agent notes (roadmap, conventions to keep, a documented reprojection bug already found and fixed).
+
+## Integration quick-start (JavaScript)
+
+```javascript
+const data = await fetch('https://joshmurdock.net/api/v1/satellite/tile?time=' + new Date().toISOString() + '&band=13').then(r => r.json());
+// poll https://joshmurdock.net/api/v1/satellite/status/{data.key} every ~3s until status is "ready",
+// then: L.imageOverlay('https://joshmurdock.net/api' + data.png_url, data.bounds).addTo(map);
+```
+
+## Notes
+
+- No auth, no API key, no enforced rate limit. Avoid polling status faster than every 3s.
+- Identical requests (same band/cmap/satellite/resolved-scan-time) hit a server-side cache — cheap to repeat.
+- License: MIT.

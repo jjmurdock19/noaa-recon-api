@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.paths import CACHE_ROOT, REPO_ROOT
@@ -35,3 +36,9 @@ app.include_router(health.router, prefix="/v1")
 app.include_router(satellite.router, prefix="/v1")
 app.include_router(tdr.router, prefix="/v1")
 app.include_router(raw.router, prefix="/v1")
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse, tags=["docs"])
+async def llms_txt():
+    """Agent-discovery summary per the llms.txt convention (https://llmstxt.org/)."""
+    return (REPO_ROOT / "llms.txt").read_text()

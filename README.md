@@ -2,13 +2,94 @@
 
 Open-source API for archival GOES satellite imagery (Band 13 IR, Band 2
 visible, GeoColor) and NOAA Tail Doppler Radar (TDR) data, with a raw-netCDF
-passthrough for client-side rendering. Built for [the hurricanes tracker
-site](https://github.com/) but designed to be consumed by any website.
+passthrough for client-side rendering. Built for a hurricane tracker site
+but designed to be called from any website — CORS-open, no auth, no API key.
 
 **Status:** MVP. `GET /v1/satellite/tile` (GOES Band 13/9 IR/WV archive) is
 fully implemented and verified against live NOAA data. Band 2/GeoColor, TDR,
 and the raw-netCDF passthrough are stubbed (`501 Not Implemented`) pending
 follow-up phases — see "Roadmap" below.
+
+**📖 Full endpoint reference + integration examples (curl/JS/Python): [API.md](API.md)**
+**🤖 Agent-readable summary: [llms.txt](llms.txt)** (also served live at `{base}/llms.txt`)
+
+---
+
+## What it produces
+
+A `GET /v1/satellite/tile` request for an arbitrary UTC timestamp resolves
+the nearest real GOES scan, downloads it from NOAA S3, reprojects ABI Fixed
+Grid → EPSG:4326, and renders a georeferenced PNG — this is real output from
+the live API (GOES-19, Band 13, BD color table):
+
+![Example GOES Band 13 IR output, BD color table](docs/assets/example-band13-bd.jpg)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        A[Hurricane tracker site<br/>js/api-explorer.js]
+        B[Any other website]
+        C[netcdf-three demo<br/>browser WebGL]
+    end
+
+    subgraph "noaa-recon-api (FastAPI)"
+        D["/v1/satellite/tile<br/>/v1/satellite/status"]
+        E["/v1/tdr/* (planned)"]
+        F["/v1/raw/netcdf (planned)"]
+        G[ResultCache<br/>lock-file + TTL]
+        H[app/services/goes.py<br/>ABI reprojection + LUTs]
+    end
+
+    I[(NOAA S3<br/>noaa-goes16/19)]
+    J[(NOAA TDR archive<br/>seb.omao.noaa.gov, planned)]
+
+    A & B -->|HTTP, CORS open| D
+    C -.->|planned| F
+    D --> G
+    G --> H
+    H -->|public bucket, no auth| I
+    E -.-> J
+```
+
+## Request flow (satellite tile)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as noaa-recon-api
+    participant S3 as NOAA S3
+
+    Client->>API: GET /v1/satellite/tile?time=...&band=13
+    API->>API: resolve_nearest() — find closest scan to `time`
+    alt cache hit
+        API-->>Client: {status: "ready", png_url, bounds, ...}
+    else cache miss
+        API-->>Client: {status: "generating", key}
+        API->>S3: download ABI-L2-CMIPF netCDF (~25MB)
+        API->>API: reproject + colorize + render PNG
+        loop poll every ~3s
+            Client->>API: GET /v1/satellite/status/{key}
+            API-->>Client: {status: "generating", elapsed} or {status: "ready", ...}
+        end
+    end
+    Client->>API: GET {png_url}
+    API-->>Client: image/png (georeferenced tile)
+```
+
+---
+
+## Try the live API right now
+
+No setup needed — it's already deployed:
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13&cmap=bd"
+```
+
+See [API.md](API.md) for the full reference and curl/JavaScript/Python
+integration examples.
 
 ---
 
@@ -51,6 +132,9 @@ docker compose up --build
 
 ### Deploying on this host (joshmurdock.net)
 
+*Already done — this is documented for reference / redeploying after a host
+rebuild. The live API is at `https://joshmurdock.net/api`.*
+
 1. `python3 -m venv .venv && pip install -e .` as above.
 2. Copy `deploy/noaa-recon-api.service` to `/etc/systemd/system/`, then
    `systemctl daemon-reload && systemctl enable --now noaa-recon-api.service`.
@@ -91,8 +175,9 @@ without re-deriving the architecture.
 
 ```
 app/
-  main.py            FastAPI app, CORS (open — this API is meant for other sites too), router includes, /cache static mount
-  paths.py            CACHE_ROOT = <repo>/cache
+  main.py            FastAPI app, CORS (open — this API is meant for other sites too), router includes,
+                      /cache + /demo/netcdf-three static mounts, GET /llms.txt
+  paths.py            CACHE_ROOT = <repo>/cache, REPO_ROOT
   models.py            Pydantic response schemas
   routers/
     satellite.py       GET /v1/satellite/tile, GET /v1/satellite/status/{key}  — IMPLEMENTED
@@ -109,7 +194,12 @@ app/
     tdr.py              Empty stub — see its docstring for the planned crawler/parse/render shape.
 clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" above)
 deploy/                       nginx snippet + systemd unit for this host
+docs/assets/                  README example image(s)
 tests/test_satellite.py       Offline math/parsing tests + one network-gated e2e test
+API.md                        Full human+agent endpoint reference, kept in sync with routers/ by hand —
+                               if you add/change an endpoint, update this file and llms.txt in the same change.
+llms.txt                      Terse agent-discovery summary (llmstxt.org convention); also served live at
+                               GET /llms.txt (app/main.py) — keep both in sync with reality, not aspiration.
 ```
 
 ### A real bug already found and fixed here
