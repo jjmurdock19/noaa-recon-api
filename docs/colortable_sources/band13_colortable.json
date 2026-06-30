@@ -1,0 +1,54 @@
+[
+  {
+    "temperature": 57,
+    "hex": "#000000"
+  },
+  {
+    "temperature": 31,
+    "hex": "#333333"
+  },
+  {
+    "temperature": 6,
+    "hex": "#666666"
+  },
+  {
+    "temperature": -20,
+    "hex": "#999999"
+  },
+  {
+    "temperature": -31,
+    "hex": "#CCCCCC"
+  },
+  {
+    "temperature": -32,
+    "hex": "#00FFFF"
+  },
+  {
+    "temperature": -40,
+    "hex": "#000080"
+  },
+  {
+    "temperature": -50,
+    "hex": "#00FF00"
+  },
+  {
+    "temperature": -59,
+    "hex": "#ADFF2F"
+  },
+  {
+    "temperature": -65,
+    "hex": "#FF4500"
+  },
+  {
+    "temperature": -75,
+    "hex": "#330000"
+  },
+  {
+    "temperature": -80,
+    "hex": "#000000"
+  },
+  {
+    "temperature": -110,
+    "hex": "#FFFFFF"
+  }
+]
