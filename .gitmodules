@@ -1,0 +1,3 @@
+[submodule "clients/netcdf-three-demo/vendor/netcdf-three"]
+	path = clients/netcdf-three-demo/vendor/netcdf-three
+	url = https://github.com/umrlastig/netcdf-three.git
