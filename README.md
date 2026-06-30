@@ -210,9 +210,9 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
                                GET /llms.txt (app/main.py) — keep both in sync with reality, not aspiration.
 ```
 
-### A real bug already found and fixed here
+### Real bugs already found and fixed here
 
-The original `goes_tile.py` (and by extension this port, before the fix) had
+1. The original `goes_tile.py` (and by extension this port, before the fix) had
 `Sx` defined with the wrong sign in `abi_to_latlon()`, which silently rotates
 every computed longitude by 180° — `lat` is unaffected (it only depends on
 `Sx**2`) so it's easy to miss, but it makes the renderer paint ~0% of pixels
@@ -224,6 +224,21 @@ this was not yet fixed there as of this writing; flag it to a human before
 touching that file, since it's in active production use.
 `tests/test_satellite.py::test_abi_to_latlon_subsatellite_point_is_origin`
 guards against a regression.
+
+2. `abi13`/`abi9` were originally built through the same shared 256-bucket
+LUT system (`_build_lut`/`_t2i`/`_i2t`) as the other colortables, which
+quantizes the full temperature range into ~0.6°C steps. That's fine for
+smooth gradients, but `abi13`'s source data has a deliberate 1°C-wide hard
+cut (cyan@-32°C → light grey@-31°C) which quantization smeared into a
+muddy blended color that doesn't exist in the source palette, and the LUT's
+fixed -113..+42°C window clamped `abi13`'s warm end (needs up to +57°C)
+before it ever reached true black. Fixed by evaluating `abi13`/`abi9`
+exactly, per-pixel, via `_apply_stops_exact()` (vectorized `np.interp`)
+instead of routing them through the shared LUT — see the comment above
+`LUTS` in `app/services/goes.py`. `tests/test_satellite.py::test_apply_stops_exact_matches_direct_function_with_no_quantization`
+guards against a regression. **If you add another colortable with a sharp
+transition or a range outside ~-113..+42°C, add it to `STOPS_BY_CMAP`
+instead of `LUTS`, not the other way around.**
 
 ### Roadmap (not yet implemented)
 

@@ -32,6 +32,7 @@ generates them from the route definitions):**
 | `GET /v1/health` | 🟢 Live |
 | `GET /v1/satellite/tile` (GOES Band 13 / 9) | 🟢 Live |
 | `GET /v1/satellite/status/{key}` | 🟢 Live |
+| `GET /v1/satellite/colortable` | 🟢 Live |
 | `GET /v1/satellite/tile` (Band 2 / GeoColor) | 🟡 Planned |
 | `GET /v1/tdr/missions` | 🟡 Planned |
 | `GET /v1/tdr/sweep` | 🟡 Planned |
@@ -190,6 +191,50 @@ curl https://joshmurdock.net/api/v1/satellite/status/goes_13_bd_16_20240928T1156
 | `idle` | Unknown key (never requested, or cache expired) |
 
 Suggested poll interval: 3–5s.
+
+---
+
+## `GET /v1/satellite/colortable` 🟢
+
+Returns the exact color stops for a colortable, so a client can render a
+legend that's **guaranteed to match** what `/tile` actually produces — it
+reads the same `STOPS_BY_CMAP`/`LUTS` data the renderer uses, not a
+hardcoded copy that could drift out of sync.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `cmap` | string | `default` | Same values as `/tile`'s `cmap`. |
+| `band` | int | `13` | Only used to resolve `cmap=default`. |
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
+```
+
+```json
+{
+  "cmap": "abi13",
+  "unit": "C",
+  "exact": true,
+  "stops": [
+    {"temp_c": -110, "hex": "#FFFFFF"},
+    {"temp_c": -80, "hex": "#000000"},
+    {"temp_c": -75, "hex": "#330000"},
+    ...
+    {"temp_c": 57, "hex": "#000000"}
+  ]
+}
+```
+
+- `exact: true` for `abi13`/`abi9` — every stop is the literal source data
+  (see "A real bug already found and fixed here" below). `exact: false`
+  for the other (LUT-based) colortables, where `stops` is a representative
+  16-point sample rather than every value.
+- To render a CSS gradient legend: sort `stops` ascending by `temp_c`
+  (already sorted), map each to a percentage position
+  `(temp_c - min) / (max - min) * 100`, and build
+  `linear-gradient(to right, hex1 pct1%, hex2 pct2%, ...)`. This is
+  exactly what the hurricanes site's `js/api-explorer.js` does (see
+  `_renderLegend()`).
 
 ---
 

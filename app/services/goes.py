@@ -229,8 +229,15 @@ LUTS = {
     "nrl": _build_lut(_nrl),
     "grayscale": _build_lut(_grayscale),
     "ir4": _build_lut(_goes_ir4),
-    "abi13": _build_lut(_abi13),
-    "abi9": _build_lut(_abi9),
+    # abi13/abi9 are intentionally NOT routed through the shared 256-bucket
+    # LUT above (_build_lut quantizes the full 160-315K range into 256
+    # steps, ~0.6C/step) — their source data has a deliberate 1C-wide hard
+    # cut (Band 13: cyan@-32C -> light grey@-31C) that quantization smears
+    # into a muddy blended color, and a range (Band 13 needs up to +57C)
+    # wider than the shared LUT's 160-315K (-113..+42C) window, clamping
+    # the warm end before it reaches true black. See STOPS_BY_CMAP /
+    # _colorize_exact below — these are evaluated exactly, per-pixel,
+    # directly from _ABI13_STOPS/_ABI9_STOPS instead.
 }
 
 # cmap="default" resolves to one of these based on the requested band, since
@@ -238,6 +245,10 @@ LUTS = {
 # enhancement conventions — there's no single "default" LUT independent of
 # which physical quantity is being displayed.
 DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9"}
+
+# Colortables evaluated exactly (vectorized, full float precision) rather
+# than through the shared quantized LUT — see comment above LUTS.
+STOPS_BY_CMAP = {"abi13": _ABI13_STOPS, "abi9": _ABI9_STOPS}
 
 
 # ── ABI Fixed Grid → geographic lat/lon (PUG Volume 5, Section 4.2) ─────────
@@ -466,16 +477,36 @@ def _smooth(output: np.ndarray, passes: int = 1) -> np.ndarray:
     return result
 
 
-def _colorize(output: np.ndarray, cmap_name: str, out_png: Path) -> None:
-    lut = LUTS.get(cmap_name, LUTS["bd"])
-    idx = _t2i(output)
-    good = np.isfinite(output)
+def _apply_stops_exact(output_k: np.ndarray, stops: list) -> np.ndarray:
+    """Vectorized, full-float-precision version of _interp_stops applied to
+    a whole array at once — exact colors, no LUT-quantization smearing.
+    `stops` ascending (temp_C, (r,g,b)); `output_k` in Kelvin."""
+    output_c = output_k - 273.15
+    temps = np.array([s[0] for s in stops], dtype=np.float64)
+    rgb = np.array([s[1] for s in stops], dtype=np.float64)
+    out = np.empty(output_c.shape + (3,), dtype=np.float64)
+    for ch in range(3):
+        out[..., ch] = np.interp(output_c, temps, rgb[:, ch])
+    return out
 
+
+def _colorize(output: np.ndarray, cmap_name: str, out_png: Path) -> None:
+    good = np.isfinite(output)
     out_size = output.shape[0]
     rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
-    rgba[good, 0] = lut[idx[good], 0]
-    rgba[good, 1] = lut[idx[good], 1]
-    rgba[good, 2] = lut[idx[good], 2]
+
+    if cmap_name in STOPS_BY_CMAP:
+        rgb = _apply_stops_exact(output, STOPS_BY_CMAP[cmap_name])
+        rgba[good, 0] = rgb[good, 0]
+        rgba[good, 1] = rgb[good, 1]
+        rgba[good, 2] = rgb[good, 2]
+    else:
+        lut = LUTS.get(cmap_name, LUTS["bd"])
+        idx = _t2i(output)
+        rgba[good, 0] = lut[idx[good], 0]
+        rgba[good, 1] = lut[idx[good], 1]
+        rgba[good, 2] = lut[idx[good], 2]
+
     rgba[good, 3] = 220
     rgba[~good, 3] = 0
 
