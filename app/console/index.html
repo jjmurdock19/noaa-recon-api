@@ -249,6 +249,14 @@
 </main>
 
 <script>
+// This page is served at the API's effective root, but that root isn't
+// always "/" — in production nginx proxies /api/ -> this app's "/", so the
+// browser's actual document path is "/api/". A literal absolute path like
+// fetch('/v1/...') resolves against the DOMAIN root, not this page's
+// directory, and silently hits the wrong (non-proxied) URL. Compute the
+// real base from the page's own location instead of hardcoding either case.
+const API_BASE = window.location.pathname.replace(/\/$/, '');
+
 const $ = (id) => document.getElementById(id);
 let prefetchPollTimer = null;
 
@@ -261,7 +269,7 @@ function fmtBytes(n) {
 }
 
 async function api(path, opts) {
-    const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts));
+    const res = await fetch(API_BASE + path, Object.assign({ credentials: 'same-origin' }, opts));
     if (res.status === 401) { showLogin(); throw new Error('not authenticated'); }
     return res;
 }
@@ -281,7 +289,7 @@ function showApp() {
 }
 
 async function checkAuth() {
-    const res = await fetch('/v1/admin/whoami', { credentials: 'same-origin' });
+    const res = await fetch(API_BASE + '/v1/admin/whoami', { credentials: 'same-origin' });
     const data = await res.json();
     if (data.authenticated) showApp(); else showLogin();
 }
@@ -292,7 +300,7 @@ document.getElementById('login-btn').addEventListener('click', async () => {
     const errEl = document.getElementById('login-error');
     errEl.textContent = '';
     try {
-        const res = await fetch('/v1/admin/login', {
+        const res = await fetch(API_BASE + '/v1/admin/login', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password }),
@@ -308,7 +316,7 @@ document.getElementById('login-pass').addEventListener('keydown', (e) => {
 });
 
 document.getElementById('logout-btn').addEventListener('click', async () => {
-    await fetch('/v1/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    await fetch(API_BASE + '/v1/admin/logout', { method: 'POST', credentials: 'same-origin' });
     showLogin();
 });
 
@@ -426,17 +434,17 @@ async function loadQuery() {
     document.getElementById('query-result').innerHTML = '';
 
     try {
-        let data = await fetch(`/v1/satellite/tile?${new URLSearchParams(params)}`, { credentials: 'same-origin' }).then(r => r.json());
+        let data = await fetch(`${API_BASE}/v1/satellite/tile?${new URLSearchParams(params)}`, { credentials: 'same-origin' }).then(r => r.json());
         while (data.status === 'generating') {
             await new Promise(r => setTimeout(r, 3000));
-            data = await fetch(`/v1/satellite/status/${data.key}`, { credentials: 'same-origin' }).then(r => r.json());
+            data = await fetch(`${API_BASE}/v1/satellite/status/${data.key}`, { credentials: 'same-origin' }).then(r => r.json());
             setQStatus(`Processing… ${data.elapsed || 0}s elapsed.`, 'working');
         }
         if (data.status !== 'ready') {
             setQStatus('Error: ' + (data.message || 'unknown'), 'err');
         } else {
             setQStatus(`✓ ${data.satellite} Band ${data.band} (${data.cmap}) — scan ${(data.scan_start || '').slice(0, 16)}Z`, 'ok');
-            document.getElementById('query-result').innerHTML = `<img src="${data.png_url}" alt="rendered tile" />`;
+            document.getElementById('query-result').innerHTML = `<img src="${API_BASE + data.png_url}" alt="rendered tile" />`;
             refreshSatelliteCache(); refreshStatus();
         }
     } catch (e) {
