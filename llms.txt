@@ -17,6 +17,7 @@ Interactive docs: {base}/docs
 - GET /v1/satellite/status/{key}: Poll for a tile job's result. Returns status ready|generating|error|idle, and on ready: png_url (relative — prefix with the base URL), bounds (Leaflet-format [[lat_s,lon_w],[lat_n,lon_e]]), band, cmap, satellite, scan_start, and (for a bbox request) center, width_km, resolution_km.
 - GET /v1/satellite/colortable?cmap=default&band=13|9: Returns the exact color stops ({temp_c, hex}) for a colortable, read from the same data the renderer uses (not a hardcoded copy) — use this to render a legend that's guaranteed to match the actual tile output.
 - GET /demo/netcdf-three/: Static demo page rendering netCDF data client-side via Three.js/WebGL (netcdf-three library). Currently loads sample data only.
+- GET / and /v1/admin/*: Login-gated admin console (cache stats/browsing/deletion, one-off queries, bulk timeframe prefetch). Not for general agent use — requires session login (POST /v1/admin/login). See API.md "Admin console" section if you're operating this deployment, not just consuming it.
 
 ## Planned endpoints (return 501 today, shape documented for forward compatibility)
 

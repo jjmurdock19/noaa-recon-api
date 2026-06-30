@@ -10,3 +10,4 @@ cache/
 .DS_Store
 .pytest_cache/
 core
+admin_credentials.json

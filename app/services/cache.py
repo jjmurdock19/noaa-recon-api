@@ -47,3 +47,25 @@ class ResultCache:
 
     def output_path(self, key: str, suffix: str) -> Path:
         return self.base_dir / f"{key}.{suffix}"
+
+    def list_keys(self) -> list[str]:
+        """All keys with a status file (ready/error/generating-via-lock)."""
+        json_keys = {p.stem for p in self.base_dir.glob("*.json")}
+        lock_keys = {p.stem for p in self.base_dir.glob("*.lock")}
+        return sorted(json_keys | lock_keys)
+
+    def delete(self, key: str) -> int:
+        """Remove every file for `key` (any suffix). Returns bytes freed."""
+        freed = 0
+        for p in self.base_dir.glob(f"{key}.*"):
+            freed += p.stat().st_size
+            p.unlink(missing_ok=True)
+        return freed
+
+    def stats(self) -> dict:
+        count, total_bytes = 0, 0
+        for p in self.base_dir.iterdir():
+            if p.is_file():
+                count += 1
+                total_bytes += p.stat().st_size
+        return {"file_count": count, "bytes": total_bytes}

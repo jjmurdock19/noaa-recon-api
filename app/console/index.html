@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>noaa-recon-api — admin console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: #0f172a; color: #e2e8f0;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 24px; border-bottom: 1px solid #334155; background: #111827;
+  }
+  header h1 { font-size: 15px; margin: 0; color: #7dd3fc; }
+  header .sub { color: #64748b; font-size: 11px; }
+  #logout-btn {
+    background: #374151; border: 1px solid #4b5563; color: #d1d5db;
+    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  #logout-btn:hover { background: #4b5563; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 24px; display: none; }
+  main.shown { display: block; }
+
+  #login-wrap {
+    display: flex; align-items: center; justify-content: center; min-height: 80vh;
+  }
+  #login-box {
+    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    padding: 28px 32px; width: 320px;
+  }
+  #login-box h2 { margin: 0 0 16px; font-size: 14px; color: #7dd3fc; }
+  #login-box label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+  #login-box input {
+    width: 100%; background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
+    padding: 7px 9px; border-radius: 4px; font-family: inherit; font-size: 13px; margin-bottom: 12px;
+  }
+  #login-box input:focus { outline: 1px solid #38bdf8; }
+  #login-box button {
+    width: 100%; background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
+    padding: 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 13px;
+  }
+  #login-box button:hover { background: #2563eb; }
+  #login-error { color: #f87171; font-size: 11px; margin-top: 10px; min-height: 14px; }
+
+  section {
+    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    padding: 16px 20px; margin-bottom: 18px;
+  }
+  section h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7dd3fc;
+    margin: 0 0 12px; display: flex; align-items: center; gap: 8px; justify-content: space-between;
+  }
+  .stat-row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .stat-card {
+    background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+    padding: 10px 16px; min-width: 140px;
+  }
+  .stat-card .label { font-size: 10px; color: #94a3b8; text-transform: uppercase; }
+  .stat-card .value { font-size: 20px; color: #e2e8f0; margin-top: 2px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1e293b; }
+  th { color: #94a3b8; font-weight: normal; text-transform: uppercase; font-size: 10px; }
+  tr:hover { background: #1e293b; }
+  .del-btn {
+    background: #7f1d1d; border: 1px solid #991b1b; color: #fca5a5;
+    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px;
+  }
+  .del-btn:hover { background: #991b1b; }
+  .clear-btn {
+    background: #374151; border: 1px solid #4b5563; color: #fca5a5;
+    padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px;
+  }
+  .clear-btn:hover { background: #4b5563; }
+  .empty-row td { color: #475569; text-align: center; padding: 16px; }
+
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .field-group { display: flex; flex-direction: column; gap: 3px; }
+  .field-label { font-size: 10px; color: #94a3b8; }
+  input, select {
+    background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
+    padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 12px;
+  }
+  input:focus, select:focus { outline: 1px solid #38bdf8; }
+  .primary-btn {
+    background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
+    padding: 7px 16px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  .primary-btn:hover { background: #2563eb; }
+  .primary-btn:disabled { background: #475569; border-color: #475569; cursor: not-allowed; }
+  .status-text { color: #94a3b8; font-size: 11px; flex: 1; min-width: 200px; }
+  .status-text.ok { color: #4ade80; }
+  .status-text.err { color: #f87171; }
+  .status-text.working { color: #fbbf24; }
+  #query-result img { max-width: 100%; border-radius: 6px; margin-top: 10px; border: 1px solid #334155; }
+
+  #prefetch-progress {
+    margin-top: 10px; display: none;
+  }
+  .progress-bar-track { background: #1e293b; border-radius: 4px; height: 10px; overflow: hidden; }
+  .progress-bar-fill { background: #38bdf8; height: 100%; width: 0%; transition: width 0.3s; }
+  .error-list { max-height: 120px; overflow-y: auto; font-size: 10px; color: #f87171; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div id="login-wrap">
+  <div id="login-box">
+    <h2>&#128272; noaa-recon-api console</h2>
+    <label for="login-user">Username</label>
+    <input type="text" id="login-user" autocomplete="username" />
+    <label for="login-pass">Password</label>
+    <input type="password" id="login-pass" autocomplete="current-password" />
+    <button id="login-btn">Log in</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<header style="display:none;" id="app-header">
+  <div>
+    <h1>&#128640; noaa-recon-api — admin console</h1>
+    <span class="sub">cache management, queries, and bulk prefetch</span>
+  </div>
+  <button id="logout-btn">Log out</button>
+</header>
+
+<main id="app-main">
+
+  <section>
+    <h2>Status</h2>
+    <div class="stat-row" id="status-cards"></div>
+  </section>
+
+  <section>
+    <h2>
+      Rendered tile cache
+      <button class="clear-btn" id="clear-satellite-btn">Clear all</button>
+    </h2>
+    <table>
+      <thead><tr>
+        <th>Key</th><th>Status</th><th>Band</th><th>Cmap</th><th>Sat</th>
+        <th>Center</th><th>Size</th><th>Modified</th><th></th>
+      </tr></thead>
+      <tbody id="satellite-cache-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>
+      Raw netCDF cache
+      <button class="clear-btn" id="clear-goesnc-btn">Clear all</button>
+    </h2>
+    <table>
+      <thead><tr><th>Filename</th><th>Scan start</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+      <tbody id="goesnc-cache-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Submit a query</h2>
+    <div class="row">
+      <div class="field-group">
+        <span class="field-label">Time (UTC)</span>
+        <input type="datetime-local" id="q-time" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Band</span>
+        <select id="q-band"><option value="13">13 — Clean IR</option><option value="9">9 — Water Vapor</option></select>
+      </div>
+      <div class="field-group">
+        <span class="field-label">Satellite</span>
+        <select id="q-satellite"><option value="goes-east">GOES-East</option><option value="goes-west">GOES-West</option></select>
+      </div>
+      <div class="field-group">
+        <span class="field-label">Cmap</span>
+        <select id="q-cmap"><option value="default">default</option><option value="abi13">abi13</option><option value="abi9">abi9</option><option value="ir4">ir4</option><option value="bd">bd</option><option value="enhanced">enhanced</option><option value="nrl">nrl</option><option value="grayscale">grayscale</option></select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field-group">
+        <span class="field-label">Center lat,lon (optional)</span>
+        <input type="text" id="q-center" placeholder="17.55,-78.14" style="width:140px;" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Dims</span>
+        <input type="number" id="q-dims" placeholder="500" style="width:80px;" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Unit</span>
+        <select id="q-unit"><option value="nm">nm</option><option value="km">km</option></select>
+      </div>
+      <button class="primary-btn" id="q-submit-btn">Load</button>
+      <span class="status-text" id="q-status"></span>
+    </div>
+    <div id="query-result"></div>
+  </section>
+
+  <section>
+    <h2>Load a timeframe into cache</h2>
+    <div class="row">
+      <div class="field-group">
+        <span class="field-label">Start (UTC)</span>
+        <input type="datetime-local" id="p-start" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">End (UTC)</span>
+        <input type="datetime-local" id="p-end" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Interval (min)</span>
+        <input type="number" id="p-interval" value="60" min="10" style="width:70px;" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Band</span>
+        <select id="p-band"><option value="13">13</option><option value="9">9</option></select>
+      </div>
+      <div class="field-group">
+        <span class="field-label">Satellite</span>
+        <select id="p-satellite"><option value="goes-east">East</option><option value="goes-west">West</option></select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field-group">
+        <span class="field-label">Center lat,lon (optional — full disk if blank)</span>
+        <input type="text" id="p-center" placeholder="17.55,-78.14" style="width:140px;" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Dims</span>
+        <input type="number" id="p-dims" placeholder="500" style="width:80px;" />
+      </div>
+      <div class="field-group">
+        <span class="field-label">Unit</span>
+        <select id="p-unit"><option value="nm">nm</option><option value="km">km</option></select>
+      </div>
+      <button class="primary-btn" id="p-submit-btn">Start prefetch</button>
+      <span class="status-text" id="p-status"></span>
+    </div>
+    <div id="prefetch-progress">
+      <div class="progress-bar-track"><div class="progress-bar-fill" id="p-progress-fill"></div></div>
+      <div class="error-list" id="p-errors"></div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let prefetchPollTimer = null;
+
+function fmtBytes(n) {
+    if (n == null) return '—';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(1)} ${units[i]}`;
+}
+
+async function api(path, opts) {
+    const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts));
+    if (res.status === 401) { showLogin(); throw new Error('not authenticated'); }
+    return res;
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────
+function showLogin() {
+    document.getElementById('login-wrap').style.display = 'flex';
+    document.getElementById('app-header').style.display = 'none';
+    document.getElementById('app-main').classList.remove('shown');
+}
+
+function showApp() {
+    document.getElementById('login-wrap').style.display = 'none';
+    document.getElementById('app-header').style.display = 'flex';
+    document.getElementById('app-main').classList.add('shown');
+    refreshAll();
+}
+
+async function checkAuth() {
+    const res = await fetch('/v1/admin/whoami', { credentials: 'same-origin' });
+    const data = await res.json();
+    if (data.authenticated) showApp(); else showLogin();
+}
+
+document.getElementById('login-btn').addEventListener('click', async () => {
+    const username = document.getElementById('login-user').value;
+    const password = document.getElementById('login-pass').value;
+    const errEl = document.getElementById('login-error');
+    errEl.textContent = '';
+    try {
+        const res = await fetch('/v1/admin/login', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        if (!res.ok) { errEl.textContent = 'Invalid username or password.'; return; }
+        showApp();
+    } catch (e) {
+        errEl.textContent = 'Network error: ' + e.message;
+    }
+});
+document.getElementById('login-pass').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('login-btn').click();
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => {
+    await fetch('/v1/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    showLogin();
+});
+
+// ── Status + cache listing ────────────────────────────────────────────────
+async function refreshStatus() {
+    const res = await api('/v1/admin/status');
+    const data = await res.json();
+    const cards = [
+        ['Rendered tiles', `${data.cache.satellite.file_count} files`, fmtBytes(data.cache.satellite.bytes)],
+        ['Raw netCDF', `${data.cache.goes_nc.file_count} files`, fmtBytes(data.cache.goes_nc.bytes)],
+        ['Total cache', '', fmtBytes(data.cache.total_bytes)],
+    ];
+    document.getElementById('status-cards').innerHTML = cards.map(([label, sub, value]) => `
+        <div class="stat-card">
+            <div class="label">${label}</div>
+            <div class="value">${value}</div>
+            <div class="label">${sub}</div>
+        </div>`).join('');
+}
+
+async function refreshSatelliteCache() {
+    const res = await api('/v1/admin/cache/satellite');
+    const data = await res.json();
+    const body = document.getElementById('satellite-cache-body');
+    if (!data.entries.length) {
+        body.innerHTML = '<tr class="empty-row"><td colspan="9">No cached tiles.</td></tr>';
+        return;
+    }
+    body.innerHTML = data.entries.map(e => `
+        <tr>
+            <td title="${e.key}">${e.key.slice(0, 40)}${e.key.length > 40 ? '…' : ''}</td>
+            <td>${e.status || ''}</td>
+            <td>${e.band ?? ''}</td>
+            <td>${e.cmap ?? ''}</td>
+            <td>${e.satellite ?? ''}</td>
+            <td>${e.center ? e.center.map(c => c.toFixed(2)).join(',') : 'full disk'}</td>
+            <td>${fmtBytes(e.size_bytes)}</td>
+            <td>${e.modified ? e.modified.slice(0, 16).replace('T', ' ') : ''}</td>
+            <td><button class="del-btn" data-key="${e.key}">Delete</button></td>
+        </tr>`).join('');
+    body.querySelectorAll('.del-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            await api(`/v1/admin/cache/satellite/${encodeURIComponent(btn.dataset.key)}`, { method: 'DELETE' });
+            refreshSatelliteCache(); refreshStatus();
+        });
+    });
+}
+
+async function refreshGoesNcCache() {
+    const res = await api('/v1/admin/cache/goes_nc');
+    const data = await res.json();
+    const body = document.getElementById('goesnc-cache-body');
+    if (!data.entries.length) {
+        body.innerHTML = '<tr class="empty-row"><td colspan="5">No cached netCDF files.</td></tr>';
+        return;
+    }
+    body.innerHTML = data.entries.map(e => `
+        <tr>
+            <td title="${e.filename}">${e.filename.slice(0, 50)}${e.filename.length > 50 ? '…' : ''}</td>
+            <td>${e.scan_start ? e.scan_start.slice(0, 16).replace('T', ' ') : ''}</td>
+            <td>${fmtBytes(e.size_bytes)}</td>
+            <td>${e.modified.slice(0, 16).replace('T', ' ')}</td>
+            <td><button class="del-btn" data-name="${e.filename}">Delete</button></td>
+        </tr>`).join('');
+    body.querySelectorAll('.del-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(btn.dataset.name)}`, { method: 'DELETE' });
+            refreshGoesNcCache(); refreshStatus();
+        });
+    });
+}
+
+document.getElementById('clear-satellite-btn').addEventListener('click', async () => {
+    if (!confirm('Delete ALL rendered tile cache entries?')) return;
+    await api('/v1/admin/cache/satellite', { method: 'DELETE' });
+    refreshSatelliteCache(); refreshStatus();
+});
+document.getElementById('clear-goesnc-btn').addEventListener('click', async () => {
+    if (!confirm('Delete ALL raw netCDF cache files? Future requests will re-download from NOAA S3.')) return;
+    await api('/v1/admin/cache/goes_nc', { method: 'DELETE' });
+    refreshGoesNcCache(); refreshStatus();
+});
+
+function refreshAll() {
+    refreshStatus();
+    refreshSatelliteCache();
+    refreshGoesNcCache();
+}
+
+// ── Submit a query (calls the public /v1/satellite/tile endpoint) ────────
+function setQStatus(msg, cls) {
+    const el = document.getElementById('q-status');
+    el.textContent = msg;
+    el.className = 'status-text ' + (cls || '');
+}
+
+async function loadQuery() {
+    const timeVal = document.getElementById('q-time').value;
+    if (!timeVal) { setQStatus('Pick a time.', 'err'); return; }
+    const params = {
+        time: timeVal + ':00Z',
+        band: document.getElementById('q-band').value,
+        satellite: document.getElementById('q-satellite').value,
+        cmap: document.getElementById('q-cmap').value,
+    };
+    const center = document.getElementById('q-center').value.trim();
+    if (center) {
+        params.center = center;
+        params.dims = document.getElementById('q-dims').value || '500';
+        params.unit = document.getElementById('q-unit').value;
+    }
+    const btn = document.getElementById('q-submit-btn');
+    btn.disabled = true;
+    setQStatus('Requesting…', 'working');
+    document.getElementById('query-result').innerHTML = '';
+
+    try {
+        let data = await fetch(`/v1/satellite/tile?${new URLSearchParams(params)}`, { credentials: 'same-origin' }).then(r => r.json());
+        while (data.status === 'generating') {
+            await new Promise(r => setTimeout(r, 3000));
+            data = await fetch(`/v1/satellite/status/${data.key}`, { credentials: 'same-origin' }).then(r => r.json());
+            setQStatus(`Processing… ${data.elapsed || 0}s elapsed.`, 'working');
+        }
+        if (data.status !== 'ready') {
+            setQStatus('Error: ' + (data.message || 'unknown'), 'err');
+        } else {
+            setQStatus(`✓ ${data.satellite} Band ${data.band} (${data.cmap}) — scan ${(data.scan_start || '').slice(0, 16)}Z`, 'ok');
+            document.getElementById('query-result').innerHTML = `<img src="${data.png_url}" alt="rendered tile" />`;
+            refreshSatelliteCache(); refreshStatus();
+        }
+    } catch (e) {
+        setQStatus('Network error: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+    }
+}
+document.getElementById('q-submit-btn').addEventListener('click', loadQuery);
+
+// ── Bulk prefetch ──────────────────────────────────────────────────────
+function setPStatus(msg, cls) {
+    const el = document.getElementById('p-status');
+    el.textContent = msg;
+    el.className = 'status-text ' + (cls || '');
+}
+
+async function startPrefetch() {
+    const startVal = document.getElementById('p-start').value;
+    const endVal = document.getElementById('p-end').value;
+    if (!startVal || !endVal) { setPStatus('Pick a start and end time.', 'err'); return; }
+
+    const body = {
+        time_start: startVal + ':00Z',
+        time_end: endVal + ':00Z',
+        interval_minutes: parseInt(document.getElementById('p-interval').value, 10) || 60,
+        band: parseInt(document.getElementById('p-band').value, 10),
+        satellite: document.getElementById('p-satellite').value,
+        cmap: 'default',
+    };
+    const center = document.getElementById('p-center').value.trim();
+    if (center) {
+        body.center = center;
+        body.dims = parseFloat(document.getElementById('p-dims').value || '500');
+        body.unit = document.getElementById('p-unit').value;
+    }
+
+    const btn = document.getElementById('p-submit-btn');
+    btn.disabled = true;
+    setPStatus('Starting…', 'working');
+    try {
+        const res = await api('/v1/admin/prefetch', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            setPStatus('Error: ' + (err.detail || 'request failed'), 'err');
+            btn.disabled = false;
+            return;
+        }
+        const job = await res.json();
+        document.getElementById('prefetch-progress').style.display = 'block';
+        pollPrefetch(job.job_id);
+    } catch (e) {
+        setPStatus('Network error: ' + e.message, 'err');
+        btn.disabled = false;
+    }
+}
+
+function pollPrefetch(jobId) {
+    if (prefetchPollTimer) clearInterval(prefetchPollTimer);
+    prefetchPollTimer = setInterval(async () => {
+        const res = await api(`/v1/admin/prefetch/${jobId}`);
+        const job = await res.json();
+        const pct = job.total ? Math.round((job.processed / job.total) * 100) : 0;
+        document.getElementById('p-progress-fill').style.width = pct + '%';
+        setPStatus(
+            `${job.status} — ${job.processed}/${job.total} (${job.completed} done, ${job.skipped} cached, ${job.failed} failed)`,
+            job.status === 'done' ? (job.failed ? 'err' : 'ok') : 'working'
+        );
+        document.getElementById('p-errors').innerHTML = job.errors.slice(0, 20).map(e => `<div>${e}</div>`).join('');
+        if (job.status === 'done') {
+            clearInterval(prefetchPollTimer);
+            document.getElementById('p-submit-btn').disabled = false;
+            refreshAll();
+        }
+    }, 2000);
+}
+document.getElementById('p-submit-btn').addEventListener('click', startPrefetch);
+
+checkAuth();
+</script>
+</body>
+</html>
