@@ -38,6 +38,7 @@ generates them from the route definitions):**
 | `GET /v1/tdr/sweep` | 🟡 Planned |
 | `GET /v1/raw/netcdf` | 🟡 Planned |
 | `GET /demo/netcdf-three/` (static 3D client) | 🟢 Live (sample data only until raw passthrough ships) |
+| `GET /` (admin console) + `/v1/admin/*` | 🟢 Live (login required, see README) |
 
 ---
 
@@ -297,6 +298,67 @@ raw-passthrough endpoint above isn't implemented yet — swap the
 ```
 https://joshmurdock.net/api/demo/netcdf-three/
 ```
+
+---
+
+## `GET /` — Admin console 🟢
+
+A login-gated web UI for operating this deployment: cache status/storage
+stats, browsing and deleting cached rendered tiles and raw netCDF
+downloads, submitting one-off queries, and bulk-prefetching a timeframe
+into the cache. Static page at `app/console/index.html`, calling the
+`/v1/admin/*` JSON endpoints below. See the README's "Admin console"
+section for the credentials file (`admin_credentials.json`, gitignored,
+default `admin`/`password` — change it before exposing this publicly).
+
+```
+https://joshmurdock.net/api/
+```
+
+### `/v1/admin/*` endpoints (all require a logged-in session except login/whoami)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie or `401`. |
+| `/v1/admin/logout` | POST | Clears the session. |
+| `/v1/admin/whoami` | GET | `{authenticated: bool}` — no login required, used by the console to decide whether to show the login form. |
+| `/v1/admin/status` | GET | Cache stats: file count + bytes for `satellite` (rendered tiles) and `goes_nc` (raw downloads) separately, plus a total. |
+| `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry (key, status, band, cmap, satellite, center, size, modified). |
+| `/v1/admin/cache/satellite/{key}` | DELETE | Delete one entry's `.png`/`.json`/`.lock` files. |
+| `/v1/admin/cache/satellite` | DELETE | Delete all rendered-tile cache entries. |
+| `/v1/admin/cache/goes_nc` | GET | List every cached raw netCDF download (filename, parsed scan time, size, modified). |
+| `/v1/admin/cache/goes_nc/{filename}` | DELETE | Delete one raw netCDF file. |
+| `/v1/admin/cache/goes_nc` | DELETE | Delete all raw netCDF downloads (next requests re-download from NOAA S3). |
+| `/v1/admin/prefetch` | POST | Bulk-load a timeframe into cache — see below. Returns a job immediately; poll for progress. |
+| `/v1/admin/prefetch/{job_id}` | GET | Poll a prefetch job's progress. |
+| `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
+
+### Bulk prefetch
+
+```json
+POST /v1/admin/prefetch
+{
+  "time_start": "2025-10-28T06:00:00Z",
+  "time_end": "2025-10-28T18:00:00Z",
+  "interval_minutes": 30,
+  "band": 13,
+  "satellite": "goes-east",
+  "cmap": "default",
+  "center": "17.55,-78.14",
+  "dims": 1000,
+  "unit": "nm"
+}
+```
+
+`center`/`dims`/`unit` are optional (omit for full-disk prefetch — much
+slower per frame, see the bbox section above). Capped at 500 generated
+timestamps per job (400 if you ask for more) to prevent an accidental
+multi-hour job; lower `interval_minutes` or shorten the range. Each
+timestamp goes through the exact same `resolve_nearest`/`render_and_store`
+pipeline as a normal `/tile` request — prefetched entries are
+indistinguishable from organically-requested ones in the cache, and a
+timestamp already cached as `ready` is skipped (counted separately from
+`completed`), not re-rendered.
 
 ---
 
