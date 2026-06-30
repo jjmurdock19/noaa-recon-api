@@ -77,23 +77,19 @@ async def status():
 async def list_satellite_cache():
     entries = []
     for key in _cache.list_keys():
-        meta = _cache.get_status(key) or {"status": "unknown"}
+        meta = dict(_cache.get_status(key) or {"status": "unknown"})
         png_path = _cache.output_path(key, "png")
         size = png_path.stat().st_size if png_path.exists() else 0
         json_path = _cache.output_path(key, "json")
         mtime = json_path.stat().st_mtime if json_path.exists() else None
-        entries.append({
-            "key": key,
-            "status": meta.get("status"),
-            "band": meta.get("band"),
-            "cmap": meta.get("cmap"),
-            "satellite": meta.get("satellite"),
-            "scan_start": meta.get("scan_start"),
-            "center": meta.get("center"),
-            "width_km": meta.get("width_km"),
-            "size_bytes": size,
-            "modified": datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc).isoformat() if mtime else None,
-        })
+        # Pass through every field the render pipeline wrote (band, cmap,
+        # satellite, sat_lon, scan_start, bounds, center, width_km,
+        # resolution_km, png_url, ...) — the console's preview pane shows
+        # all of it, so don't hand-curate a subset here.
+        meta["key"] = key
+        meta["size_bytes"] = size
+        meta["modified"] = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc).isoformat() if mtime else None
+        entries.append(meta)
     entries.sort(key=lambda e: e["modified"] or "", reverse=True)
     return {"entries": entries}
 
@@ -129,6 +125,46 @@ async def list_goes_nc_cache():
                 "scan_start": scan_start.isoformat() if scan_start else None,
             })
     return {"entries": entries}
+
+
+@router.get("/cache/goes_nc/{filename}/info", dependencies=[Depends(auth.require_login)])
+async def get_goes_nc_info(filename: str):
+    """Structural metadata for a raw netCDF file — dimensions, variables
+    (with shape/dtype/units), and global attributes. netCDF isn't directly
+    viewable like an image, so this is the console's "preview" for it,
+    analogous to `ncdump -h`."""
+    if "/" in filename or ".." in filename:
+        raise HTTPException(400, "invalid filename")
+    path = _nc_cache_dir / filename
+    if not path.exists():
+        raise HTTPException(404, "not found")
+
+    import netCDF4 as nc4
+
+    ds = nc4.Dataset(str(path), "r")
+    try:
+        dimensions = {name: len(dim) for name, dim in ds.dimensions.items()}
+        variables = []
+        for name, var in ds.variables.items():
+            variables.append({
+                "name": name,
+                "dimensions": list(var.dimensions),
+                "shape": list(var.shape),
+                "dtype": str(var.dtype),
+                "units": getattr(var, "units", None),
+                "long_name": getattr(var, "long_name", None),
+            })
+        global_attrs = {attr: str(getattr(ds, attr)) for attr in ds.ncattrs()}
+    finally:
+        ds.close()
+
+    return {
+        "filename": filename,
+        "size_bytes": path.stat().st_size,
+        "dimensions": dimensions,
+        "variables": sorted(variables, key=lambda v: v["name"]),
+        "global_attrs": global_attrs,
+    }
 
 
 @router.delete("/cache/goes_nc/{filename}", dependencies=[Depends(auth.require_login)])

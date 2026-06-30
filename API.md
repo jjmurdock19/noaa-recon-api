@@ -18,6 +18,19 @@ generates them from the route definitions):**
 - Swagger UI: `{base}/docs`
 - OpenAPI schema (machine-readable, for codegen/agent tooling): `{base}/openapi.json`
 
+In production, the API is reverse-proxied behind a path prefix
+(`joshmurdock.net/api/` → this app's `/`). FastAPI's auto-generated
+Swagger UI doesn't know about that prefix unless told — without it, `/docs`
+tries to fetch `openapi.json` from the domain root and 404s. Fixed by
+starting uvicorn with `--root-path /api` in production only (see
+`deploy/noaa-recon-api.service`); local dev (`uvicorn app.main:app
+--reload`, no `--root-path`) is unaffected since there's no prefix there.
+If you ever see "Failed to load API definition" / `404 /openapi.json` in
+Swagger UI again, this is the first thing to check — same root cause
+class as any "absolute path resolves to the wrong place behind a reverse
+proxy" bug (see the admin console's `API_BASE` pattern in
+`app/console/index.html` for the client-side equivalent fix).
+
 ---
 
 ## Status legend
@@ -323,10 +336,11 @@ https://joshmurdock.net/api/
 | `/v1/admin/logout` | POST | Clears the session. |
 | `/v1/admin/whoami` | GET | `{authenticated: bool}` — no login required, used by the console to decide whether to show the login form. |
 | `/v1/admin/status` | GET | Cache stats: file count + bytes for `satellite` (rendered tiles) and `goes_nc` (raw downloads) separately, plus a total. |
-| `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry (key, status, band, cmap, satellite, center, size, modified). |
+| `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry — **every field the render pipeline wrote** (key, status, band, cmap, satellite, sat_lon, scan_start, bounds, center, width_km, resolution_km, png_url, size, modified), not a curated subset, so the console's preview pane has everything without a second round-trip. |
 | `/v1/admin/cache/satellite/{key}` | DELETE | Delete one entry's `.png`/`.json`/`.lock` files. |
 | `/v1/admin/cache/satellite` | DELETE | Delete all rendered-tile cache entries. |
 | `/v1/admin/cache/goes_nc` | GET | List every cached raw netCDF download (filename, parsed scan time, size, modified). |
+| `/v1/admin/cache/goes_nc/{filename}/info` | GET | Structural metadata for one raw netCDF file — dimensions, every variable (name/dims/shape/dtype/units/long_name), and global attributes. Analogous to `ncdump -h`; this is how the console "previews" a netCDF file since it isn't directly viewable like an image. |
 | `/v1/admin/cache/goes_nc/{filename}` | DELETE | Delete one raw netCDF file. |
 | `/v1/admin/cache/goes_nc` | DELETE | Delete all raw netCDF downloads (next requests re-download from NOAA S3). |
 | `/v1/admin/prefetch` | POST | Bulk-load a timeframe into cache — see below. Returns a job immediately; poll for progress. |
@@ -359,6 +373,26 @@ pipeline as a normal `/tile` request — prefetched entries are
 indistinguishable from organically-requested ones in the cache, and a
 timestamp already cached as `ready` is skipped (counted separately from
 `completed`), not re-rendered.
+
+---
+
+## Logging
+
+Every request gets one line in `logs/app.log` (method, path, status code,
+duration in ms, client IP) — see `app/main.py`'s `log_requests` middleware
+— plus any `log.exception(...)` calls already in the codebase (e.g.
+render failures in `app/services/goes.py`) and an automatic log line for
+any unhandled exception, with full traceback, before it's re-raised as a
+500. The file rotates at 10MB with 5 backups kept (`app/logging_config.py`)
+so it doesn't grow unbounded — this is for ongoing/long-term monitoring,
+not just whatever stdout the process happens to be attached to.
+
+```bash
+tail -f logs/app.log
+```
+
+`logs/` is gitignored (same as `cache/`) — it's host-local state, not
+repo content.
 
 ---
 

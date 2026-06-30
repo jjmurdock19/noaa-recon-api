@@ -249,21 +249,31 @@ without re-deriving the architecture.
 
 ```
 app/
-  main.py            FastAPI app, CORS (open — this API is meant for other sites too), SessionMiddleware
-                      (admin console auth), router includes, /cache + /demo/netcdf-three static mounts,
-                      GET /llms.txt, and the console static mount at "/" (registered LAST so it doesn't
-                      shadow the more specific routes above it).
+  main.py            FastAPI app, CORS (open — this API is meant for other sites too), configure_logging()
+                      (called at import time, before anything else logs), the log_requests middleware
+                      (one line per request to logs/app.log), SessionMiddleware (admin console auth),
+                      router includes, /cache + /demo/netcdf-three static mounts, GET /llms.txt, and the
+                      console static mount at "/" (registered LAST so it doesn't shadow the more specific
+                      routes above it).
   auth.py            Admin console auth: loads/creates admin_credentials.json (gitignored, repo root —
                       see README "Admin console"), verify_credentials(), require_login() FastAPI dependency.
+  logging_config.py    configure_logging(): rotating file handler (10MB x5) attached to the ROOT logger
+                        ONLY — attaching to "uvicorn.error"/"uvicorn.access" too caused every line to be
+                        logged twice (they propagate to root by default; found and fixed empirically, see
+                        the module docstring). app.* loggers (e.g. goes.py's `log`) need no extra setup.
   paths.py            CACHE_ROOT = <repo>/cache, REPO_ROOT
   models.py            Pydantic response schemas
-  console/index.html   Static admin console UI (no build step) — login form + dashboard, calls /v1/admin/*.
+  console/index.html   Static admin console UI (no build step) — login form + dashboard + cache preview
+                        pane (tile images w/ full metadata, netCDF dimension/variable/attribute inspection),
+                        calls /v1/admin/*. All requests are prefixed with a runtime-computed API_BASE (see
+                        "Real bugs" below) — never hardcode a path starting with "/" in this file.
   routers/
     satellite.py       GET /v1/satellite/tile, /status/{key}, /colortable  — IMPLEMENTED
     admin.py            GET/POST /v1/admin/* — login/logout/whoami, status, cache list/delete (satellite
-                         + goes_nc separately), bulk prefetch (POST /prefetch, GET /prefetch/{job_id}).
-                         All except login/whoami require require_login(). Prefetch jobs are tracked in an
-                         in-memory dict (fine for this scope — lost on restart, not persisted).
+                         + goes_nc separately, goes_nc also has a GET .../info for netCDF structural
+                         metadata), bulk prefetch (POST /prefetch, GET /prefetch/{job_id}). All except
+                         login/whoami require require_login(). Prefetch jobs are tracked in an in-memory
+                         dict (fine for this scope — lost on restart, not persisted).
     tdr.py              GET /v1/tdr/missions, GET /v1/tdr/sweep                — STUB (501)
     raw.py              GET /v1/raw/netcdf                                     — STUB (501)
     health.py           GET /v1/health
@@ -282,6 +292,7 @@ app/
                          list_keys()/delete()/stats() for the admin console's cache browser.
     tdr.py              Empty stub — see its docstring for the planned crawler/parse/render shape.
 admin_credentials.json        Gitignored, auto-created on first run — admin console login (see README).
+logs/app.log                  Gitignored, auto-created on first run — rotating request/error log (see API.md "Logging").
 clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" above)
 deploy/                       nginx snippet + systemd unit for this host
 docs/assets/                  README example images
@@ -357,6 +368,38 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    guards against a regression.
 
    ![Before (plain latitude spacing) vs after (Web Mercator spacing) — same scan, same bbox](docs/assets/mercator-fix-before-after.jpg)
+
+5. **Admin console fetch requests used domain-root absolute paths.** The
+   console (`app/console/index.html`) used literal absolute paths like
+   `fetch('/v1/admin/login', ...)`. In production the page is served at
+   `/api/` (nginx proxies `/api/` → this app's `/`), so the browser
+   resolved `/v1/admin/login` against the domain root
+   (`joshmurdock.net/v1/admin/login`, a 404 never proxied to us) rather than
+   the page's own directory (`joshmurdock.net/api/v1/admin/login`). FastAPI's
+   own request-handling was never even reached — but my generic `!res.ok`
+   handler showed "Invalid username or password" for any non-OK response,
+   masking the real 404 behind a plausible auth error. Fixed by computing
+   `API_BASE = window.location.pathname.replace(/\/$/, '')` at page load and
+   prefixing every fetch. **If you add new fetch() calls to the console, you
+   MUST prefix them with `API_BASE + '/v1/...'` — never a bare `/v1/...`
+   string.** Only caught because a user attempted login in production (where
+   the `/api/` prefix exists); local dev testing (`127.0.0.1:8000`, no
+   prefix) didn't trigger it. No automated test covers this — a real browser
+   click-test is the only reliable check.
+
+6. **Swagger UI 404 on `/openapi.json`.** FastAPI's auto-generated `/docs`
+   page hardcodes the `url` it fetches the OpenAPI schema from as a simple
+   `openapi.json` reference, which FastAPI rewrites to an absolute URL based
+   on `root_path`. Without `root_path=/api`, the URL became the bare
+   `/openapi.json` (domain root, not proxied to our app) instead of
+   `/api/openapi.json`. Fixed by adding `--root-path /api` to the production
+   uvicorn command in `deploy/noaa-recon-api.service` — local dev (`uvicorn
+   app.main:app --reload`, no flag) is unaffected since there's no proxy
+   prefix there. Same root-cause class as bug #5 (absolute paths constructed
+   without awareness of a reverse-proxy path prefix), same symptom (works
+   locally, breaks in production), same diagnostic approach (check what URL
+   the failing fetch is actually constructing by inspecting the rendered HTML
+   or browser devtools).
 
 ### Roadmap (not yet implemented)
 
