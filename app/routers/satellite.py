@@ -13,7 +13,7 @@ router = APIRouter(prefix="/satellite", tags=["satellite"])
 _cache = ResultCache(CACHE_ROOT / "satellite")
 _nc_cache_dir = CACHE_ROOT / "goes_nc"
 
-VALID_CMAPS = set(goes.LUTS.keys()) | {"default"}
+VALID_CMAPS = set(goes.LUTS.keys()) | set(goes.STOPS_BY_CMAP.keys()) | {"default"}
 VALID_BANDS = {9, 13}  # Band 2 (visible) / GeoColor are follow-up phases
 NM_PER_KM = 1.0 / 1.852
 
@@ -101,3 +101,38 @@ async def get_status(key: str):
     if status is None:
         return {"status": "idle"}
     return status
+
+
+def _rgb_to_hex(rgb) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*[int(round(v)) for v in rgb])
+
+
+@router.get("/colortable")
+async def get_colortable(
+    cmap: str = Query("default", description="Same values as GET /tile's cmap param"),
+    band: int = Query(13, description="Used to resolve cmap='default'"),
+):
+    """Returns the exact color stops for a colortable, so a client can
+    render a legend that's guaranteed to match what /tile actually
+    produces (single source of truth — see STOPS_BY_CMAP / LUTS in
+    app/services/goes.py)."""
+    if cmap not in VALID_CMAPS:
+        raise HTTPException(400, f"cmap must be one of {sorted(VALID_CMAPS)}")
+    if cmap == "default":
+        if band not in VALID_BANDS:
+            raise HTTPException(400, f"band must be one of {sorted(VALID_BANDS)}")
+        cmap = goes.DEFAULT_CMAP_BY_BAND[band]
+
+    if cmap in goes.STOPS_BY_CMAP:
+        stops = [{"temp_c": t, "hex": _rgb_to_hex(rgb)} for t, rgb in goes.STOPS_BY_CMAP[cmap]]
+        exact = True
+    else:
+        # LUT-based colortables: sample at evenly spaced indices for a
+        # representative (not exhaustive) legend.
+        lut = goes.LUTS[cmap]
+        sample_indices = range(0, 256, 16)
+        stops = [{"temp_c": round(goes._i2t(i) - 273.15, 1), "hex": _rgb_to_hex(lut[i])} for i in sample_indices]
+        stops.sort(key=lambda s: s["temp_c"])
+        exact = False
+
+    return {"cmap": cmap, "unit": "C", "exact": exact, "stops": stops}

@@ -132,10 +132,29 @@ def test_default_cmap_by_band_resolves_correctly():
     assert goes.DEFAULT_CMAP_BY_BAND[9] == "abi9"
 
 
-def test_abi13_and_abi9_registered_in_luts():
-    for name in ("abi13", "abi9"):
-        assert name in goes.LUTS
-        assert goes.LUTS[name].shape == (256, 3)
+def test_abi13_and_abi9_registered_in_stops_by_cmap():
+    # abi13/abi9 are deliberately NOT in LUTS (see comment above LUTS in
+    # goes.py) — they're evaluated exactly via STOPS_BY_CMAP instead, to
+    # avoid LUT-quantization smearing their sharp transitions.
+    assert "abi13" in goes.STOPS_BY_CMAP
+    assert "abi9" in goes.STOPS_BY_CMAP
+    assert "abi13" not in goes.LUTS
+    assert "abi9" not in goes.LUTS
+
+
+def test_apply_stops_exact_matches_direct_function_with_no_quantization():
+    # The whole point of _apply_stops_exact is to NOT go through the
+    # 256-bucket LUT — confirm it reproduces _abi13()/_abi9() exactly
+    # (no smearing at the sharp -32/-31C cut, no clamping above +42C).
+    K = 273.15
+    temps_c = [57, 40, 31, 6, -20, -31, -32, -40, -50, -59, -65, -75, -80, -86, -100, -110]
+    arr_k = np.array([[t + K for t in temps_c]], dtype=np.float64)
+
+    rgb = goes._apply_stops_exact(arr_k, goes._ABI13_STOPS)
+    for i, t_c in enumerate(temps_c):
+        expected = goes._abi13(t_c + K)
+        actual = list(rgb[0, i])
+        assert [round(v) for v in actual] == expected, f"{t_c}C: expected {expected}, got {actual}"
 
 
 # ── bbox request validation ──────────────────────────────────────────────
