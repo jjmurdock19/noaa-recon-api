@@ -136,7 +136,7 @@ sequenceDiagram
 
 ---
 
-## Human setup
+## Manual setup
 
 ```bash
 git clone --recurse-submodules <this-repo-url>
@@ -303,7 +303,7 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    and produce a blank tile. Fixed by computing
    `Sx = H - rs*cos(x)*cos(y)` per PUG Vol 5 Sec 4.2 (not
    `rs*cos(x)*cos(y) - H`). **The same bug likely exists in the live
-   hurricanes site's `goes_tile.py`** — flag it to a human before touching
+   hurricanes site's `goes_tile.py`** — flag it to a person before touching
    that file, since it's in active production use.
    `tests/test_satellite.py::test_abi_to_latlon_subsatellite_point_is_origin`
    guards against a regression.
