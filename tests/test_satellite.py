@@ -47,6 +47,40 @@ def test_abi_to_latlon_nan_off_disk():
     assert np.isnan(lon_off[0])
 
 
+# ── Web Mercator row spacing (georeferencing fix) ────────────────────────
+def test_mercator_y_matches_known_reference_values():
+    # Standard, widely-cited Web Mercator constants (same formula OSM/Google
+    # Maps tiles use): y=0 at the equator, y~=0.8814 at 45 deg, monotonic.
+    assert goes._mercator_y(0.0) == pytest.approx(0.0, abs=1e-9)
+    assert goes._mercator_y(45.0) == pytest.approx(0.8814, abs=1e-3)
+    assert goes._mercator_y(-45.0) == pytest.approx(-0.8814, abs=1e-3)
+    assert goes._mercator_y(10.0) < goes._mercator_y(20.0) < goes._mercator_y(30.0)
+
+
+def test_mercator_row_spacing_differs_from_linear_latitude():
+    # This is the actual bug: Leaflet's L.imageOverlay stretches an image
+    # LINEARLY (in Web Mercator screen space) between its bounds. A pixel
+    # row spaced linearly by latitude lands at the wrong screen position
+    # unless it's spaced linearly in Mercator Y instead — the discrepancy
+    # grows with both the box's latitude span and how far it is from the
+    # equator. Confirm the two methods diverge for a realistic box (e.g.
+    # the Hurricane Melissa 1000nm box, which spans ~15 degrees of lat
+    # centered at 17.55N).
+    lat_S, lat_N = 9.0, 26.0  # roughly a 1000nm-tall box centered near 17.55N
+    lat_mid = (lat_S + lat_N) / 2.0
+
+    out_size = 1000
+    linear_row = (lat_N - lat_mid) / (lat_N - lat_S) * out_size
+
+    merc_y_S, merc_y_N = goes._mercator_y(lat_S), goes._mercator_y(lat_N)
+    mercator_row = (merc_y_N - goes._mercator_y(lat_mid)) / (merc_y_N - merc_y_S) * out_size
+
+    # The midpoint by latitude is NOT the midpoint by Mercator Y (Mercator
+    # compresses space near the equator relative to higher latitudes), so
+    # these must differ by a visible amount, not just rounding noise.
+    assert abs(linear_row - mercator_row) > 1.0
+
+
 def test_fill_gaps_propagates_into_nan_holes():
     data = np.full((5, 5), np.nan, dtype=np.float32)
     data[2, 2] = 10.0
@@ -79,6 +113,12 @@ def test_paint_coldest_keeps_minimum_on_collision():
 def test_get_satellite_bucket_switches_at_cutover():
     assert goes._get_satellite_bucket(datetime.date(2024, 1, 1)) == (16, "noaa-goes16")
     assert goes._get_satellite_bucket(datetime.date(2025, 1, 14)) == (19, "noaa-goes19")
+
+
+def test_get_satellite_bucket_west_switches_at_cutover():
+    assert goes._get_satellite_bucket(datetime.date(2022, 1, 1), "west") == (17, "noaa-goes17")
+    assert goes._get_satellite_bucket(datetime.date(2023, 1, 10), "west") == (18, "noaa-goes18")
+    assert goes._get_satellite_bucket(datetime.date(2024, 1, 1), "west") == (18, "noaa-goes18")
 
 
 def test_parse_scan_start_extracts_utc_datetime():

@@ -41,7 +41,12 @@ async def get_tile(
         "abi9 for band=9) — these are not interchangeable, since Band 13 (IR window) and Band 9 "
         "(water vapor) represent different physical quantities and use different color conventions.",
     ),
-    satellite: str = Query("goes-east", description="Only 'goes-east' is implemented currently"),
+    satellite: str = Query(
+        "goes-east",
+        description="'goes-east' (GOES-16 until 2025-01-14, then GOES-19) or 'goes-west' "
+        "(GOES-17 until 2023-01-10, then GOES-18). Both only cover ABI-era dates (~2017-2018 "
+        "onward) — pre-ABI satellites used a different instrument/format with no open archive.",
+    ),
     center: Optional[str] = Query(
         None, description="'lat,lon' — render only a box around this point instead of the full disk. Requires `dims`."
     ),
@@ -55,8 +60,9 @@ async def get_tile(
         "(highest detail — ~2km for bands 9/13). Increase to render faster / smaller files.",
     ),
 ):
-    if satellite != "goes-east":
-        raise HTTPException(400, "Only satellite='goes-east' is implemented currently (GOES-West is a follow-up phase)")
+    if satellite not in ("goes-east", "goes-west"):
+        raise HTTPException(400, "satellite must be 'goes-east' or 'goes-west'")
+    sat_side = "west" if satellite == "goes-west" else "east"
     if band not in VALID_BANDS:
         raise HTTPException(400, f"band must be one of {sorted(VALID_BANDS)}")
     if cmap not in VALID_CMAPS:
@@ -78,7 +84,7 @@ async def get_tile(
             raise HTTPException(400, str(e)) from e
 
     try:
-        resolved = goes.resolve_nearest(time, band)
+        resolved = goes.resolve_nearest(time, band, sat_side)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e)) from e
 
