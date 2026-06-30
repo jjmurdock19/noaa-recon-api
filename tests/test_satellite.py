@@ -86,31 +86,45 @@ def test_ir4_registered_in_luts():
 
 
 # ── "default ABI" per-band colortables ───────────────────────────────────
-def test_abi13_matches_reference_legend_anchors():
-    # Transcribed from the project owner's reference legend (tick marks at
-    # -110, -59, -20, 6, 31, 57 C): white at the extreme cold end, a narrow
-    # rainbow band, then greyscale (light=cold, dark=warm) for the bulk.
+def test_abi13_matches_exact_source_stops():
+    # Exact temperature(C)->hex stops supplied directly by the project
+    # owner (band13_colortable.json) — not a visual estimate, so checked
+    # at every anchor point.
     K = 273.15
-    assert goes._abi13(-110 + K) == [255, 255, 255]   # most extreme cold -> white
-    assert goes._abi13(-115 + K) == [255, 255, 255]   # colder than legend range, clipped not extrapolated
-    assert goes._abi13(57 + K) == [0, 0, 0]            # warmest -> black
-    assert goes._abi13(65 + K) == [0, 0, 0]            # warmer than legend range, clipped
-    # Bulk of the range is greyscale (per the user's "large amount of grey/black" note)
-    r, g, b = goes._abi13(6 + K)
-    assert r == g == b
+    assert goes._abi13(-110 + K) == [255, 255, 255]  # white, most extreme
+    assert goes._abi13(-115 + K) == [255, 255, 255]  # colder than source range, clipped
+    assert goes._abi13(-80 + K) == [0, 0, 0]
+    assert goes._abi13(-75 + K) == [51, 0, 0]
+    assert goes._abi13(-65 + K) == [255, 69, 0]
+    assert goes._abi13(-59 + K) == [173, 255, 47]
+    assert goes._abi13(-50 + K) == [0, 255, 0]
+    assert goes._abi13(-40 + K) == [0, 0, 128]
+    assert goes._abi13(-32 + K) == [0, 255, 255]   # cyan — rainbow band ends
+    assert goes._abi13(-31 + K) == [204, 204, 204]  # hard cut to light grey
+    assert goes._abi13(-20 + K) == [153, 153, 153]
+    assert goes._abi13(6 + K) == [102, 102, 102]
+    assert goes._abi13(31 + K) == [51, 51, 51]
+    assert goes._abi13(57 + K) == [0, 0, 0]          # warmest, black
+    assert goes._abi13(65 + K) == [0, 0, 0]          # warmer than source range, clipped
 
 
-def test_abi9_matches_reference_legend_anchors():
-    # Transcribed from the project owner's reference legend (tick marks at
-    # -93, -54, -30, -18, -5, 7 C, labeled "clouds .. <<moist  dry>>"):
-    # teal at coldest/moist, white at the moist/dry boundary, black at
-    # warmest/driest.
+def test_abi9_matches_exact_source_stops():
+    # Exact temperature(C)->hex stops supplied directly by the project
+    # owner (band9_colortable.json).
     K = 273.15
-    assert goes._abi9(-93 + K) == [20, 130, 120]   # coldest/moist -> teal
-    assert goes._abi9(-100 + K) == [20, 130, 120]  # colder than legend range, clipped
-    assert goes._abi9(-30 + K) == [255, 255, 255]  # moist/dry boundary -> white
-    assert goes._abi9(7 + K) == [0, 0, 0]           # warmest/driest -> black
-    assert goes._abi9(15 + K) == [0, 0, 0]          # warmer than legend range, clipped
+    assert goes._abi9(-93 + K) == [0, 255, 255]     # cyan, coldest/moist
+    assert goes._abi9(-100 + K) == [0, 255, 255]    # colder than source range, clipped
+    assert goes._abi9(-75 + K) == [60, 179, 113]
+    assert goes._abi9(-54 + K) == [120, 171, 120]
+    assert goes._abi9(-42 + K) == [255, 255, 255]   # white — moist/dry transition
+    assert goes._abi9(-30 + K) == [153, 153, 204]
+    assert goes._abi9(-24 + K) == [0, 0, 128]
+    assert goes._abi9(-18 + K) == [34, 34, 59]
+    assert goes._abi9(-12 + K) == [255, 255, 0]
+    assert goes._abi9(-5 + K) == [255, 127, 0]
+    assert goes._abi9(2 + K) == [255, 0, 0]
+    assert goes._abi9(7 + K) == [0, 0, 0]            # warmest/driest, black
+    assert goes._abi9(15 + K) == [0, 0, 0]           # warmer than source range, clipped
 
 
 def test_default_cmap_by_band_resolves_correctly():

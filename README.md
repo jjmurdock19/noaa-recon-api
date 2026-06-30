@@ -7,7 +7,7 @@ but designed to be called from any website — CORS-open, no auth, no API key.
 
 **Status:** MVP. `GET /v1/satellite/tile` (GOES Band 13/9 IR/WV archive) is
 fully implemented and verified against live NOAA data, including:
-- `cmap=default` (the recommended default) resolves server-side to the correct **per-band** standard enhancement — `abi13` for Band 13, `abi9` for Band 9 — transcribed from reference legends, since these two bands measure different physical quantities and aren't interchangeable. `ir4` (an alternate Band 13 table cited from satpy + ColorBrewer) is also available — see API.md.
+- `cmap=default` (the recommended default) resolves server-side to the correct **per-band** standard enhancement — `abi13` for Band 13, `abi9` for Band 9 — built from exact temperature→hex stops, since these two bands measure different physical quantities and aren't interchangeable. `ir4` (an alternate Band 13 table cited from satpy + ColorBrewer) is also available — see API.md.
 - `center`+`dims` bounding-box requests that render a fast, high-detail crop instead of the slow/coarse full disk (~11x faster processing, ~130x smaller file for a 500km box — measured, see API.md),
 - always-native-resolution rendering plus a smoothing pass that reduces the blocky look of the forward-projection paint step (the sensor's native ~2km/px is a hardware ceiling no processing changes — see API.md's bbox section).
 

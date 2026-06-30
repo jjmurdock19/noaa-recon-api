@@ -155,15 +155,12 @@ def _goes_ir4(t):
 
 
 # ── "Default ABI" per-band enhancements ─────────────────────────────────────
-# Transcribed from reference colorbar legends supplied directly by the
-# project owner for this exact use case (one legend per band, with axis tick
-# marks in degrees C) — these are the standard enhancements this project
-# treats as canonical for these two bands, not a third-party approximation
-# like `ir4` above. Intermediate colors between the labeled tick marks are
-# this module's best-effort visual transcription of the reference legend;
-# if a specific hue looks off compared to the source legend, adjust the
-# stops below rather than the structure (anchor temperatures come straight
-# from the legend's tick marks).
+# Exact temperature(C)->hex stops supplied directly by the project owner for
+# this exact use case (one table per band) — these are the standard
+# enhancements this project treats as canonical for these two bands, not a
+# third-party approximation like `ir4` above. Every stop below is the
+# literal source data, not a visual estimate. Original source files:
+# docs/colortable_sources/band13_colortable.json, band9_colortable.json.
 def _interp_stops(t_c, stops):
     """stops: ascending list of (temp_C, (r,g,b)). Linear interpolation
     between neighboring stops; clamps to the end colors outside the range."""
@@ -179,19 +176,22 @@ def _interp_stops(t_c, stops):
 
 
 # Band 13 (Clean IR Window, 10.3um): white at the most extreme cold
-# overshooting tops, a narrow rainbow band highlighting severe convection,
-# then greyscale (light=cold, dark=warm) across the bulk of the range —
-# per the reference legend's tick marks (-110, -59, -20, 6, 31, 57 C).
+# overshooting tops (-110C), down through black (-80C), a rainbow band
+# from -80C to -32C highlighting severe convection, a hard cut to light
+# grey at -31C, then greyscale (light=cold, dark=warm) to black at +57C.
 _ABI13_STOPS = [
     (-110, (255, 255, 255)),  # white — most extreme overshooting tops
-    (-100, (210, 0, 0)),      # red
-    (-92, (255, 140, 0)),     # orange
-    (-85, (255, 255, 0)),     # yellow
-    (-78, (0, 170, 0)),       # green
-    (-71, (0, 200, 200)),     # cyan
-    (-65, (30, 60, 220)),     # blue
-    (-59, (180, 110, 220)),   # purple — rainbow band ends, blends into greyscale
-    (-59.0001, (235, 235, 235)),  # greyscale starts here (light grey)
+    (-80, (0, 0, 0)),         # black
+    (-75, (51, 0, 0)),        # dark maroon
+    (-65, (255, 69, 0)),      # orange-red
+    (-59, (173, 255, 47)),    # green-yellow
+    (-50, (0, 255, 0)),       # green
+    (-40, (0, 0, 128)),       # navy
+    (-32, (0, 255, 255)),     # cyan — rainbow band ends here
+    (-31, (204, 204, 204)),   # hard cut to light grey — greyscale starts
+    (-20, (153, 153, 153)),
+    (6, (102, 102, 102)),
+    (31, (51, 51, 51)),
     (57, (0, 0, 0)),          # black — warmest (clear sky / ground)
 ]
 
@@ -200,17 +200,21 @@ def _abi13(t_k):
     return _interp_stops(t_k - 273.15, _ABI13_STOPS)
 
 
-# Band 9 (Mid-Level Water Vapor, 6.9um): teal/green for cold, moist
-# upper-tropospheric cloud tops, through white at the moist/dry boundary,
-# to orange/black for warm, dry airmasses — per the reference legend's tick
-# marks (-93, -54, -30, -18, -5, 7 C) and "clouds .. <<moist dry>>" labels.
+# Band 9 (Mid-Level Water Vapor, 6.9um): cyan at coldest/moist (-93C),
+# through green tones, white at the moist/dry transition (-42C), a band
+# of purple/navy/near-black indigo (-30C to -18C), then yellow/orange/red
+# to black at the warmest/driest (+7C).
 _ABI9_STOPS = [
-    (-93, (20, 130, 120)),   # teal — coldest, moist cloud tops
-    (-70, (60, 180, 100)),   # green
-    (-54, (150, 220, 150)),  # pale green
-    (-30, (255, 255, 255)),  # white — moist/dry boundary
-    (-18, (255, 255, 150)),  # pale yellow
-    (-5, (255, 140, 0)),     # orange
+    (-93, (0, 255, 255)),    # cyan — coldest, moist cloud tops
+    (-75, (60, 179, 113)),   # medium sea green
+    (-54, (120, 171, 120)),  # muted green
+    (-42, (255, 255, 255)),  # white — moist/dry transition
+    (-30, (153, 153, 204)),  # light purple
+    (-24, (0, 0, 128)),      # navy
+    (-18, (34, 34, 59)),     # dark indigo
+    (-12, (255, 255, 0)),    # yellow
+    (-5, (255, 127, 0)),     # orange
+    (2, (255, 0, 0)),        # red
     (7, (0, 0, 0)),          # black — warmest, driest
 ]
 
