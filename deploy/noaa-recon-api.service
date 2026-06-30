@@ -12,7 +12,7 @@ After=network.target
 Type=simple
 User=server
 WorkingDirectory=/var/www/html/noaa-recon-api
-ExecStart=/var/www/html/noaa-recon-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+ExecStart=/var/www/html/noaa-recon-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --root-path /api
 Restart=on-failure
 RestartSec=5
 

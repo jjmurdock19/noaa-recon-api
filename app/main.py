@@ -1,12 +1,19 @@
-from fastapi import FastAPI
+import logging
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import auth
+from app.logging_config import configure_logging
 from app.paths import CACHE_ROOT, REPO_ROOT
 from app.routers import admin, health, raw, satellite, tdr
+
+configure_logging()
+access_log = logging.getLogger("noaa_recon_api.access")
 
 app = FastAPI(
     title="noaa-recon-api",
@@ -34,6 +41,29 @@ app.add_middleware(
 # Secret key is generated once into the gitignored admin_credentials.json on
 # first run, not hardcoded — see app/auth.py.
 app.add_middleware(SessionMiddleware, secret_key=auth.get_secret_key())
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """One log line per request (method, path, status, duration, client) to
+    logs/app.log — see app/logging_config.py. Logs and re-raises on an
+    unhandled exception so failures land in the file too, not just a 500
+    response with no trace of why."""
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.monotonic() - start) * 1000
+        client = request.client.host if request.client else "-"
+        access_log.exception("%s %s -> EXCEPTION (%.1fms) client=%s", request.method, request.url.path, duration_ms, client)
+        raise
+    duration_ms = (time.monotonic() - start) * 1000
+    client = request.client.host if request.client else "-"
+    access_log.info(
+        "%s %s -> %d (%.1fms) client=%s",
+        request.method, request.url.path, response.status_code, duration_ms, client,
+    )
+    return response
 
 app.mount("/cache", StaticFiles(directory=str(CACHE_ROOT)), name="cache")
 app.mount(

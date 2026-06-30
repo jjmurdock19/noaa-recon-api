@@ -98,6 +98,17 @@
   .status-text.err { color: #f87171; }
   .status-text.working { color: #fbbf24; }
   #query-result img { max-width: 100%; border-radius: 6px; margin-top: 10px; border: 1px solid #334155; }
+  .view-btn {
+    background: #1e3a5f; border: 1px solid #1d4ed8; color: #93c5fd;
+    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
+  }
+  .view-btn:hover { background: #1d4ed8; color: #fff; }
+  .preview-flex { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .preview-flex img { max-width: 480px; max-height: 480px; border-radius: 6px; border: 1px solid #334155; }
+  .meta-table { border-collapse: collapse; font-size: 11px; min-width: 280px; }
+  .meta-table td { padding: 4px 10px 4px 0; border-bottom: 1px solid #1e293b; vertical-align: top; }
+  .meta-table td:first-child { color: #94a3b8; white-space: nowrap; }
+  .nc-section-title { color: #7dd3fc; font-size: 11px; text-transform: uppercase; margin: 14px 0 6px; }
 
   #prefetch-progress {
     margin-top: 10px; display: none;
@@ -159,6 +170,11 @@
       <thead><tr><th>Filename</th><th>Scan start</th><th>Size</th><th>Modified</th><th></th></tr></thead>
       <tbody id="goesnc-cache-body"></tbody>
     </table>
+  </section>
+
+  <section id="preview-section" style="display:none;">
+    <h2>Preview <button class="clear-btn" id="preview-close-btn">Close</button></h2>
+    <div id="preview-body"></div>
   </section>
 
   <section>
@@ -337,9 +353,13 @@ async function refreshStatus() {
         </div>`).join('');
 }
 
+let _satelliteEntries = [];
+let _goesNcEntries = [];
+
 async function refreshSatelliteCache() {
     const res = await api('/v1/admin/cache/satellite');
     const data = await res.json();
+    _satelliteEntries = data.entries;
     const body = document.getElementById('satellite-cache-body');
     if (!data.entries.length) {
         body.innerHTML = '<tr class="empty-row"><td colspan="9">No cached tiles.</td></tr>';
@@ -355,8 +375,14 @@ async function refreshSatelliteCache() {
             <td>${e.center ? e.center.map(c => c.toFixed(2)).join(',') : 'full disk'}</td>
             <td>${fmtBytes(e.size_bytes)}</td>
             <td>${e.modified ? e.modified.slice(0, 16).replace('T', ' ') : ''}</td>
-            <td><button class="del-btn" data-key="${e.key}">Delete</button></td>
+            <td>
+                <button class="view-btn" data-key="${e.key}">View</button>
+                <button class="del-btn" data-key="${e.key}">Delete</button>
+            </td>
         </tr>`).join('');
+    body.querySelectorAll('.view-btn').forEach(btn => {
+        btn.addEventListener('click', () => previewSatelliteEntry(btn.dataset.key));
+    });
     body.querySelectorAll('.del-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             await api(`/v1/admin/cache/satellite/${encodeURIComponent(btn.dataset.key)}`, { method: 'DELETE' });
@@ -368,6 +394,7 @@ async function refreshSatelliteCache() {
 async function refreshGoesNcCache() {
     const res = await api('/v1/admin/cache/goes_nc');
     const data = await res.json();
+    _goesNcEntries = data.entries;
     const body = document.getElementById('goesnc-cache-body');
     if (!data.entries.length) {
         body.innerHTML = '<tr class="empty-row"><td colspan="5">No cached netCDF files.</td></tr>';
@@ -379,14 +406,84 @@ async function refreshGoesNcCache() {
             <td>${e.scan_start ? e.scan_start.slice(0, 16).replace('T', ' ') : ''}</td>
             <td>${fmtBytes(e.size_bytes)}</td>
             <td>${e.modified.slice(0, 16).replace('T', ' ')}</td>
-            <td><button class="del-btn" data-name="${e.filename}">Delete</button></td>
+            <td>
+                <button class="view-btn" data-name="${e.filename}">View</button>
+                <button class="del-btn" data-name="${e.filename}">Delete</button>
+            </td>
         </tr>`).join('');
+    body.querySelectorAll('.view-btn').forEach(btn => {
+        btn.addEventListener('click', () => previewGoesNcEntry(btn.dataset.name));
+    });
     body.querySelectorAll('.del-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(btn.dataset.name)}`, { method: 'DELETE' });
             refreshGoesNcCache(); refreshStatus();
         });
     });
+}
+
+// ── Preview pane ───────────────────────────────────────────────────────
+function showPreview(html) {
+    document.getElementById('preview-body').innerHTML = html;
+    document.getElementById('preview-section').style.display = 'block';
+    document.getElementById('preview-section').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+document.getElementById('preview-close-btn').addEventListener('click', () => {
+    document.getElementById('preview-section').style.display = 'none';
+});
+
+function previewSatelliteEntry(key) {
+    const e = _satelliteEntries.find(x => x.key === key);
+    if (!e) return;
+    const rows = Object.entries(e)
+        .filter(([k]) => !['png_url'].includes(k))
+        .map(([k, v]) => `<tr><td>${k}</td><td>${v == null ? '—' : (Array.isArray(v) ? JSON.stringify(v) : v)}</td></tr>`)
+        .join('');
+    const imgSrc = e.png_url ? API_BASE + e.png_url : '';
+    showPreview(`
+        <div class="preview-flex">
+            ${imgSrc ? `<img src="${imgSrc}" alt="${key}" />` : '<div class="status-text">No image (not ready).</div>'}
+            <table class="meta-table">${rows}</table>
+        </div>
+    `);
+}
+
+async function previewGoesNcEntry(filename) {
+    showPreview('<div class="status-text">Loading…</div>');
+    try {
+        const res = await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(filename)}/info`);
+        if (!res.ok) {
+            const err = await res.json();
+            showPreview(`<div class="status-text err">Error: ${err.detail || 'failed to read file'}</div>`);
+            return;
+        }
+        const info = await res.json();
+        const dimRows = Object.entries(info.dimensions).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+        const varRows = info.variables.map(v => `
+            <tr>
+                <td>${v.name}</td>
+                <td>${v.dimensions.join(', ')}</td>
+                <td>${v.shape.join(' x ')}</td>
+                <td>${v.dtype}</td>
+                <td>${v.units || ''}</td>
+                <td>${v.long_name || ''}</td>
+            </tr>`).join('');
+        const attrRows = Object.entries(info.global_attrs).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+        showPreview(`
+            <div class="status-text">${filename} — ${fmtBytes(info.size_bytes)}</div>
+            <div class="nc-section-title">Dimensions</div>
+            <table class="meta-table">${dimRows}</table>
+            <div class="nc-section-title">Variables</div>
+            <table>
+                <thead><tr><th>Name</th><th>Dims</th><th>Shape</th><th>Dtype</th><th>Units</th><th>Long name</th></tr></thead>
+                <tbody>${varRows}</tbody>
+            </table>
+            <div class="nc-section-title">Global attributes</div>
+            <table class="meta-table">${attrRows}</table>
+        `);
+    } catch (e) {
+        showPreview(`<div class="status-text err">Network error: ${e.message}</div>`);
+    }
 }
 
 document.getElementById('clear-satellite-btn').addEventListener('click', async () => {
