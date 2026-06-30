@@ -68,19 +68,41 @@ until `status` becomes `"ready"` or `"error"`.
 |---|---|---|---|
 | `time` | ISO 8601 UTC datetime | *required* | e.g. `2024-09-28T12:00:00Z`. Resolved to the nearest available scan. |
 | `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm). Band 2 (visible) and GeoColor are planned, not yet accepted. |
-| `cmap` | string | `bd` | One of `bd`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
+| `cmap` | string | `bd` | One of `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
 | `satellite` | string | `goes-east` | Only `goes-east` is implemented (auto-resolves GOES-16 vs GOES-19 by date). `goes-west` returns `400`. |
+| `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. |
+| `dims` | float | *(none)* | Full width/height of the box centered on `center` (a square box). Requires `center`. Clamped to 10–8000km. |
+| `unit` | string | `nm` | Unit for `dims`: `nm` (nautical miles) or `km`. |
+| `resolution_km` | float | *(native)* | km per output pixel for a bbox request. Omit for the sensor's native resolution (highest detail — 2km for bands 9/13 today). Increase to render faster / produce a smaller file; can't go finer than native (silently clamped up). |
 
 ### Color tables (`cmap`)
 
 | Value | Description |
 |---|---|
-| `bd` | Standard NWS BD enhancement — greyscale for warm/moderate tops, blue→purple→red for cold convection |
+| `bd` | Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue→purple→red for cold convection |
+| `ir4` | **The true GOES Band 13 standard enhancement.** Sourced verbatim from [satpy](https://github.com/pytroll/satpy)'s (the standard open-source ABI processing library) `colorized_ir_clouds` enhancement: greyscale from -20°C to +30°C, then the [ColorBrewer "Spectral"](https://colorbrewer2.org) 11-class diverging palette from -80°C to -20°C (coldest = dark red, warming toward purple at the greyscale boundary). Not an in-house approximation like the others — see `app/services/goes.py` for the exact cited breakpoints. |
 | `enhanced` | Darker surface/low clouds, white mid/high clouds, color for coldest tops |
 | `nrl` | Naval Research Lab tropical cyclone enhancement — smooth yellow-green→cyan→blue→purple→red ramp |
 | `grayscale` | Plain linear greyscale by brightness temperature |
 
-### Example request
+### Bounding-box requests (`center` + `dims`)
+
+By default the API renders the **full disk** (~162° across), downsampled
+for a manageable file size — fine for an overview, but slow (10-15s to
+process) and low-detail for a specific storm. Passing `center` + `dims`
+instead renders **only that area, at up to the sensor's native ~2km
+resolution** — both meaningfully faster to process and far more detailed.
+Measured on this deployment: a 500km box at native resolution processes in
+**~1.3s vs. ~14s for a full-disk render** (image data only — the initial
+~25MB NOAA S3 download is unaffected either way and is the dominant cost
+on a cold cache), and produces a **~130x smaller PNG** (tens of KB instead
+of several MB).
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=ir4&center=25.7617,-80.1918&dims=270&unit=nm"
+```
+
+### Example request (full disk)
 
 ```bash
 curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=bd"
@@ -102,13 +124,23 @@ After polling to completion:
   "cmap": "bd",
   "satellite": "GOES-16",
   "sat_lon": -75.0,
-  "scan_start": "2024-09-28T11:56:21+00:00"
+  "scan_start": "2024-09-28T11:56:21+00:00",
+  "center": null,
+  "width_km": null,
+  "resolution_km": null
 }
 ```
 
+A bbox request's `ready` response additionally has `center` (`[lat, lon]`),
+`width_km` (the resolved box size — note `dims`/`unit` get converted to km),
+and `resolution_km` (the resolved render resolution, native unless you
+overrode it) populated instead of `null`.
+
 - `png_url` is **relative to the API's own base URL**, not the page you're
-  integrating into — prefix it yourself: `base + png_url`. It is a
-  2048×2048 RGBA PNG; transparent pixels are off-disk/no-data.
+  integrating into — prefix it yourself: `base + png_url`. For a full-disk
+  request it's a 2048×2048 RGBA PNG; for a bbox request its size is
+  `width_km / resolution_km` pixels (clamped to 64–4096). Transparent
+  pixels are off-disk/no-data either way.
 - `bounds` is `[[lat_south, lon_west], [lat_north, lon_east]]` — the exact
   format `L.imageOverlay(url, bounds)` expects in Leaflet.
 - `scan_start` is the **actual** scan time used, which may differ from your
@@ -119,6 +151,12 @@ After polling to completion:
 ```json
 {"status": "error", "key": "...", "message": "No GOES Band 13 scan found near ..."}
 ```
+
+A bbox request can also fail with messages like `"Requested area is outside
+this scan's visible disk"` (point not on the half of Earth this satellite
+sees) — `center`/`dims` are still validated (lat/lon range, box size
+bounds) before the scan is even resolved, so malformed requests fail fast
+with `400` rather than waiting on a render.
 
 ---
 
@@ -195,9 +233,14 @@ curl -s "https://joshmurdock.net/api/v1/satellite/status/$KEY"
 ```javascript
 const API_BASE = 'https://joshmurdock.net/api';
 
-async function loadGoesTile(map, { time, band = 13, cmap = 'bd' }) {
-  const params = new URLSearchParams({ time, band, cmap });
-  let data = await fetch(`${API_BASE}/v1/satellite/tile?${params}`).then(r => r.json());
+// Pass { center: '25.5,-80.3', dims: 270, unit: 'nm' } to render a fast,
+// high-detail box instead of the full disk — see "Bounding-box requests" above.
+async function loadGoesTile(map, { time, band = 13, cmap = 'bd', center, dims, unit, resolution_km }) {
+  const params = { time, band, cmap };
+  if (center) Object.assign(params, { center, dims, unit: unit || 'nm' });
+  if (resolution_km) params.resolution_km = resolution_km;
+
+  let data = await fetch(`${API_BASE}/v1/satellite/tile?${new URLSearchParams(params)}`).then(r => r.json());
 
   while (data.status === 'generating') {
     await new Promise(res => setTimeout(res, 3000));
@@ -208,10 +251,11 @@ async function loadGoesTile(map, { time, band = 13, cmap = 'bd' }) {
   return L.imageOverlay(API_BASE + data.png_url, data.bounds, { opacity: 0.85 }).addTo(map);
 }
 
-// loadGoesTile(map, { time: new Date().toISOString() });
+// Full disk:      loadGoesTile(map, { time: new Date().toISOString() });
+// Fast regional:  loadGoesTile(map, { time: new Date().toISOString(), cmap: 'ir4', center: '25.7617,-80.1918', dims: 270, unit: 'nm' });
 ```
 
-(This is exactly the pattern used in the hurricanes tracker site's `js/api-explorer.js` — see that file for the full version with status-polling UI, band/colormap pickers, etc.)
+(This is exactly the pattern used in the hurricanes tracker site's `js/api-explorer.js` — see that file for the full version with status-polling UI, the click-on-map point picker, band/colormap pickers, etc.)
 
 ### Python — fetch and save the PNG locally
 
@@ -249,8 +293,18 @@ def fetch_goes_tile(time_iso, band=13, cmap="bd"):
   Be a good citizen: cache results client-side where you can, and avoid
   polling faster than every 3s.
 - The `key` returned by `/v1/satellite/tile` is deterministic for a given
-  `(band, cmap, satellite, resolved-scan-time)` — repeated identical
-  requests are cheap (cache hit), not re-rendered.
+  `(band, cmap, satellite, resolved-scan-time)` (plus `center`/`width_km`/
+  `resolution_km` for a bbox request) — repeated identical requests are
+  cheap (cache hit), not re-rendered.
+- Prefer `center`+`dims` over a full-disk request whenever you know roughly
+  where you need imagery (e.g. you already have a storm's lat/lon) — it's
+  both faster to process and much higher detail. The first request for a
+  given *scan* still has to download ~25MB from NOAA S3 regardless of bbox
+  vs. full-disk (that part isn't optimized yet); the bbox speedup is in the
+  reprojection/render step and the output file size.
+- `resolution_km` can't go finer than the sensor's native pixel size (2km
+  for bands 9/13 today) — requesting finer is silently clamped up to native
+  rather than erroring, so it's safe to pass an optimistic value.
 - The OpenAPI schema at `{base}/openapi.json` is generated directly from
   the route definitions and is the most authoritative machine-readable
   source if this document drifts.

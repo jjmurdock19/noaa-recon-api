@@ -66,6 +66,52 @@ def test_parse_scan_start_extracts_utc_datetime():
     assert dt == datetime.datetime(2024, 9, 26, 12, 0, 20, tzinfo=datetime.timezone.utc)
 
 
+# ── ir4 colortable ────────────────────────────────────────────────────────
+def test_ir4_matches_cited_breakpoints_exactly():
+    # Source: satpy's colorized_ir_clouds enhancement (generic.yaml) + the
+    # ColorBrewer Spectral-11 palette it references. These are exact, not
+    # approximations, so check them at full float precision (not through
+    # the 256-level _t2i index, which would introduce quantization noise).
+    K = 273.15
+    assert goes._goes_ir4(30 + K) == [0, 0, 0]            # warmest clipped to black
+    assert goes._goes_ir4(0 + K) == [153, 153, 153]        # mid greyscale
+    assert goes._goes_ir4(-20 + K) == [94, 79, 162]         # grey/color boundary -> Spectral[10] (purple)
+    assert goes._goes_ir4(-80 + K) == [158, 1, 66]          # coldest -> Spectral[0] (dark red)
+    assert goes._goes_ir4(-90 + K) == [158, 1, 66]          # colder than -80C clipped, not extrapolated
+
+
+def test_ir4_registered_in_luts():
+    assert "ir4" in goes.LUTS
+    assert goes.LUTS["ir4"].shape == (256, 3)
+
+
+# ── bbox request validation ──────────────────────────────────────────────
+def test_resolve_bbox_request_defaults_to_native_resolution():
+    bbox = goes.resolve_bbox_request(25.5, -80.3, 500.0, None, band=13)
+    assert bbox.resolution_km == goes.NATIVE_GSD_KM[13]
+
+
+def test_resolve_bbox_request_cannot_exceed_native_resolution():
+    # Asking for finer than native (e.g. 0.5 km/px) clamps up to native (2km),
+    # since the sensor physically can't resolve finer than that.
+    bbox = goes.resolve_bbox_request(25.5, -80.3, 500.0, 0.5, band=13)
+    assert bbox.resolution_km == goes.NATIVE_GSD_KM[13]
+
+
+def test_resolve_bbox_request_clamps_width_to_bounds():
+    too_small = goes.resolve_bbox_request(0, 0, 1.0, None, band=13)
+    assert too_small.width_km == goes.MIN_BBOX_WIDTH_KM
+    too_large = goes.resolve_bbox_request(0, 0, 50000.0, None, band=13)
+    assert too_large.width_km == goes.MAX_BBOX_WIDTH_KM
+
+
+def test_resolve_bbox_request_rejects_invalid_lat_lon():
+    with pytest.raises(ValueError):
+        goes.resolve_bbox_request(95.0, 0.0, 500.0, None, band=13)
+    with pytest.raises(ValueError):
+        goes.resolve_bbox_request(0.0, 200.0, 500.0, None, band=13)
+
+
 @pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
 def test_resolve_and_render_matches_goes_tile_py_bounds(tmp_path):
     """End-to-end sanity check: render a known recent scan and confirm the
@@ -81,3 +127,30 @@ def test_resolve_and_render_matches_goes_tile_py_bounds(tmp_path):
     (lat_s, lon_w), (lat_n, lon_e) = meta["bounds"]
     assert lat_n - lat_s == pytest.approx(162.6, abs=0.1)
     assert lon_e - lon_w == pytest.approx(162.0, abs=0.1)
+
+
+@pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
+def test_bbox_render_is_native_resolution_and_correctly_bounded(tmp_path):
+    """Render a small box over a known point (Miami) and confirm: the output
+    is sized for native ~2km/px resolution (not the full-disk downsample),
+    bounds match the requested box, and a real (non-empty) image comes out."""
+    from PIL import Image as PILImage
+
+    target = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=6)
+    resolved = goes.resolve_nearest(target, band=13)
+    nc_path = goes.ensure_downloaded(resolved, tmp_path / "nc")
+    out_png = tmp_path / "bbox.png"
+
+    bbox = goes.resolve_bbox_request(25.7617, -80.1918, 500.0, None, band=13)  # Miami, 500km box
+    meta = goes.render_bbox_to_png(nc_path, 13, "ir4", out_png, bbox)
+
+    assert out_png.exists()
+    (lat_s, lon_w), (lat_n, lon_e) = meta["bounds"]
+    assert lat_n - lat_s == pytest.approx(500.0 / goes.KM_PER_DEG_LAT, rel=0.05)
+    assert meta["resolution_km"] == 2.0
+    assert meta["out_size"] == pytest.approx(250, abs=2)  # 500km / 2km-per-px
+
+    im = PILImage.open(out_png)
+    assert im.size == (meta["out_size"], meta["out_size"])
+    arr = np.array(im)
+    assert (arr[:, :, 3] > 0).sum() > 0  # at least some opaque (real data) pixels

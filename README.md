@@ -6,9 +6,13 @@ passthrough for client-side rendering. Built for a hurricane tracker site
 but designed to be called from any website — CORS-open, no auth, no API key.
 
 **Status:** MVP. `GET /v1/satellite/tile` (GOES Band 13/9 IR/WV archive) is
-fully implemented and verified against live NOAA data. Band 2/GeoColor, TDR,
-and the raw-netCDF passthrough are stubbed (`501 Not Implemented`) pending
-follow-up phases — see "Roadmap" below.
+fully implemented and verified against live NOAA data, including:
+- a true-to-source `ir4` color table (cited from satpy + ColorBrewer, not an approximation — see API.md),
+- `center`+`dims` bounding-box requests that render a fast, high-detail crop instead of the slow/coarse full disk (~11x faster processing, ~130x smaller file for a 500km box — measured, see API.md),
+- a `resolution_km` param to trade detail for speed, defaulting to the sensor's native ~2km/px.
+
+Band 2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed
+(`501 Not Implemented`) pending follow-up phases — see "Roadmap" below.
 
 **📖 Full endpoint reference + integration examples (curl/JS/Python): [API.md](API.md)**
 **🤖 Agent-readable summary: [llms.txt](llms.txt)** (also served live at `{base}/llms.txt`)
@@ -186,9 +190,12 @@ app/
     health.py           GET /v1/health
   services/
     goes.py             Ported from the hurricanes site's goes_tile.py: ABI Fixed Grid reprojection
-                         (PUG Vol 5 Sec 4.2), 4 color LUTs, S3 download, PNG render. Adds
-                         resolve_nearest() for true ~10-min resolution (picks the closest scan
-                         to an arbitrary timestamp, not just "first file in the hour").
+                         (PUG Vol 5 Sec 4.2), 5 color LUTs (incl. the cited-source `ir4`), S3
+                         download, PNG render. Adds resolve_nearest() for true ~10-min resolution
+                         (picks the closest scan to an arbitrary timestamp, not just "first file
+                         in the hour"), and render_bbox_to_png() — a two-pass sparse-locate +
+                         native-resolution-crop renderer for center+dims requests (see
+                         render_to_png() for the original full-disk path, unchanged).
     cache.py            ResultCache: lock-file + TTL pattern (mirrors proxy.php's approach),
                          driven by FastAPI BackgroundTasks instead of subprocess/nohup.
     tdr.py              Empty stub — see its docstring for the planned crawler/parse/render shape.
