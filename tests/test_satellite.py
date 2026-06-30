@@ -85,6 +85,45 @@ def test_ir4_registered_in_luts():
     assert goes.LUTS["ir4"].shape == (256, 3)
 
 
+# ── "default ABI" per-band colortables ───────────────────────────────────
+def test_abi13_matches_reference_legend_anchors():
+    # Transcribed from the project owner's reference legend (tick marks at
+    # -110, -59, -20, 6, 31, 57 C): white at the extreme cold end, a narrow
+    # rainbow band, then greyscale (light=cold, dark=warm) for the bulk.
+    K = 273.15
+    assert goes._abi13(-110 + K) == [255, 255, 255]   # most extreme cold -> white
+    assert goes._abi13(-115 + K) == [255, 255, 255]   # colder than legend range, clipped not extrapolated
+    assert goes._abi13(57 + K) == [0, 0, 0]            # warmest -> black
+    assert goes._abi13(65 + K) == [0, 0, 0]            # warmer than legend range, clipped
+    # Bulk of the range is greyscale (per the user's "large amount of grey/black" note)
+    r, g, b = goes._abi13(6 + K)
+    assert r == g == b
+
+
+def test_abi9_matches_reference_legend_anchors():
+    # Transcribed from the project owner's reference legend (tick marks at
+    # -93, -54, -30, -18, -5, 7 C, labeled "clouds .. <<moist  dry>>"):
+    # teal at coldest/moist, white at the moist/dry boundary, black at
+    # warmest/driest.
+    K = 273.15
+    assert goes._abi9(-93 + K) == [20, 130, 120]   # coldest/moist -> teal
+    assert goes._abi9(-100 + K) == [20, 130, 120]  # colder than legend range, clipped
+    assert goes._abi9(-30 + K) == [255, 255, 255]  # moist/dry boundary -> white
+    assert goes._abi9(7 + K) == [0, 0, 0]           # warmest/driest -> black
+    assert goes._abi9(15 + K) == [0, 0, 0]          # warmer than legend range, clipped
+
+
+def test_default_cmap_by_band_resolves_correctly():
+    assert goes.DEFAULT_CMAP_BY_BAND[13] == "abi13"
+    assert goes.DEFAULT_CMAP_BY_BAND[9] == "abi9"
+
+
+def test_abi13_and_abi9_registered_in_luts():
+    for name in ("abi13", "abi9"):
+        assert name in goes.LUTS
+        assert goes.LUTS[name].shape == (256, 3)
+
+
 # ── bbox request validation ──────────────────────────────────────────────
 def test_resolve_bbox_request_defaults_to_native_resolution():
     bbox = goes.resolve_bbox_request(25.5, -80.3, 500.0, None, band=13)

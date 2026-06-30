@@ -13,7 +13,7 @@ router = APIRouter(prefix="/satellite", tags=["satellite"])
 _cache = ResultCache(CACHE_ROOT / "satellite")
 _nc_cache_dir = CACHE_ROOT / "goes_nc"
 
-VALID_CMAPS = set(goes.LUTS.keys())
+VALID_CMAPS = set(goes.LUTS.keys()) | {"default"}
 VALID_BANDS = {9, 13}  # Band 2 (visible) / GeoColor are follow-up phases
 NM_PER_KM = 1.0 / 1.852
 
@@ -34,7 +34,13 @@ async def get_tile(
     background_tasks: BackgroundTasks,
     time: datetime.datetime = Query(..., description="UTC timestamp, e.g. 2024-09-28T12:00:00Z"),
     band: int = Query(13, description="13 = Clean IR, 9 = Water Vapor"),
-    cmap: str = Query("bd", description="bd | enhanced | nrl | grayscale | ir4"),
+    cmap: str = Query(
+        "default",
+        description="default | abi13 | abi9 | bd | ir4 | enhanced | nrl | grayscale. "
+        "'default' resolves to the correct per-band standard enhancement (abi13 for band=13, "
+        "abi9 for band=9) — these are not interchangeable, since Band 13 (IR window) and Band 9 "
+        "(water vapor) represent different physical quantities and use different color conventions.",
+    ),
     satellite: str = Query("goes-east", description="Only 'goes-east' is implemented currently"),
     center: Optional[str] = Query(
         None, description="'lat,lon' — render only a box around this point instead of the full disk. Requires `dims`."
@@ -55,6 +61,8 @@ async def get_tile(
         raise HTTPException(400, f"band must be one of {sorted(VALID_BANDS)}")
     if cmap not in VALID_CMAPS:
         raise HTTPException(400, f"cmap must be one of {sorted(VALID_CMAPS)}")
+    if cmap == "default":
+        cmap = goes.DEFAULT_CMAP_BY_BAND[band]
     if unit not in ("nm", "km"):
         raise HTTPException(400, "unit must be 'nm' or 'km'")
     if (center is None) != (dims is None):

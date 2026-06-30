@@ -68,7 +68,7 @@ until `status` becomes `"ready"` or `"error"`.
 |---|---|---|---|
 | `time` | ISO 8601 UTC datetime | *required* | e.g. `2024-09-28T12:00:00Z`. Resolved to the nearest available scan. |
 | `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm). Band 2 (visible) and GeoColor are planned, not yet accepted. |
-| `cmap` | string | `bd` | One of `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
+| `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
 | `satellite` | string | `goes-east` | Only `goes-east` is implemented (auto-resolves GOES-16 vs GOES-19 by date). `goes-west` returns `400`. |
 | `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. |
 | `dims` | float | *(none)* | Full width/height of the box centered on `center` (a square box). Requires `center`. Clamped to 10–8000km. |
@@ -77,10 +77,20 @@ until `status` becomes `"ready"` or `"error"`.
 
 ### Color tables (`cmap`)
 
+`default` is recommended for almost all use — it resolves server-side to
+the correct **per-band** standard enhancement (`abi13` for `band=13`,
+`abi9` for `band=9`). Band 13 (IR window) and Band 9 (water vapor) measure
+different physical quantities and use genuinely different color
+conventions — there is no single colortable that's correct for both, so
+`default` is band-aware rather than a fixed choice.
+
 | Value | Description |
 |---|---|
+| `default` | Resolves to `abi13` or `abi9` based on `band` (see below). |
+| `abi13` | **Band 13 standard enhancement.** White at the most extreme cold overshooting convective tops, a narrow rainbow band highlighting severe convection, then greyscale (light=cold, dark=warm) across the bulk of the range — most scenes are mostly greyscale, with color only appearing over genuinely severe convection. Transcribed from a reference legend (tick marks at -110, -59, -20, 6, 31, 57°C) — see `app/services/goes.py` for the exact stops. |
+| `abi9` | **Band 9 (water vapor) standard enhancement.** Teal/green for cold, moist upper-tropospheric cloud tops, through white at the moist/dry boundary, to orange/black for warm, dry airmasses. Transcribed from a reference legend (tick marks at -93, -54, -30, -18, -5, 7°C, labeled "clouds / moist / dry"). Do not use this for Band 13 (or vice versa) — it represents a different physical quantity. |
+| `ir4` | An alternate Band 13 enhancement sourced verbatim from [satpy](https://github.com/pytroll/satpy)'s `colorized_ir_clouds` enhancement: greyscale -20°C to +30°C, then the [ColorBrewer "Spectral"](https://colorbrewer2.org) 11-class diverging palette -80°C to -20°C. Kept for comparison; `abi13` is the recommended default for Band 13. |
 | `bd` | Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue→purple→red for cold convection |
-| `ir4` | **The true GOES Band 13 standard enhancement.** Sourced verbatim from [satpy](https://github.com/pytroll/satpy)'s (the standard open-source ABI processing library) `colorized_ir_clouds` enhancement: greyscale from -20°C to +30°C, then the [ColorBrewer "Spectral"](https://colorbrewer2.org) 11-class diverging palette from -80°C to -20°C (coldest = dark red, warming toward purple at the greyscale boundary). Not an in-house approximation like the others — see `app/services/goes.py` for the exact cited breakpoints. |
 | `enhanced` | Darker surface/low clouds, white mid/high clouds, color for coldest tops |
 | `nrl` | Naval Research Lab tropical cyclone enhancement — smooth yellow-green→cyan→blue→purple→red ramp |
 | `grayscale` | Plain linear greyscale by brightness temperature |
@@ -99,29 +109,29 @@ on a cold cache), and produces a **~130x smaller PNG** (tens of KB instead
 of several MB).
 
 ```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=ir4&center=25.7617,-80.1918&dims=270&unit=nm"
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&center=25.7617,-80.1918&dims=270&unit=nm"
 ```
 
 ### Example request (full disk)
 
 ```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=bd"
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13"
 ```
 
 First call (job started):
 ```json
-{"status": "generating", "key": "goes_13_bd_16_20240928T115621"}
+{"status": "generating", "key": "goes_13_abi13_16_20240928T115621"}
 ```
 
 After polling to completion:
 ```json
 {
   "status": "ready",
-  "key": "goes_13_bd_16_20240928T115621",
-  "png_url": "/cache/satellite/goes_13_bd_16_20240928T115621.png",
+  "key": "goes_13_abi13_16_20240928T115621",
+  "png_url": "/cache/satellite/goes_13_abi13_16_20240928T115621.png",
   "bounds": [[-81.3, -156.0], [81.3, 6.0]],
   "band": 13,
-  "cmap": "bd",
+  "cmap": "abi13",
   "satellite": "GOES-16",
   "sat_lon": -75.0,
   "scan_start": "2024-09-28T11:56:21+00:00",
@@ -130,6 +140,10 @@ After polling to completion:
   "resolution_km": null
 }
 ```
+
+Note `cmap` in the response is the **resolved** table (`abi13`), not the
+literal `default` you requested — always read it back from the response
+rather than assuming.
 
 A bbox request's `ready` response additionally has `center` (`[lat, lon]`),
 `width_km` (the resolved box size — note `dims`/`unit` get converted to km),
@@ -235,7 +249,7 @@ const API_BASE = 'https://joshmurdock.net/api';
 
 // Pass { center: '25.5,-80.3', dims: 270, unit: 'nm' } to render a fast,
 // high-detail box instead of the full disk — see "Bounding-box requests" above.
-async function loadGoesTile(map, { time, band = 13, cmap = 'bd', center, dims, unit, resolution_km }) {
+async function loadGoesTile(map, { time, band = 13, cmap = 'default', center, dims, unit, resolution_km }) {
   const params = { time, band, cmap };
   if (center) Object.assign(params, { center, dims, unit: unit || 'nm' });
   if (resolution_km) params.resolution_km = resolution_km;
@@ -252,7 +266,7 @@ async function loadGoesTile(map, { time, band = 13, cmap = 'bd', center, dims, u
 }
 
 // Full disk:      loadGoesTile(map, { time: new Date().toISOString() });
-// Fast regional:  loadGoesTile(map, { time: new Date().toISOString(), cmap: 'ir4', center: '25.7617,-80.1918', dims: 270, unit: 'nm' });
+// Fast regional:  loadGoesTile(map, { time: new Date().toISOString(), center: '25.7617,-80.1918', dims: 270, unit: 'nm' });
 ```
 
 (This is exactly the pattern used in the hurricanes tracker site's `js/api-explorer.js` — see that file for the full version with status-polling UI, the click-on-map point picker, band/colormap pickers, etc.)
@@ -264,7 +278,7 @@ import time, requests
 
 API_BASE = "https://joshmurdock.net/api"
 
-def fetch_goes_tile(time_iso, band=13, cmap="bd"):
+def fetch_goes_tile(time_iso, band=13, cmap="default"):
     r = requests.get(f"{API_BASE}/v1/satellite/tile",
                       params={"time": time_iso, "band": band, "cmap": cmap})
     data = r.json()
