@@ -70,7 +70,7 @@ until `status` becomes `"ready"` or `"error"`.
 | `time` | ISO 8601 UTC datetime | *required* | e.g. `2024-09-28T12:00:00Z`. Resolved to the nearest available scan. |
 | `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm). Band 2 (visible) and GeoColor are planned, not yet accepted. |
 | `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
-| `satellite` | string | `goes-east` | Only `goes-east` is implemented (auto-resolves GOES-16 vs GOES-19 by date). `goes-west` returns `400`. |
+| `satellite` | string | `goes-east` | `goes-east` (auto-resolves GOES-16 vs GOES-19 by date) or `goes-west` (auto-resolves GOES-17 vs GOES-18 by date). Both only cover the ABI era (~2017-2018 onward) — see "Satellite coverage" below. |
 | `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. |
 | `dims` | float | *(none)* | Full width/height of the box centered on `center` (a square box). Requires `center`. Clamped to 10–8000km. |
 | `unit` | string | `nm` | Unit for `dims`: `nm` (nautical miles) or `km`. |
@@ -95,6 +95,29 @@ conventions — there is no single colortable that's correct for both, so
 | `enhanced` | Darker surface/low clouds, white mid/high clouds, color for coldest tops |
 | `nrl` | Naval Research Lab tropical cyclone enhancement — smooth yellow-green→cyan→blue→purple→red ramp |
 | `grayscale` | Plain linear greyscale by brightness temperature |
+
+### Satellite coverage (`satellite`)
+
+| Satellite | Bucket | Active dates |
+|---|---|---|
+| GOES-16 (East) | `noaa-goes16` | until 2025-01-14 |
+| GOES-19 (East) | `noaa-goes19` | 2025-01-14 onward |
+| GOES-17 (West) | `noaa-goes17` | until 2023-01-10 (earliest data ~2018) |
+| GOES-18 (West) | `noaa-goes18` | 2023-01-10 onward |
+
+`satellite=goes-east`/`goes-west` auto-resolve to the right satellite for
+the requested `time`; you don't need to track these cutover dates
+yourself.
+
+**This only reaches the ABI era (~2017-2018 onward).** Older storms (e.g.
+Hurricane Katrina, 2005) were observed by earlier GOES satellites (GOES-12
+at the time) using a completely different instrument — not ABI, no open S3
+archive. The only access path for that era is NOAA CLASS/NCEI's
+order-based system (you submit a request, wait — hours to weeks — and get
+a download link that **expires in 96 hours**), which is fundamentally
+incompatible with this API's on-demand design, and the data format isn't
+netCDF4/ABI-L2-CMIPF, so it would need its own parser. Not implemented;
+see the README roadmap if you want to scope that as a separate project.
 
 ### Bounding-box requests (`center` + `dims`)
 

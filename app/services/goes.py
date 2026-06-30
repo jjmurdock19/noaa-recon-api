@@ -283,6 +283,23 @@ def abi_to_latlon(x_rad, y_rad, sat_lon_deg, h, r_eq, r_pol):
     return lon_deg, lat_deg
 
 
+# ── Web Mercator Y (for output-grid row spacing) ────────────────────────────
+# L.imageOverlay positions an image's four corners at the map's current
+# (Web Mercator) screen coordinates for the given bounds, then stretches the
+# raw image LINEARLY between them. If the image's own pixel rows are spaced
+# linearly by *latitude* (plain equirectangular/Plate Carrée — what a naive
+# `row = f(lat)` mapping produces), that doesn't match Web Mercator's
+# non-linear north-south spacing, and the displayed imagery is vertically
+# mispositioned — worse away from the vertical center of the image and
+# worse at higher latitudes. The fix: space output rows linearly in Web
+# Mercator Y instead of linearly in latitude, so Leaflet's linear stretch
+# reproduces the correct geography. (Web Mercator IS linear in longitude,
+# so the column/longitude mapping elsewhere in this module is unaffected.)
+def _mercator_y(lat_deg):
+    lat_rad = np.radians(lat_deg)
+    return np.log(np.tan(np.pi / 4.0 + lat_rad / 2.0))
+
+
 # ── NOAA S3 helpers (plain urllib + XML, public bucket, no auth) ───────────
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
@@ -290,8 +307,21 @@ S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 _SCAN_START_RE = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})\d_")
 
 
-def _get_satellite_bucket(date: datetime.date) -> tuple[int, str]:
-    """Operational GOES-East satellite/bucket for a given date."""
+def _get_satellite_bucket(date: datetime.date, satellite: str = "east") -> tuple[int, str]:
+    """Operational GOES-East or GOES-West satellite/bucket for a given date.
+
+    East: GOES-16 until the GOES-19 cutover (2025-01-14), then GOES-19.
+    West: GOES-17 until the GOES-18 cutover (2023-01-10), then GOES-18.
+    Doesn't enforce a minimum date — resolve_nearest()'s "no scan found"
+    error already handles dates before a bucket has any data. This does
+    NOT reach pre-ABI satellites (GOES-8..15, retired by ~2018): those used
+    a completely different instrument/file format with no open S3 archive
+    — see the README's "Roadmap" for what a pre-2017 (e.g. Katrina, 2005)
+    data source would actually require."""
+    if satellite == "west":
+        if date >= datetime.date(2023, 1, 10):
+            return 18, "noaa-goes18"
+        return 17, "noaa-goes17"
     if date >= datetime.date(2025, 1, 14):
         return 19, "noaa-goes19"
     return 16, "noaa-goes16"
@@ -343,11 +373,13 @@ class ResolvedScan:
     scan_start: datetime.datetime
 
 
-def resolve_nearest(target: datetime.datetime, band: int) -> ResolvedScan:
+def resolve_nearest(target: datetime.datetime, band: int, satellite: str = "east") -> ResolvedScan:
     """Find the ABI-L2-CMIPF scan for `band` whose start time is nearest
     `target` (UTC), searching the target's hour and the following hour
     (CMIPF scans land roughly every 10 minutes and can cross an hour
-    boundary relative to the requested minute)."""
+    boundary relative to the requested minute). `satellite` is 'east' or
+    'west' — see _get_satellite_bucket() for which physical satellite that
+    resolves to on a given date."""
     if target.tzinfo is None:
         target = target.replace(tzinfo=datetime.timezone.utc)
 
@@ -357,7 +389,7 @@ def resolve_nearest(target: datetime.datetime, band: int) -> ResolvedScan:
 
     candidates: list[tuple[str, str, datetime.datetime]] = []
     for hour_dt in (this_hour, next_hour):
-        satellite, bucket = _get_satellite_bucket(hour_dt.date())
+        _, bucket = _get_satellite_bucket(hour_dt.date(), satellite)
         prefix = f"ABI-L2-CMIPF/{hour_dt.year}/{hour_dt.timetuple().tm_yday:03d}/{hour_dt.hour:02d}/"
         try:
             keys = list_s3_prefix(bucket, prefix)
@@ -373,13 +405,13 @@ def resolve_nearest(target: datetime.datetime, band: int) -> ResolvedScan:
 
     if not candidates:
         raise FileNotFoundError(
-            f"No GOES Band {band} scan found near {target.isoformat()} "
+            f"No GOES-{satellite} Band {band} scan found near {target.isoformat()} "
             f"(searched {this_hour.isoformat()} and {next_hour.isoformat()})"
         )
 
     bucket, key, scan_start = min(candidates, key=lambda c: abs((c[2] - target).total_seconds()))
-    satellite, _ = _get_satellite_bucket(scan_start.date())
-    return ResolvedScan(bucket=bucket, key=key, satellite=satellite, band=band, scan_start=scan_start)
+    satellite_num, _ = _get_satellite_bucket(scan_start.date(), satellite)
+    return ResolvedScan(bucket=bucket, key=key, satellite=satellite_num, band=band, scan_start=scan_start)
 
 
 def ensure_downloaded(resolved: ResolvedScan, nc_cache_dir: Path) -> Path:
@@ -581,8 +613,9 @@ def render_to_png(
     lat_S, lat_N = -81.3, 81.3
     lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
 
+    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
     col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
-    row = ((lat_N - LAT) / (lat_N - lat_S) * out_size).astype(np.int32)
+    row = ((merc_y_N - _mercator_y(LAT)) / (merc_y_N - merc_y_S) * out_size).astype(np.int32)
 
     valid = (
         np.isfinite(LON)
@@ -666,8 +699,9 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
 
     out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
 
+    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
     col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
-    row = ((lat_N - LAT) / (lat_N - lat_S) * out_size).astype(np.int32)
+    row = ((merc_y_N - _mercator_y(LAT)) / (merc_y_N - merc_y_S) * out_size).astype(np.int32)
     valid = (
         np.isfinite(LON) & np.isfinite(LAT) & np.isfinite(cmi_crop)
         & (col >= 0) & (col < out_size) & (row >= 0) & (row < out_size)

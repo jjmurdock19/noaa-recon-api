@@ -1,32 +1,84 @@
 # noaa-recon-api
 
-Open-source API for archival GOES satellite imagery (Band 13 IR, Band 2
-visible, GeoColor) and NOAA Tail Doppler Radar (TDR) data, with a raw-netCDF
-passthrough for client-side rendering. Built for a hurricane tracker site
-but designed to be called from any website — CORS-open, no auth, no API key.
+**Open-source HTTP API for archival GOES satellite imagery and NOAA Tail
+Doppler Radar data.** CORS-open, no auth, no API key — built for a
+hurricane tracker site, designed to be called from any website.
 
-**Status:** MVP. `GET /v1/satellite/tile` (GOES Band 13/9 IR/WV archive) is
-fully implemented and verified against live NOAA data, including:
-- `cmap=default` (the recommended default) resolves server-side to the correct **per-band** standard enhancement — `abi13` for Band 13, `abi9` for Band 9 — built from exact temperature→hex stops, since these two bands measure different physical quantities and aren't interchangeable. `ir4` (an alternate Band 13 table cited from satpy + ColorBrewer) is also available — see API.md.
-- `center`+`dims` bounding-box requests that render a fast, high-detail crop instead of the slow/coarse full disk (~11x faster processing, ~130x smaller file for a 500km box — measured, see API.md),
-- always-native-resolution rendering plus a smoothing pass that reduces the blocky look of the forward-projection paint step (the sensor's native ~2km/px is a hardware ceiling no processing changes — see API.md's bbox section).
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live API](https://img.shields.io/badge/API-live-brightgreen)](https://joshmurdock.net/api/docs)
 
-Band 2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed
-(`501 Not Implemented`) pending follow-up phases — see "Roadmap" below.
-
-**📖 Full endpoint reference + integration examples (curl/JS/Python): [API.md](API.md)**
-**🤖 Agent-readable summary: [llms.txt](llms.txt)** (also served live at `{base}/llms.txt`)
+📖 **[API.md](API.md)** — full endpoint reference, every param, copy-paste
+curl/JavaScript/Python examples
+🤖 **[llms.txt](llms.txt)** — terse agent-discovery summary, also served
+live at `{base}/llms.txt`
 
 ---
 
-## What it produces
+## Hurricane Melissa, rendered by this API
 
-A `GET /v1/satellite/tile` request for an arbitrary UTC timestamp resolves
-the nearest real GOES scan, downloads it from NOAA S3, reprojects ABI Fixed
-Grid → EPSG:4326, and renders a georeferenced PNG — this is real output from
-the live API (GOES-19, Band 13, BD color table):
+Real output from `GET /v1/satellite/tile` — GOES-19, Band 13 (Clean
+Longwave IR), the `abi13` standard enhancement, a 1000 nautical-mile box
+centered on the storm (17.55°N, 78.14°W, 2025-10-28 12:00 UTC):
 
-![Example GOES Band 13 IR output, BD color table](docs/assets/example-band13-bd.jpg)
+![Hurricane Melissa, GOES-19 Band 13, abi13 enhancement](docs/assets/melissa-abi13.jpg)
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&band=13&center=17.55,-78.14&dims=1000&unit=nm"
+```
+
+## What it does
+
+- **Archival GOES satellite tiles on demand.** Give it any UTC timestamp
+  (not just hourly buckets) and it finds the nearest real ABI scan
+  (~10-minute cadence), downloads it from NOAA's public S3 archive,
+  reprojects it, and returns a georeferenced PNG ready to drop onto a
+  Leaflet map.
+- **Both GOES-East and GOES-West**, auto-resolved to the correct satellite
+  (GOES-16/19 East, GOES-17/18 West) for the requested date — covers the
+  full ABI era (~2017-2018 onward). Pre-ABI storms (e.g. Katrina, 2005)
+  aren't reachable this way; see "Satellite coverage" in API.md for why.
+- **The correct color table for the band you asked for.** `cmap=default`
+  resolves to `abi13` or `abi9` — the real per-band standard enhancements,
+  built from exact temperature→color stops, not a generic approximation.
+  See [the live color legend tool](#color-legend) below.
+- **Fast, high-detail regional crops.** Pass `center` + `dims` (km or
+  nautical miles) instead of rendering the slow, coarse full disk —
+  ~11x faster, ~130x smaller files, at the sensor's native ~2km/pixel
+  resolution by default.
+- **Correctly georeferenced for web maps.** Output rows are spaced in Web
+  Mercator, matching how Leaflet/Google Maps/every standard web map
+  actually projects the earth — see "Real bugs found and fixed" below.
+- **A raw-netCDF path for client-side rendering** (in progress) feeding a
+  Three.js/WebGL volumetric viewer, for users who want the data itself
+  rather than a pre-rendered image.
+
+**Status:** MVP. Satellite tiles are fully implemented and verified
+against live NOAA data. Band 2/GeoColor, TDR, and the raw-netCDF
+passthrough are stubbed (`501 Not Implemented`) — see "Roadmap" below.
+
+## Color legend
+
+`GET /v1/satellite/colortable` returns the exact stops a render actually
+used, so a client can show a legend that's guaranteed to match — this is
+what powers the live gradient legend in the hurricanes site's API
+explorer panel:
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
+```
+
+## Try it right now
+
+No setup needed — it's already deployed:
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13"
+```
+
+See [API.md](API.md) for the full reference and curl/JavaScript/Python
+integration examples.
+
+---
 
 ## Architecture
 
@@ -39,14 +91,14 @@ flowchart LR
     end
 
     subgraph "noaa-recon-api (FastAPI)"
-        D["/v1/satellite/tile<br/>/v1/satellite/status"]
+        D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
         E["/v1/tdr/* (planned)"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
-        H[app/services/goes.py<br/>ABI reprojection + LUTs]
+        H[app/services/goes.py<br/>ABI reprojection + colortables]
     end
 
-    I[(NOAA S3<br/>noaa-goes16/19)]
+    I[(NOAA S3<br/>noaa-goes16/17/18/19)]
     J[(NOAA TDR archive<br/>seb.omao.noaa.gov, planned)]
 
     A & B -->|HTTP, CORS open| D
@@ -72,7 +124,7 @@ sequenceDiagram
     else cache miss
         API-->>Client: {status: "generating", key}
         API->>S3: download ABI-L2-CMIPF netCDF (~25MB)
-        API->>API: reproject + colorize + render PNG
+        API->>API: reproject (Web Mercator) + colorize + render PNG
         loop poll every ~3s
             Client->>API: GET /v1/satellite/status/{key}
             API-->>Client: {status: "generating", elapsed} or {status: "ready", ...}
@@ -81,19 +133,6 @@ sequenceDiagram
     Client->>API: GET {png_url}
     API-->>Client: image/png (georeferenced tile)
 ```
-
----
-
-## Try the live API right now
-
-No setup needed — it's already deployed:
-
-```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13&cmap=default"
-```
-
-See [API.md](API.md) for the full reference and curl/JavaScript/Python
-integration examples.
 
 ---
 
@@ -115,7 +154,7 @@ Already cloned without `--recurse-submodules`? Run `git submodule update --init`
 Try it:
 
 ```bash
-curl "http://127.0.0.1:8000/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=default"
+curl "http://127.0.0.1:8000/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13"
 # -> {"status": "generating", "key": "goes_13_abi13_..."}
 curl "http://127.0.0.1:8000/v1/satellite/status/<key>"
 # -> poll until {"status": "ready", "png_url": "/cache/satellite/<key>.png", "bounds": [[lat,lon],[lat,lon]], ...}
@@ -184,25 +223,27 @@ app/
   paths.py            CACHE_ROOT = <repo>/cache, REPO_ROOT
   models.py            Pydantic response schemas
   routers/
-    satellite.py       GET /v1/satellite/tile, GET /v1/satellite/status/{key}  — IMPLEMENTED
+    satellite.py       GET /v1/satellite/tile, /status/{key}, /colortable  — IMPLEMENTED
     tdr.py              GET /v1/tdr/missions, GET /v1/tdr/sweep                — STUB (501)
     raw.py              GET /v1/raw/netcdf                                     — STUB (501)
     health.py           GET /v1/health
   services/
     goes.py             Ported from the hurricanes site's goes_tile.py: ABI Fixed Grid reprojection
-                         (PUG Vol 5 Sec 4.2), 7 color LUTs incl. the per-band "default ABI" tables
-                         (abi13, abi9 — see DEFAULT_CMAP_BY_BAND) and the cited-source `ir4`, S3
-                         download, PNG render. Adds resolve_nearest() for true ~10-min resolution
-                         (picks the closest scan to an arbitrary timestamp, not just "first file
-                         in the hour"), and render_bbox_to_png() — a two-pass sparse-locate +
-                         native-resolution-crop renderer for center+dims requests (see
-                         render_to_png() for the original full-disk path, unchanged).
+                         (PUG Vol 5 Sec 4.2), Web Mercator row spacing (_mercator_y — see "Real bugs"
+                         below), collision-safe forward-paint (_paint_coldest), per-band "default ABI"
+                         colortables (abi13, abi9 — exact stops, evaluated without LUT quantization via
+                         _apply_stops_exact/STOPS_BY_CMAP) plus 5 LUT-based approximate tables in LUTS.
+                         resolve_nearest() picks the closest scan to an arbitrary timestamp for true
+                         ~10-min resolution. render_bbox_to_png() is a two-pass sparse-locate +
+                         native-resolution-crop renderer for center+dims requests (render_to_png() is
+                         the full-disk path).
     cache.py            ResultCache: lock-file + TTL pattern (mirrors proxy.php's approach),
                          driven by FastAPI BackgroundTasks instead of subprocess/nohup.
     tdr.py              Empty stub — see its docstring for the planned crawler/parse/render shape.
 clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" above)
 deploy/                       nginx snippet + systemd unit for this host
-docs/assets/                  README example image(s)
+docs/assets/                  README example images
+docs/colortable_sources/      Source JSON for the abi13/abi9 exact color stops
 tests/test_satellite.py       Offline math/parsing tests + one network-gated e2e test
 API.md                        Full human+agent endpoint reference, kept in sync with routers/ by hand —
                                if you add/change an endpoint, update this file and llms.txt in the same change.
@@ -212,33 +253,68 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
 
 ### Real bugs already found and fixed here
 
-1. The original `goes_tile.py` (and by extension this port, before the fix) had
-`Sx` defined with the wrong sign in `abi_to_latlon()`, which silently rotates
-every computed longitude by 180° — `lat` is unaffected (it only depends on
-`Sx**2`) so it's easy to miss, but it makes the renderer paint ~0% of pixels
-onto the output grid (everything lands outside the expected `[lon_W, lon_E]`
-window) and produce a blank tile. Fixed here by computing
-`Sx = H - rs*cos(x)*cos(y)` per PUG Vol 5 Sec 4.2 (not `rs*cos(x)*cos(y) - H`).
-**The same bug likely exists in the live hurricanes site's `goes_tile.py`** —
-this was not yet fixed there as of this writing; flag it to a human before
-touching that file, since it's in active production use.
-`tests/test_satellite.py::test_abi_to_latlon_subsatellite_point_is_origin`
-guards against a regression.
+1. **180° longitude flip.** The original `goes_tile.py` (and by extension
+   this port, before the fix) had `Sx` defined with the wrong sign in
+   `abi_to_latlon()`, which silently rotates every computed longitude by
+   180° — `lat` is unaffected (it only depends on `Sx**2`) so it's easy to
+   miss, but it makes the renderer paint ~0% of pixels onto the output grid
+   and produce a blank tile. Fixed by computing
+   `Sx = H - rs*cos(x)*cos(y)` per PUG Vol 5 Sec 4.2 (not
+   `rs*cos(x)*cos(y) - H`). **The same bug likely exists in the live
+   hurricanes site's `goes_tile.py`** — flag it to a human before touching
+   that file, since it's in active production use.
+   `tests/test_satellite.py::test_abi_to_latlon_subsatellite_point_is_origin`
+   guards against a regression.
 
-2. `abi13`/`abi9` were originally built through the same shared 256-bucket
-LUT system (`_build_lut`/`_t2i`/`_i2t`) as the other colortables, which
-quantizes the full temperature range into ~0.6°C steps. That's fine for
-smooth gradients, but `abi13`'s source data has a deliberate 1°C-wide hard
-cut (cyan@-32°C → light grey@-31°C) which quantization smeared into a
-muddy blended color that doesn't exist in the source palette, and the LUT's
-fixed -113..+42°C window clamped `abi13`'s warm end (needs up to +57°C)
-before it ever reached true black. Fixed by evaluating `abi13`/`abi9`
-exactly, per-pixel, via `_apply_stops_exact()` (vectorized `np.interp`)
-instead of routing them through the shared LUT — see the comment above
-`LUTS` in `app/services/goes.py`. `tests/test_satellite.py::test_apply_stops_exact_matches_direct_function_with_no_quantization`
-guards against a regression. **If you add another colortable with a sharp
-transition or a range outside ~-113..+42°C, add it to `STOPS_BY_CMAP`
-instead of `LUTS`, not the other way around.**
+2. **Color-table quantization smearing.** `abi13`/`abi9` were originally
+   built through the same shared 256-bucket LUT system (`_build_lut`/
+   `_t2i`/`_i2t`) as the other colortables, which quantizes the full
+   temperature range into ~0.6°C steps. That's fine for smooth gradients,
+   but `abi13`'s source data has a deliberate 1°C-wide hard cut
+   (cyan@-32°C → light grey@-31°C) which quantization smeared into a muddy
+   blended color absent from the source palette, and the LUT's fixed
+   -113..+42°C window clamped `abi13`'s warm end (needs up to +57°C) before
+   it ever reached true black. Fixed by evaluating `abi13`/`abi9` exactly,
+   per-pixel, via `_apply_stops_exact()` (vectorized `np.interp`) instead of
+   routing them through the shared LUT — see the comment above `LUTS` in
+   `app/services/goes.py`.
+   `tests/test_satellite.py::test_apply_stops_exact_matches_direct_function_with_no_quantization`
+   guards against a regression. **If you add another colortable with a
+   sharp transition or a range outside ~-113..+42°C, add it to
+   `STOPS_BY_CMAP` instead of `LUTS`, not the other way around.**
+
+3. **Forward-paint collision loss.** The reprojection paint step used plain
+   `output[row, col] = values` assignment. When multiple source pixels land
+   on the same output cell (real and not rare — ~330 of ~51k cells on a
+   typical 500km/native-resolution bbox render), numpy keeps an arbitrary
+   one (whichever is last in array order), not the meteorologically
+   significant one. Verified cell-by-cell on a real render: 160 cells
+   differed between old and fixed behavior, with up to a 23°C difference at
+   one cell — enough to jump entire color zones. Fixed via
+   `_paint_coldest()` using `np.minimum.at` to deterministically keep the
+   coldest value on collision.
+   `tests/test_satellite.py::test_paint_coldest_keeps_minimum_on_collision`
+   covers it.
+
+4. **Equirectangular vs. Web Mercator mismatch (georeferencing).**
+   `L.imageOverlay` (and every standard web map) positions an image's
+   corners at the map's *Web Mercator* screen coordinates for the given
+   bounds, then stretches the raw image **linearly** between them. The
+   renderer was spacing output rows linearly by *latitude*
+   (`row = f(lat)`, plain equirectangular/Plate Carrée), which doesn't
+   match — the displayed imagery was vertically mispositioned, worse away
+   from the image's vertical center and worse at higher latitudes. Fixed by
+   spacing rows linearly in Web Mercator Y instead (`_mercator_y()`); the
+   column/longitude mapping was already correct, since Web Mercator
+   *is* linear in longitude. Verified on a real Hurricane Melissa render
+   (1000nm box, 17.55°N–25.9°N): the storm's true latitude landed ~11px
+   off-position (out of 926, ~1.2%) under the old method. The effect grows
+   with box size and latitude, so it's far more severe for the full-disk
+   render path (spans ±81.3°) or any higher-latitude storm.
+   `tests/test_satellite.py::test_mercator_row_spacing_differs_from_linear_latitude`
+   guards against a regression.
+
+   ![Before (plain latitude spacing) vs after (Web Mercator spacing) — same scan, same bbox](docs/assets/mercator-fix-before-after.jpg)
 
 ### Roadmap (not yet implemented)
 
@@ -264,8 +340,13 @@ instead of `LUTS`, not the other way around.**
    this API instead of the local `goes_tile.py` subprocess / TC-Atlas proxy
    — not done in the MVP since those already work in production; this is a
    deliberate follow-up, not an oversight.
-5. Push to a GitHub remote (user-supplied) and move off this host into its
-   own container — `Dockerfile`/`docker-compose.yml` already exist for this.
+5. Move off this host into its own container — `Dockerfile`/
+   `docker-compose.yml` already exist for this.
+6. **Extend historical satellite coverage** — see the note in API.md /
+   the project's GOES satellite history research; pre-2017 storms (e.g.
+   Katrina, 2005) predate the ABI instrument entirely and need a
+   different data source and file-format parser, not just another S3
+   bucket.
 
 ### Conventions to keep
 
@@ -277,6 +358,8 @@ instead of `LUTS`, not the other way around.**
 - Keep dependencies minimal — no rasterio/pyproj/boto3/satpy/metpy, matching
   the constraint the original `goes_tile.py` was built under (plain
   `netCDF4`/`numpy`/`Pillow`/stdlib + `httpx` for async HTTP).
+- Output rows must stay spaced in Web Mercator (`_mercator_y`), not plain
+  latitude — see bug #4 above. Any new render path needs the same spacing.
 
 ## License
 
