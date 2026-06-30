@@ -154,13 +154,86 @@ def _goes_ir4(t):
     return _spectral_interp(frac)
 
 
+# ── "Default ABI" per-band enhancements ─────────────────────────────────────
+# Transcribed from reference colorbar legends supplied directly by the
+# project owner for this exact use case (one legend per band, with axis tick
+# marks in degrees C) — these are the standard enhancements this project
+# treats as canonical for these two bands, not a third-party approximation
+# like `ir4` above. Intermediate colors between the labeled tick marks are
+# this module's best-effort visual transcription of the reference legend;
+# if a specific hue looks off compared to the source legend, adjust the
+# stops below rather than the structure (anchor temperatures come straight
+# from the legend's tick marks).
+def _interp_stops(t_c, stops):
+    """stops: ascending list of (temp_C, (r,g,b)). Linear interpolation
+    between neighboring stops; clamps to the end colors outside the range."""
+    if t_c <= stops[0][0]:
+        return list(stops[0][1])
+    if t_c >= stops[-1][0]:
+        return list(stops[-1][1])
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t0 <= t_c <= t1:
+            frac = (t_c - t0) / (t1 - t0) if t1 != t0 else 0.0
+            return [int(round(c0[k] + (c1[k] - c0[k]) * frac)) for k in range(3)]
+    return list(stops[-1][1])  # unreachable, satisfies type checkers
+
+
+# Band 13 (Clean IR Window, 10.3um): white at the most extreme cold
+# overshooting tops, a narrow rainbow band highlighting severe convection,
+# then greyscale (light=cold, dark=warm) across the bulk of the range —
+# per the reference legend's tick marks (-110, -59, -20, 6, 31, 57 C).
+_ABI13_STOPS = [
+    (-110, (255, 255, 255)),  # white — most extreme overshooting tops
+    (-100, (210, 0, 0)),      # red
+    (-92, (255, 140, 0)),     # orange
+    (-85, (255, 255, 0)),     # yellow
+    (-78, (0, 170, 0)),       # green
+    (-71, (0, 200, 200)),     # cyan
+    (-65, (30, 60, 220)),     # blue
+    (-59, (180, 110, 220)),   # purple — rainbow band ends, blends into greyscale
+    (-59.0001, (235, 235, 235)),  # greyscale starts here (light grey)
+    (57, (0, 0, 0)),          # black — warmest (clear sky / ground)
+]
+
+
+def _abi13(t_k):
+    return _interp_stops(t_k - 273.15, _ABI13_STOPS)
+
+
+# Band 9 (Mid-Level Water Vapor, 6.9um): teal/green for cold, moist
+# upper-tropospheric cloud tops, through white at the moist/dry boundary,
+# to orange/black for warm, dry airmasses — per the reference legend's tick
+# marks (-93, -54, -30, -18, -5, 7 C) and "clouds .. <<moist dry>>" labels.
+_ABI9_STOPS = [
+    (-93, (20, 130, 120)),   # teal — coldest, moist cloud tops
+    (-70, (60, 180, 100)),   # green
+    (-54, (150, 220, 150)),  # pale green
+    (-30, (255, 255, 255)),  # white — moist/dry boundary
+    (-18, (255, 255, 150)),  # pale yellow
+    (-5, (255, 140, 0)),     # orange
+    (7, (0, 0, 0)),          # black — warmest, driest
+]
+
+
+def _abi9(t_k):
+    return _interp_stops(t_k - 273.15, _ABI9_STOPS)
+
+
 LUTS = {
     "bd": _build_lut(_bd),
     "enhanced": _build_lut(_enhanced),
     "nrl": _build_lut(_nrl),
     "grayscale": _build_lut(_grayscale),
     "ir4": _build_lut(_goes_ir4),
+    "abi13": _build_lut(_abi13),
+    "abi9": _build_lut(_abi9),
 }
+
+# cmap="default" resolves to one of these based on the requested band, since
+# Band 13 (IR window) and Band 9 (water vapor) use genuinely different
+# enhancement conventions — there's no single "default" LUT independent of
+# which physical quantity is being displayed.
+DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9"}
 
 
 # ── ABI Fixed Grid → geographic lat/lon (PUG Volume 5, Section 4.2) ─────────
@@ -362,6 +435,33 @@ def fill_gaps(data: np.ndarray, iterations: int = 6) -> np.ndarray:
     return result
 
 
+def _smooth(output: np.ndarray, passes: int = 1) -> np.ndarray:
+    """NaN-aware 3x3 box blur (a couple of passes approximates a mild
+    Gaussian). This is anti-aliasing over real sampled data, not invented
+    detail — bands 9/13 are physically captured at ~2km/pixel by the ABI
+    sensor, which is a hardware ceiling no amount of processing changes.
+    What this *does* fix is the blocky look from the forward-projection
+    paint step (each source pixel scattered to its nearest output cell,
+    leaving hard edges where one source sample dominates several output
+    pixels). Only blurs within already-valid (non-NaN) cells; never bleeds
+    valid data into off-disk/no-data regions or vice versa."""
+    result = output
+    for _ in range(passes):
+        valid = np.isfinite(result)
+        vals = np.where(valid, result, 0.0)
+        weight = valid.astype(np.float32)
+        vsum = np.zeros_like(result, dtype=np.float32)
+        wsum = np.zeros_like(result, dtype=np.float32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                vsum += np.roll(np.roll(vals, dy, axis=0), dx, axis=1)
+                wsum += np.roll(np.roll(weight, dy, axis=0), dx, axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            blurred = vsum / wsum
+        result = np.where(valid, blurred, result)
+    return result
+
+
 def _colorize(output: np.ndarray, cmap_name: str, out_png: Path) -> None:
     lut = LUTS.get(cmap_name, LUTS["bd"])
     idx = _t2i(output)
@@ -446,6 +546,7 @@ def render_to_png(
     log.info("Painted %d / %d source pixels", int(valid.sum()), int(valid.size))
 
     output = fill_gaps(output, iterations=6)
+    output = _smooth(output)
     _colorize(output, cmap_name, out_png)
 
     return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
@@ -526,6 +627,7 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
     log.info("Painted %d / %d source pixels into %dx%d output", int(valid.sum()), int(valid.size), out_size, out_size)
 
     output = fill_gaps(output, iterations=6)
+    output = _smooth(output)
     _colorize(output, cmap_name, out_png)
 
     return {

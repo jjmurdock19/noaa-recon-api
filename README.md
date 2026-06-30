@@ -7,9 +7,9 @@ but designed to be called from any website — CORS-open, no auth, no API key.
 
 **Status:** MVP. `GET /v1/satellite/tile` (GOES Band 13/9 IR/WV archive) is
 fully implemented and verified against live NOAA data, including:
-- a true-to-source `ir4` color table (cited from satpy + ColorBrewer, not an approximation — see API.md),
+- `cmap=default` (the recommended default) resolves server-side to the correct **per-band** standard enhancement — `abi13` for Band 13, `abi9` for Band 9 — transcribed from reference legends, since these two bands measure different physical quantities and aren't interchangeable. `ir4` (an alternate Band 13 table cited from satpy + ColorBrewer) is also available — see API.md.
 - `center`+`dims` bounding-box requests that render a fast, high-detail crop instead of the slow/coarse full disk (~11x faster processing, ~130x smaller file for a 500km box — measured, see API.md),
-- a `resolution_km` param to trade detail for speed, defaulting to the sensor's native ~2km/px.
+- always-native-resolution rendering plus a smoothing pass that reduces the blocky look of the forward-projection paint step (the sensor's native ~2km/px is a hardware ceiling no processing changes — see API.md's bbox section).
 
 Band 2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed
 (`501 Not Implemented`) pending follow-up phases — see "Roadmap" below.
@@ -89,7 +89,7 @@ sequenceDiagram
 No setup needed — it's already deployed:
 
 ```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13&cmap=bd"
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13&cmap=default"
 ```
 
 See [API.md](API.md) for the full reference and curl/JavaScript/Python
@@ -115,8 +115,8 @@ Already cloned without `--recurse-submodules`? Run `git submodule update --init`
 Try it:
 
 ```bash
-curl "http://127.0.0.1:8000/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=bd"
-# -> {"status": "generating", "key": "goes_13_bd_..."}
+curl "http://127.0.0.1:8000/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13&cmap=default"
+# -> {"status": "generating", "key": "goes_13_abi13_..."}
 curl "http://127.0.0.1:8000/v1/satellite/status/<key>"
 # -> poll until {"status": "ready", "png_url": "/cache/satellite/<key>.png", "bounds": [[lat,lon],[lat,lon]], ...}
 ```
@@ -190,7 +190,8 @@ app/
     health.py           GET /v1/health
   services/
     goes.py             Ported from the hurricanes site's goes_tile.py: ABI Fixed Grid reprojection
-                         (PUG Vol 5 Sec 4.2), 5 color LUTs (incl. the cited-source `ir4`), S3
+                         (PUG Vol 5 Sec 4.2), 7 color LUTs incl. the per-band "default ABI" tables
+                         (abi13, abi9 — see DEFAULT_CMAP_BY_BAND) and the cited-source `ir4`, S3
                          download, PNG render. Adds resolve_nearest() for true ~10-min resolution
                          (picks the closest scan to an arbitrary timestamp, not just "first file
                          in the hour"), and render_bbox_to_png() — a two-pass sparse-locate +
