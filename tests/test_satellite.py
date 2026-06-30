@@ -55,6 +55,27 @@ def test_fill_gaps_propagates_into_nan_holes():
     assert filled[2, 3] == 10.0
 
 
+def test_paint_coldest_keeps_minimum_on_collision():
+    # Two source pixels land on the same output cell (0,0): one warm (250),
+    # one cold (200). Plain `output[row,col] = values` assignment would
+    # arbitrarily keep whichever is last in array order — coldest-wins must
+    # always keep 200, regardless of array order, since the coldest pixel
+    # is the scientifically significant one for these enhancements.
+    row = np.array([0, 0, 1])
+    col = np.array([0, 0, 1])
+    values = np.array([250.0, 200.0, 300.0], dtype=np.float32)
+    valid = np.array([True, True, True])
+    out = goes._paint_coldest(3, row, col, values, valid)
+    assert out[0, 0] == 200.0
+    assert out[1, 1] == 300.0
+    assert np.isnan(out[2, 2])  # untouched cell stays NaN, not inf
+
+    # Order shouldn't matter — reverse it and confirm the same result.
+    values_rev = np.array([200.0, 250.0, 300.0], dtype=np.float32)
+    out_rev = goes._paint_coldest(3, row, col, values_rev, valid)
+    assert out_rev[0, 0] == 200.0
+
+
 def test_get_satellite_bucket_switches_at_cutover():
     assert goes._get_satellite_bucket(datetime.date(2024, 1, 1)) == (16, "noaa-goes16")
     assert goes._get_satellite_bucket(datetime.date(2025, 1, 14)) == (19, "noaa-goes19")

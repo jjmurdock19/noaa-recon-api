@@ -477,6 +477,23 @@ def _smooth(output: np.ndarray, passes: int = 1) -> np.ndarray:
     return result
 
 
+def _paint_coldest(out_size: int, row: np.ndarray, col: np.ndarray, values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Forward-scatter `values` onto an out_size x out_size grid, keeping the
+    COLDEST value when multiple source pixels land on the same output cell.
+    Plain `output[row, col] = values` assignment is non-deterministic on
+    collisions — numpy fancy-index assignment silently keeps whichever
+    source pixel happens to be last in array iteration order, which can
+    discard a genuine extreme (e.g. a single-pixel overshooting convective
+    top) right when it matters most. Collisions are real and not rare:
+    ~330 of ~51k cells on a typical 500km/native-resolution bbox render.
+    Coldest-wins matches how these brightness-temperature enhancements are
+    meant to be read — the coldest pixel is the significant one."""
+    output = np.full((out_size, out_size), np.inf, dtype=np.float32)
+    np.minimum.at(output, (row[valid], col[valid]), values[valid])
+    output[np.isinf(output)] = np.nan
+    return output
+
+
 def _apply_stops_exact(output_k: np.ndarray, stops: list) -> np.ndarray:
     """Vectorized, full-float-precision version of _interp_stops applied to
     a whole array at once — exact colors, no LUT-quantization smearing.
@@ -564,7 +581,6 @@ def render_to_png(
     lat_S, lat_N = -81.3, 81.3
     lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
 
-    output = np.full((out_size, out_size), np.nan, dtype=np.float32)
     col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
     row = ((lat_N - LAT) / (lat_N - lat_S) * out_size).astype(np.int32)
 
@@ -577,11 +593,12 @@ def render_to_png(
         & (row >= 0)
         & (row < out_size)
     )
-    output[row[valid], col[valid]] = cmi_ds[valid]
+    output = _paint_coldest(out_size, row, col, cmi_ds, valid)
     log.info("Painted %d / %d source pixels", int(valid.sum()), int(valid.size))
 
     output = fill_gaps(output, iterations=6)
-    output = _smooth(output)
+    if cmap_name not in STOPS_BY_CMAP:  # exact colortables show true peak values, unblurred
+        output = _smooth(output)
     _colorize(output, cmap_name, out_png)
 
     return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
@@ -649,7 +666,6 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
 
     out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
 
-    output = np.full((out_size, out_size), np.nan, dtype=np.float32)
     col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
     row = ((lat_N - LAT) / (lat_N - lat_S) * out_size).astype(np.int32)
     valid = (
@@ -658,11 +674,12 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
     )
     if not valid.any():
         raise ValueError("Requested area has no valid data in this scan (off-disk or no-data)")
-    output[row[valid], col[valid]] = cmi_crop[valid]
+    output = _paint_coldest(out_size, row, col, cmi_crop, valid)
     log.info("Painted %d / %d source pixels into %dx%d output", int(valid.sum()), int(valid.size), out_size, out_size)
 
     output = fill_gaps(output, iterations=6)
-    output = _smooth(output)
+    if cmap_name not in STOPS_BY_CMAP:  # exact colortables show true peak values, unblurred
+        output = _smooth(output)
     _colorize(output, cmap_name, out_png)
 
     return {
