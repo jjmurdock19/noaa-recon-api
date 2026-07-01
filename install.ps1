@@ -45,6 +45,18 @@ function Write-Warn2 ($msg) { Write-Host "  !!  $msg" -ForegroundColor Yellow }
 function Write-Err2  ($msg) { Write-Host "  xx  $msg" -ForegroundColor Red }
 function Die         ($msg) { Write-Err2 $msg; exit 1 }
 
+# $ErrorActionPreference = "Stop" only catches PowerShell's own terminating
+# errors -- a native .exe (git, pip, python) returning a non-zero exit code
+# does NOT throw on its own, so failures there would otherwise be silently
+# ignored and the install would limp forward "successfully" with a broken
+# venv/repo. Call this right after any native command whose failure should
+# actually stop the install.
+function Invoke-Checked($Description) {
+    if ($LASTEXITCODE -ne 0) {
+        Die "$Description failed (exit code $LASTEXITCODE) -- see the output above for details."
+    }
+}
+
 function Test-Interactive {
     return (-not $Yes) -and [Environment]::UserInteractive -and (-not [Console]::IsInputRedirected)
 }
@@ -215,15 +227,16 @@ function Sync-Repo {
         Write-Step "Existing repo at $InstallDir -- syncing to origin/$Branch"
         Push-Location $InstallDir
         try {
-            git fetch origin
-            git reset --hard "origin/$Branch"
-            git submodule update --init --recursive
+            git fetch origin;                        Invoke-Checked "git fetch"
+            git reset --hard "origin/$Branch";        Invoke-Checked "git reset"
+            git submodule update --init --recursive;  Invoke-Checked "git submodule update"
         } finally { Pop-Location }
     } else {
         Write-Step "Cloning $RepoUrl into $InstallDir"
         $parent = Split-Path $InstallDir -Parent
         if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
         git clone --branch $Branch --recurse-submodules $RepoUrl $InstallDir
+        Invoke-Checked "git clone"
     }
     $rev = (git -C $InstallDir rev-parse --short HEAD)
     Write-Ok "repo ready at $InstallDir ($rev)"
@@ -234,10 +247,13 @@ function Setup-Venv {
     $venvDir = Join-Path $InstallDir ".venv"
     if (-not (Test-Path (Join-Path $venvDir "Scripts\python.exe"))) {
         & $PythonCmd.Exe @($PythonCmd.Args + @("-m", "venv", $venvDir))
+        Invoke-Checked "python -m venv"
     }
     $pip = Join-Path $venvDir "Scripts\pip.exe"
     & $pip install --upgrade pip -q
+    Invoke-Checked "pip install --upgrade pip"
     & $pip install -e $InstallDir -q
+    Invoke-Checked "pip install -e . (dependency install -- check for a Windows wheel/build failure above, netCDF4 and Pillow are the usual suspects)"
     Write-Ok "virtualenv ready"
 }
 
@@ -325,11 +341,29 @@ function Start-Api {
         -RedirectStandardError (Join-Path `$LogDir "uvicorn-err.log") ``
         -PassThru
     `$proc.Id | Set-Content `$PidFile
-    Start-Sleep -Seconds 1
-    if (Get-Process -Id `$proc.Id -ErrorAction SilentlyContinue) {
+
+    # Wait up to ~15s for it to actually answer -- not just for the process to
+    # still exist a moment later. A process can survive a couple seconds and
+    # then die on import (a broken/incomplete venv install is the classic
+    # cause) or just be slow importing numpy/netCDF4/Pillow on a cold start.
+    `$healthy = `$false
+    for (`$i = 0; `$i -lt 15; `$i++) {
+        if (-not (Get-Process -Id `$proc.Id -ErrorAction SilentlyContinue)) { break }
+        try {
+            Invoke-RestMethod -Uri "http://127.0.0.1:`$Port/v1/health" -TimeoutSec 1 | Out-Null
+            `$healthy = `$true
+            break
+        } catch { Start-Sleep -Seconds 1 }
+    }
+
+    if (`$healthy) {
         Write-Host "Started (PID `$(`$proc.Id)). API: http://`${BindHostValue}:`${Port}"
+    } elseif (Get-Process -Id `$proc.Id -ErrorAction SilentlyContinue) {
+        Write-Host "Process is running (PID `$(`$proc.Id)) but isn't answering http://127.0.0.1:`$Port/v1/health yet."
+        Write-Host "Check `$LogDir\uvicorn-err.log -- if it's still starting, run 'noaa-recon-api status' again in a few seconds."
     } else {
-        Write-Host "Failed to start -- check `$LogDir\uvicorn-err.log"
+        Write-Host "Failed to start -- check `$LogDir\uvicorn-err.log for the actual error."
+        Remove-Item `$PidFile -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -375,9 +409,12 @@ switch (`$Command) {
     if ($userPath -notlike "*$binDir*") {
         $newPath = if ($userPath) { "$userPath;$binDir" } else { $binDir }
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        Write-Warn2 "Added $binDir to your PATH -- open a NEW terminal window before using the 'noaa-recon-api' command."
     }
-    Write-Ok "try (in a new terminal): noaa-recon-api status"
+    # Same fix as winget-installed git/python above: the registry write persists
+    # for future sessions, but *this* session's $env:Path was already loaded --
+    # refresh it too so `noaa-recon-api` works right away, no new window needed.
+    Update-SessionPath
+    Write-Ok "try: noaa-recon-api status"
 }
 
 function Print-Summary {
@@ -402,7 +439,7 @@ function Print-Summary {
     }
     Write-Host "  It never auto-starts at login either way (local-testing scope, not a service)."
     Write-Host ""
-    Write-Host "  Manage it (open a NEW terminal first so PATH picks up the command):"
+    Write-Host "  Manage it (works right here -- also on PATH for new terminals from now on):"
     Write-Host "    noaa-recon-api start      -- start it in the background"
     Write-Host "    noaa-recon-api stop       -- stop it"
     Write-Host "    noaa-recon-api status     -- is it running?"
@@ -466,10 +503,11 @@ function Invoke-Update {
     Write-Step "Updating $InstallDir to the latest $Branch"
     Push-Location $InstallDir
     try {
-        git fetch origin
-        git reset --hard "origin/$Branch"
-        git submodule update --init --recursive
+        git fetch origin;                       Invoke-Checked "git fetch"
+        git reset --hard "origin/$Branch";       Invoke-Checked "git reset"
+        git submodule update --init --recursive; Invoke-Checked "git submodule update"
         & (Join-Path $InstallDir ".venv\Scripts\pip.exe") install -e $InstallDir -q
+        Invoke-Checked "pip install -e ."
     } finally { Pop-Location }
 
     $binCmd = Join-Path $InstallDir "bin\noaa-recon-api.cmd"

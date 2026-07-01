@@ -114,6 +114,48 @@ are fully implemented and verified against live NOAA data. Band
 2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed (`501 Not
 Implemented`) — see "Roadmap" below.
 
+## Data sources
+
+Every byte this API serves is fetched live (and then cached) from NOAA's
+own public archives — nothing here is a private/licensed dataset. Exact
+endpoints, for reproducibility and citation:
+
+**GOES satellite imagery** — [NOAA GOES-R Series on AWS Open Data](https://registry.opendata.aws/noaa-goes/),
+unauthenticated public S3 buckets. This API reads the `ABI-L2-CMIPF`
+(Cloud and Moisture Imagery, Full Disk) product directly:
+- East: [`noaa-goes16`](https://noaa-goes16.s3.amazonaws.com/) (2017-12-18 – 2025-01-14), [`noaa-goes19`](https://noaa-goes19.s3.amazonaws.com/) (2025-01-14 – present)
+- West: [`noaa-goes17`](https://noaa-goes17.s3.amazonaws.com/) (2019-02-12 – 2023-01-10), [`noaa-goes18`](https://noaa-goes18.s3.amazonaws.com/) (2023-01-10 – present)
+- Object path: `ABI-L2-CMIPF/{year}/{day-of-year}/{hour}/` within each bucket
+  (see `_get_satellite_bucket()` in `app/services/goes.py` for the exact
+  cutover-date logic, and "Satellite coverage" in API.md for what's out of
+  reach — pre-ABI storms like Katrina 2005 aren't in these buckets at all).
+
+**Storm tracks** — [NHC (National Hurricane Center)](https://www.nhc.noaa.gov/):
+- [HURDAT2](https://www.nhc.noaa.gov/data/#hurdat), the reconciled historical best-track database:
+  [Atlantic, 1851–2024](https://www.nhc.noaa.gov/data/hurdat/hurdat2-1851-2024-040425.txt) and
+  [East/Central Pacific, 1949–2023](https://www.nhc.noaa.gov/data/hurdat/hurdat2-nepac-1949-2023-042624.txt)
+- [ATCF](https://ftp.nhc.noaa.gov/atcf/) (Automated Tropical Cyclone Forecasting) b-decks, which bridge the
+  gap from HURDAT2's cutoff up through whatever's happening right now:
+  [current season](https://ftp.nhc.noaa.gov/atcf/btk/) and
+  [closed-season archive](https://ftp.nhc.noaa.gov/atcf/archive/) (per-year subdirectories)
+
+**Recon MET archive** — [NOAA OMAO](https://www.omao.noaa.gov/)'s (Office of Marine and Aviation
+Operations) Aircraft Operations Center raw data archive at
+[`seb.omao.noaa.gov/pub/acdata`](https://seb.omao.noaa.gov/pub/acdata/), organized
+`{year}/MET/{mission_id}/`. Every hurricane hunter flight since 2011: this
+API decimates the QC'd 1-second flight-level NetCDF file (position, wind,
+SFMR surface wind, altitude) to ~7 fields for quick plotting, and
+`GET /v1/recon/mission/{id}/download` streams NOAA's original
+full-resolution file (600+ variables) unmodified, straight from that same
+archive.
+
+**TDR (planned, not yet implemented)** — same host as the recon archive,
+[`seb.omao.noaa.gov/pub/acdata`](https://seb.omao.noaa.gov/pub/acdata/), but
+targeting the per-instrument Tail Doppler Radar `.tar.gz` bundles in each
+mission directory rather than the MET NetCDF file. See `app/routers/tdr.py`'s
+docstring for exactly what's missing (there's no manifest, so it needs a
+crawler over the mission-directory listing).
+
 ## Color legend
 
 `GET /v1/satellite/colortable` returns the exact stops a render actually
