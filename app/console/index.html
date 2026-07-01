@@ -23,12 +23,24 @@
   }
   #logout-btn:hover { background: #4b5563; }
 
-  main { max-width: 1100px; margin: 0 auto; padding: 24px; display: none; }
+  main { max-width: 1900px; width: 96%; margin: 0 auto; padding: 24px; display: none; }
   main.shown { display: block; }
 
   #login-wrap {
-    display: flex; align-items: center; justify-content: center; min-height: 80vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 80vh; gap: 22px;
   }
+  #public-stats-box {
+    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    padding: 20px 24px; width: 320px;
+  }
+  #public-stats-box h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7dd3fc;
+    margin: 0 0 12px;
+  }
+  #public-stats-box .stat-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  #public-stats-box .stat-card { flex: 1 1 120px; min-width: 90px; padding: 8px 10px; }
+  #public-stats-box .status-text { font-size: 11px; }
   #login-box {
     background: #111827; border: 1px solid #334155; border-radius: 8px;
     padding: 28px 32px; width: 320px;
@@ -63,6 +75,22 @@
   .stat-card .label { font-size: 10px; color: #94a3b8; text-transform: uppercase; }
   .stat-card .value { font-size: 20px; color: #e2e8f0; margin-top: 2px; }
 
+  /* Three-column post-login layout: preview pane (left) / archive (middle) / add-to-cache (right) */
+  .console-columns { display: flex; align-items: flex-start; gap: 18px; }
+  .col-preview { display: none; flex: 1 1 320px; max-width: 540px; position: sticky; top: 16px; }
+  .col-preview.active { display: block; }
+  .col-archive { flex: 2 1 480px; min-width: 0; }
+  .col-add { flex: 1 1 340px; max-width: 420px; }
+  @media (max-width: 1050px) {
+    .console-columns { flex-direction: column; }
+    .col-preview, .col-archive, .col-add { max-width: none; width: 100%; position: static; }
+  }
+
+  /* Scrolling frames for cache tables so a large cache doesn't blow up the page */
+  .table-scroll { max-height: 320px; overflow-y: auto; }
+  .table-scroll table { width: 100%; }
+  .table-scroll thead th { position: sticky; top: 0; background: #111827; z-index: 1; }
+
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1e293b; }
   th { color: #94a3b8; font-weight: normal; text-transform: uppercase; font-size: 10px; }
@@ -72,6 +100,11 @@
     padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px;
   }
   .del-btn:hover { background: #991b1b; }
+  .error-btn {
+    background: #78350f; border: 1px solid #92400e; color: #fdba74;
+    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
+  }
+  .error-btn:hover { background: #92400e; }
   .clear-btn {
     background: #374151; border: 1px solid #4b5563; color: #fca5a5;
     padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px;
@@ -104,7 +137,7 @@
   }
   .view-btn:hover { background: #1d4ed8; color: #fff; }
   .preview-flex { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
-  .preview-flex img { max-width: 480px; max-height: 480px; border-radius: 6px; border: 1px solid #334155; }
+  .preview-flex img { max-width: 100%; max-height: 480px; border-radius: 6px; border: 1px solid #334155; }
   .meta-table { border-collapse: collapse; font-size: 11px; min-width: 280px; }
   .meta-table td { padding: 4px 10px 4px 0; border-bottom: 1px solid #1e293b; vertical-align: top; }
   .meta-table td:first-child { color: #94a3b8; white-space: nowrap; }
@@ -121,6 +154,12 @@
 <body>
 
 <div id="login-wrap">
+  <div id="public-stats-box">
+    <h2>API status</h2>
+    <div class="stat-row" id="public-stat-cards">
+      <span class="status-text">Loading…</span>
+    </div>
+  </div>
   <div id="login-box">
     <h2>&#128272; noaa-recon-api console</h2>
     <label for="login-user">Username</label>
@@ -142,125 +181,192 @@
 
 <main id="app-main">
 
-  <section>
-    <h2>Status</h2>
-    <div class="stat-row" id="status-cards"></div>
-  </section>
+  <div class="console-columns">
 
-  <section>
-    <h2>
-      Rendered tile cache
-      <button class="clear-btn" id="clear-satellite-btn">Clear all</button>
-    </h2>
-    <table>
-      <thead><tr>
-        <th>Key</th><th>Status</th><th>Band</th><th>Cmap</th><th>Sat</th>
-        <th>Center</th><th>Size</th><th>Modified</th><th></th>
-      </tr></thead>
-      <tbody id="satellite-cache-body"></tbody>
-    </table>
-  </section>
+    <div class="col-preview" id="col-preview">
+      <section id="preview-section">
+        <h2>Preview <button class="clear-btn" id="preview-close-btn">Close</button></h2>
+        <div id="preview-body"></div>
+      </section>
+    </div>
 
-  <section>
-    <h2>
-      Raw netCDF cache
-      <button class="clear-btn" id="clear-goesnc-btn">Clear all</button>
-    </h2>
-    <table>
-      <thead><tr><th>Filename</th><th>Scan start</th><th>Size</th><th>Modified</th><th></th></tr></thead>
-      <tbody id="goesnc-cache-body"></tbody>
-    </table>
-  </section>
+    <div class="col-archive">
+      <section>
+        <h2>Status</h2>
+        <div class="stat-row" id="status-cards"></div>
+      </section>
 
-  <section id="preview-section" style="display:none;">
-    <h2>Preview <button class="clear-btn" id="preview-close-btn">Close</button></h2>
-    <div id="preview-body"></div>
-  </section>
+      <section>
+        <h2>Databases</h2>
+        <div class="stat-row" id="db-stat-cards"></div>
 
-  <section>
-    <h2>Submit a query</h2>
-    <div class="row">
-      <div class="field-group">
-        <span class="field-label">Time (UTC)</span>
-        <input type="datetime-local" id="q-time" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Band</span>
-        <select id="q-band"><option value="13">13 — Clean IR</option><option value="9">9 — Water Vapor</option></select>
-      </div>
-      <div class="field-group">
-        <span class="field-label">Satellite</span>
-        <select id="q-satellite"><option value="goes-east">GOES-East</option><option value="goes-west">GOES-West</option></select>
-      </div>
-      <div class="field-group">
-        <span class="field-label">Cmap</span>
-        <select id="q-cmap"><option value="default">default</option><option value="abi13">abi13</option><option value="abi9">abi9</option><option value="ir4">ir4</option><option value="bd">bd</option><option value="enhanced">enhanced</option><option value="nrl">nrl</option><option value="grayscale">grayscale</option></select>
-      </div>
-    </div>
-    <div class="row">
-      <div class="field-group">
-        <span class="field-label">Center lat,lon (optional)</span>
-        <input type="text" id="q-center" placeholder="17.55,-78.14" style="width:140px;" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Dims</span>
-        <input type="number" id="q-dims" placeholder="500" style="width:80px;" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Unit</span>
-        <select id="q-unit"><option value="nm">nm</option><option value="km">km</option></select>
-      </div>
-      <button class="primary-btn" id="q-submit-btn">Load</button>
-      <span class="status-text" id="q-status"></span>
-    </div>
-    <div id="query-result"></div>
-  </section>
+        <div class="row" style="margin-top:14px;">
+          <button class="primary-btn" id="storms-update-btn">Force update: Storm Tracks</button>
+          <span class="status-text" id="storms-update-status"></span>
+        </div>
+        <div class="row">
+          <button class="primary-btn" id="reconmet-update-btn">Force update: Recon MET</button>
+          <span class="status-text" id="reconmet-update-status"></span>
+        </div>
 
-  <section>
-    <h2>Load a timeframe into cache</h2>
-    <div class="row">
-      <div class="field-group">
-        <span class="field-label">Start (UTC)</span>
-        <input type="datetime-local" id="p-start" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">End (UTC)</span>
-        <input type="datetime-local" id="p-end" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Interval (min)</span>
-        <input type="number" id="p-interval" value="60" min="10" style="width:70px;" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Band</span>
-        <select id="p-band"><option value="13">13</option><option value="9">9</option></select>
-      </div>
-      <div class="field-group">
-        <span class="field-label">Satellite</span>
-        <select id="p-satellite"><option value="goes-east">East</option><option value="goes-west">West</option></select>
-      </div>
+        <div class="row" style="margin-top:16px; border-top:1px solid #334155; padding-top:14px;">
+          <div class="field-group">
+            <span class="field-label">Database</span>
+            <select id="db-view-type">
+              <option value="storms">Storm Tracks</option>
+              <option value="recon_met">Recon MET</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Year</span>
+            <select id="db-view-year"><option value="">Year...</option></select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Storm</span>
+            <select id="db-view-storm" disabled><option value="">Storm...</option></select>
+          </div>
+          <button class="primary-btn" id="db-view-load-btn" disabled>Load</button>
+          <span class="status-text" id="db-view-status"></span>
+        </div>
+        <div class="table-scroll" style="margin-top:10px;">
+          <table>
+            <thead id="db-view-thead"></thead>
+            <tbody id="db-view-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>
+          Rendered tile cache
+          <button class="clear-btn" id="clear-satellite-btn">Clear all</button>
+        </h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr>
+              <th>Key</th><th>Status</th><th>Band</th><th>Cmap</th><th>Sat</th>
+              <th>Center</th><th>Size</th><th>Modified</th><th></th>
+            </tr></thead>
+            <tbody id="satellite-cache-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>
+          Raw netCDF cache
+          <button class="clear-btn" id="clear-goesnc-btn">Clear all</button>
+        </h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Filename</th><th>Scan start</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+            <tbody id="goesnc-cache-body"></tbody>
+          </table>
+        </div>
+      </section>
     </div>
-    <div class="row">
-      <div class="field-group">
-        <span class="field-label">Center lat,lon (optional — full disk if blank)</span>
-        <input type="text" id="p-center" placeholder="17.55,-78.14" style="width:140px;" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Dims</span>
-        <input type="number" id="p-dims" placeholder="500" style="width:80px;" />
-      </div>
-      <div class="field-group">
-        <span class="field-label">Unit</span>
-        <select id="p-unit"><option value="nm">nm</option><option value="km">km</option></select>
-      </div>
-      <button class="primary-btn" id="p-submit-btn">Start prefetch</button>
-      <span class="status-text" id="p-status"></span>
+
+    <div class="col-add">
+      <section>
+        <h2>Submit a query</h2>
+        <div class="row">
+          <div class="field-group">
+            <span class="field-label">Time (UTC)</span>
+            <input type="datetime-local" id="q-time" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Product (overrides band/cmap)</span>
+            <select id="q-product">
+              <option value="">(none — use band/cmap)</option>
+              <option value="sandwich">sandwich</option>
+              <option value="geocolor">geocolor (approximate)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Band</span>
+            <select id="q-band">
+              <option value="13">13 — Clean IR</option>
+              <option value="9">9 — Water Vapor</option>
+              <option value="7">7 — Shortwave IR (Fire Temp)</option>
+              <option value="5">5 — Near-IR Snow/Ice</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Satellite</span>
+            <select id="q-satellite"><option value="goes-east">GOES-East</option><option value="goes-west">GOES-West</option></select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Cmap</span>
+            <select id="q-cmap"><option value="default">default</option><option value="abi13">abi13</option><option value="abi9">abi9</option><option value="abi7">abi7</option><option value="abi5">abi5</option><option value="ir4">ir4</option><option value="bd">bd</option><option value="enhanced">enhanced</option><option value="nrl">nrl</option><option value="grayscale">grayscale</option></select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field-group">
+            <span class="field-label">Center lat,lon (optional)</span>
+            <input type="text" id="q-center" placeholder="17.55,-78.14" style="width:140px;" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Dims</span>
+            <input type="number" id="q-dims" placeholder="500" style="width:80px;" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Unit</span>
+            <select id="q-unit"><option value="nm">nm</option><option value="km">km</option></select>
+          </div>
+          <button class="primary-btn" id="q-submit-btn">Load</button>
+          <span class="status-text" id="q-status"></span>
+        </div>
+        <div id="query-result"></div>
+      </section>
+
+      <section>
+        <h2>Load a timeframe into cache</h2>
+        <div class="row">
+          <div class="field-group">
+            <span class="field-label">Start (UTC)</span>
+            <input type="datetime-local" id="p-start" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">End (UTC)</span>
+            <input type="datetime-local" id="p-end" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Interval (min)</span>
+            <input type="number" id="p-interval" value="60" min="10" style="width:70px;" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Band</span>
+            <select id="p-band"><option value="13">13</option><option value="9">9</option><option value="7">7</option><option value="5">5</option></select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Satellite</span>
+            <select id="p-satellite"><option value="goes-east">East</option><option value="goes-west">West</option></select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field-group">
+            <span class="field-label">Center lat,lon (optional — full disk if blank)</span>
+            <input type="text" id="p-center" placeholder="17.55,-78.14" style="width:140px;" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Dims</span>
+            <input type="number" id="p-dims" placeholder="500" style="width:80px;" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Unit</span>
+            <select id="p-unit"><option value="nm">nm</option><option value="km">km</option></select>
+          </div>
+          <button class="primary-btn" id="p-submit-btn">Start prefetch</button>
+          <span class="status-text" id="p-status"></span>
+        </div>
+        <div id="prefetch-progress">
+          <div class="progress-bar-track"><div class="progress-bar-fill" id="p-progress-fill"></div></div>
+          <div class="error-list" id="p-errors"></div>
+        </div>
+      </section>
     </div>
-    <div id="prefetch-progress">
-      <div class="progress-bar-track"><div class="progress-bar-fill" id="p-progress-fill"></div></div>
-      <div class="error-list" id="p-errors"></div>
-    </div>
-  </section>
+
+  </div>
 
 </main>
 
@@ -295,6 +401,7 @@ function showLogin() {
     document.getElementById('login-wrap').style.display = 'flex';
     document.getElementById('app-header').style.display = 'none';
     document.getElementById('app-main').classList.remove('shown');
+    stopLiveRefresh();
 }
 
 function showApp() {
@@ -302,6 +409,22 @@ function showApp() {
     document.getElementById('app-header').style.display = 'flex';
     document.getElementById('app-main').classList.add('shown');
     refreshAll();
+    startLiveRefresh();
+}
+
+// ── Live refresh — polls status/cache tables so entries update as jobs
+// process/add/delete files, without the operator having to hit refresh.
+// Only ticks while the tab is actually visible, so a console left open in a
+// background tab doesn't keep polling forever.
+let liveRefreshTimer = null;
+function startLiveRefresh() {
+    stopLiveRefresh();
+    liveRefreshTimer = setInterval(() => {
+        if (document.visibilityState === 'visible') refreshAll();
+    }, 5000);
+}
+function stopLiveRefresh() {
+    if (liveRefreshTimer) { clearInterval(liveRefreshTimer); liveRefreshTimer = null; }
 }
 
 async function checkAuth() {
@@ -309,6 +432,34 @@ async function checkAuth() {
     const data = await res.json();
     if (data.authenticated) showApp(); else showLogin();
 }
+
+// ── Public stats (shown on the login screen, no auth required) ─────────
+function fmtUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function loadPublicStats() {
+    const el = document.getElementById('public-stat-cards');
+    try {
+        const res = await fetch(API_BASE + '/v1/admin/public-stats');
+        const data = await res.json();
+        const cards = [
+            ['Health', data.healthy ? '&#128994; OK' : '&#128308; Down'],
+            ['Calls (last hr)', data.calls_last_hour],
+            ['Uptime', fmtUptime(data.uptime_seconds)],
+        ];
+        el.innerHTML = cards.map(([label, value]) => `
+            <div class="stat-card">
+                <div class="label">${label}</div>
+                <div class="value">${value}</div>
+            </div>`).join('');
+    } catch (e) {
+        el.innerHTML = '<span class="status-text err">Unable to reach API.</span>';
+    }
+}
+loadPublicStats();
 
 document.getElementById('login-btn').addEventListener('click', async () => {
     const username = document.getElementById('login-user').value;
@@ -343,9 +494,22 @@ async function refreshStatus() {
     const cards = [
         ['Rendered tiles', `${data.cache.satellite.file_count} files`, fmtBytes(data.cache.satellite.bytes)],
         ['Raw netCDF', `${data.cache.goes_nc.file_count} files`, fmtBytes(data.cache.goes_nc.bytes)],
-        ['Total cache', '', fmtBytes(data.cache.total_bytes)],
+        ['Storm tracks DB', `${data.databases.storms.storm_count} storms`, fmtBytes(data.databases.storms.bytes)],
+        ['Recon MET DB', `${data.databases.recon_met.mission_count} missions`, fmtBytes(data.databases.recon_met.bytes)],
+        ['Grand total', '', fmtBytes(data.grand_total_bytes)],
     ];
     document.getElementById('status-cards').innerHTML = cards.map(([label, sub, value]) => `
+        <div class="stat-card">
+            <div class="label">${label}</div>
+            <div class="value">${value}</div>
+            <div class="label">${sub}</div>
+        </div>`).join('');
+
+    const dbCards = [
+        ['Storm tracks', `${data.databases.storms.storm_count} storms`, fmtBytes(data.databases.storms.bytes)],
+        ['Recon MET missions', `${data.databases.recon_met.mission_count} missions`, fmtBytes(data.databases.recon_met.bytes)],
+    ];
+    document.getElementById('db-stat-cards').innerHTML = dbCards.map(([label, sub, value]) => `
         <div class="stat-card">
             <div class="label">${label}</div>
             <div class="value">${value}</div>
@@ -368,7 +532,7 @@ async function refreshSatelliteCache() {
     body.innerHTML = data.entries.map(e => `
         <tr>
             <td title="${e.key}">${e.key.slice(0, 40)}${e.key.length > 40 ? '…' : ''}</td>
-            <td>${e.status || ''}</td>
+            <td style="color:${e.status === 'error' ? '#f87171' : e.status === 'ready' ? '#4ade80' : '#fbbf24'};">${e.status || ''}</td>
             <td>${e.band ?? ''}</td>
             <td>${e.cmap ?? ''}</td>
             <td>${e.satellite ?? ''}</td>
@@ -377,11 +541,15 @@ async function refreshSatelliteCache() {
             <td>${e.modified ? e.modified.slice(0, 16).replace('T', ' ') : ''}</td>
             <td>
                 <button class="view-btn" data-key="${e.key}">View</button>
+                ${e.status === 'error' ? `<button class="error-btn" data-key="${e.key}">Error</button>` : ''}
                 <button class="del-btn" data-key="${e.key}">Delete</button>
             </td>
         </tr>`).join('');
     body.querySelectorAll('.view-btn').forEach(btn => {
         btn.addEventListener('click', () => previewSatelliteEntry(btn.dataset.key));
+    });
+    body.querySelectorAll('.error-btn').forEach(btn => {
+        btn.addEventListener('click', () => previewSatelliteError(btn.dataset.key));
     });
     body.querySelectorAll('.del-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
@@ -425,11 +593,11 @@ async function refreshGoesNcCache() {
 // ── Preview pane ───────────────────────────────────────────────────────
 function showPreview(html) {
     document.getElementById('preview-body').innerHTML = html;
-    document.getElementById('preview-section').style.display = 'block';
-    document.getElementById('preview-section').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    document.getElementById('col-preview').classList.add('active');
+    document.getElementById('col-preview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 document.getElementById('preview-close-btn').addEventListener('click', () => {
-    document.getElementById('preview-section').style.display = 'none';
+    document.getElementById('col-preview').classList.remove('active');
 });
 
 function previewSatelliteEntry(key) {
@@ -446,6 +614,19 @@ function previewSatelliteEntry(key) {
             <table class="meta-table">${rows}</table>
         </div>
     `);
+}
+
+function previewSatelliteError(key) {
+    const e = _satelliteEntries.find(x => x.key === key);
+    if (!e) return;
+    showPreview(`
+        <div style="background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;padding:12px 16px;margin-bottom:14px;">
+            <div style="color:#fca5a5;font-weight:bold;margin-bottom:6px;">Error rendering ${key}</div>
+            <div style="color:#fecaca;font-size:12px;white-space:pre-wrap;">${e.message || 'No error message recorded.'}</div>
+        </div>
+        <button class="view-btn" id="preview-error-full-btn">Show full metadata</button>
+    `);
+    document.getElementById('preview-error-full-btn').addEventListener('click', () => previewSatelliteEntry(key));
 }
 
 async function previewGoesNcEntry(filename) {
@@ -501,7 +682,187 @@ function refreshAll() {
     refreshStatus();
     refreshSatelliteCache();
     refreshGoesNcCache();
+    refreshDbViewYears();
 }
+
+// ── Force-update the storms / recon MET archives ────────────────────────
+function fmtArchiveSummary(archive, summary) {
+    if (archive === 'storms') {
+        return `${summary.total_storms} storms total`;
+    }
+    return `${summary.ingested} ingested, ${summary.skipped} unchanged, ${summary.errors} errors, ${summary.total_missions} missions total`;
+}
+
+function pollArchiveUpdate(archive, btn, statusEl) {
+    const timer = setInterval(async () => {
+        const res = await api(`/v1/admin/archive-update/${archive}`);
+        const job = await res.json();
+        if (job.status === 'running' || job.status === 'queued') {
+            statusEl.textContent = `${job.status}…`;
+            statusEl.className = 'status-text working';
+            return;
+        }
+        clearInterval(timer);
+        btn.disabled = false;
+        if (job.error) {
+            statusEl.textContent = 'Error: ' + job.error;
+            statusEl.className = 'status-text err';
+        } else {
+            statusEl.textContent = 'Done — ' + fmtArchiveSummary(archive, job.summary);
+            statusEl.className = 'status-text ok';
+        }
+        refreshStatus();
+    }, 3000);
+}
+
+function startArchiveUpdate(archive, btnId, statusId) {
+    const btn = document.getElementById(btnId);
+    const statusEl = document.getElementById(statusId);
+    btn.disabled = true;
+    statusEl.textContent = 'Starting…';
+    statusEl.className = 'status-text working';
+    api(`/v1/admin/archive-update/${archive}`, { method: 'POST' })
+        .then(async (res) => {
+            if (!res.ok) {
+                const err = await res.json();
+                statusEl.textContent = 'Error: ' + (err.detail || 'failed to start');
+                statusEl.className = 'status-text err';
+                btn.disabled = false;
+                return;
+            }
+            pollArchiveUpdate(archive, btn, statusEl);
+        })
+        .catch((e) => {
+            statusEl.textContent = 'Network error: ' + e.message;
+            statusEl.className = 'status-text err';
+            btn.disabled = false;
+        });
+}
+
+document.getElementById('storms-update-btn').addEventListener('click', () => {
+    startArchiveUpdate('storms', 'storms-update-btn', 'storms-update-status');
+});
+document.getElementById('reconmet-update-btn').addEventListener('click', () => {
+    startArchiveUpdate('recon_met', 'reconmet-update-btn', 'reconmet-update-status');
+});
+
+// ── Database viewer — browse storms/recon MET by year -> storm ─────────
+function setDbViewStatus(msg, cls) {
+    const el = document.getElementById('db-view-status');
+    el.textContent = msg;
+    el.className = 'status-text ' + (cls || '');
+}
+
+async function refreshDbViewYears() {
+    const type = document.getElementById('db-view-type').value;
+    const yearSel = document.getElementById('db-view-year');
+    const stormSel = document.getElementById('db-view-storm');
+    yearSel.innerHTML = '<option value="">Year...</option>';
+    stormSel.innerHTML = '<option value="">Storm...</option>';
+    stormSel.disabled = true;
+    document.getElementById('db-view-load-btn').disabled = true;
+    document.getElementById('db-view-thead').innerHTML = '';
+    document.getElementById('db-view-body').innerHTML = '';
+
+    const path = type === 'storms' ? '/v1/storms/years' : '/v1/recon/years';
+    try {
+        const res = await api(path);
+        const data = await res.json();
+        (data.years || []).slice().reverse().forEach((y) => {
+            yearSel.innerHTML += `<option value="${y}">${y}</option>`;
+        });
+        setDbViewStatus(`${(data.years || []).length} years on record`);
+    } catch (e) {
+        setDbViewStatus('Failed to load years', 'err');
+    }
+}
+document.getElementById('db-view-type').addEventListener('change', refreshDbViewYears);
+
+document.getElementById('db-view-year').addEventListener('change', async function () {
+    const type = document.getElementById('db-view-type').value;
+    const stormSel = document.getElementById('db-view-storm');
+    stormSel.innerHTML = '<option value="">Storm...</option>';
+    stormSel.disabled = true;
+    document.getElementById('db-view-load-btn').disabled = true;
+    if (!this.value) return;
+
+    const path = type === 'storms' ? `/v1/storms/${this.value}` : `/v1/recon/${this.value}`;
+    const res = await api(path);
+    if (!res.ok) { setDbViewStatus('No data for that year', 'err'); return; }
+    const data = await res.json();
+    const storms = data.storms || [];
+    if (type === 'storms') {
+        storms.forEach((s) => {
+            stormSel.innerHTML += `<option value="${s.name}|${s.basin}">${s.name} (${s.basin})</option>`;
+        });
+    } else {
+        storms.forEach((s) => {
+            stormSel.innerHTML += `<option value="${s.storm_name}">${s.storm_name} (${s.mission_count})</option>`;
+        });
+    }
+    stormSel.disabled = storms.length === 0;
+    setDbViewStatus(`${storms.length} storms in ${this.value}`);
+});
+
+document.getElementById('db-view-storm').addEventListener('change', function () {
+    document.getElementById('db-view-load-btn').disabled = !this.value;
+});
+
+function renderDbViewTable(type, data) {
+    const thead = document.getElementById('db-view-thead');
+    const tbody = document.getElementById('db-view-body');
+    if (type === 'storms') {
+        thead.innerHTML = '<tr><th>Datetime (UTC)</th><th>Status</th><th>Category</th><th>Lat</th><th>Lon</th><th>Wind (kt)</th><th>Pressure (mb)</th></tr>';
+        const points = data.points || [];
+        tbody.innerHTML = points.length ? points.map((p) => `
+            <tr>
+                <td>${p.datetime_utc}</td><td>${p.status}</td><td>${p.category}</td>
+                <td>${p.lat}</td><td>${p.lon}</td>
+                <td>${p.wind_kt ?? ''}</td><td>${p.pressure_mb ?? ''}</td>
+            </tr>`).join('') : '<tr class="empty-row"><td colspan="7">No track points.</td></tr>';
+        setDbViewStatus(`${points.length} track points — ${data.name} (${data.basin}) ${data.year}`, 'ok');
+    } else {
+        thead.innerHTML = '<tr><th>Mission ID</th><th>Aircraft</th><th>Tail #</th><th>Flight date</th><th>Start (UTC)</th><th>End (UTC)</th><th>Obs</th><th></th></tr>';
+        const missions = data.missions || [];
+        tbody.innerHTML = missions.length ? missions.map((m) => `
+            <tr>
+                <td>${m.mission_id}</td><td>${m.aircraft ?? ''}</td><td>${m.tail_num ?? ''}</td>
+                <td>${m.flight_date ?? ''}</td>
+                <td>${new Date(m.start_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
+                <td>${new Date(m.end_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
+                <td>${m.obs_count}</td>
+                <td><a class="view-btn" href="${API_BASE}/v1/recon/mission/${m.mission_id}/download" target="_blank" rel="noopener">Download</a></td>
+            </tr>`).join('') : '<tr class="empty-row"><td colspan="8">No missions.</td></tr>';
+        setDbViewStatus(`${missions.length} missions — ${data.storm_name} ${data.year}`, 'ok');
+    }
+}
+
+document.getElementById('db-view-load-btn').addEventListener('click', async () => {
+    const type = document.getElementById('db-view-type').value;
+    const year = document.getElementById('db-view-year').value;
+    const stormVal = document.getElementById('db-view-storm').value;
+    if (!year || !stormVal) return;
+
+    setDbViewStatus('Loading…', 'working');
+    let path;
+    if (type === 'storms') {
+        const [name, basin] = stormVal.split('|');
+        path = `/v1/storms/${year}/${encodeURIComponent(name)}?basin=${basin}`;
+    } else {
+        path = `/v1/recon/${year}/${encodeURIComponent(stormVal)}`;
+    }
+    try {
+        const res = await api(path);
+        if (!res.ok) {
+            const err = await res.json();
+            setDbViewStatus('Error: ' + (err.detail || 'failed to load'), 'err');
+            return;
+        }
+        renderDbViewTable(type, await res.json());
+    } catch (e) {
+        setDbViewStatus('Network error: ' + e.message, 'err');
+    }
+});
 
 // ── Submit a query (calls the public /v1/satellite/tile endpoint) ────────
 function setQStatus(msg, cls) {
@@ -513,12 +874,17 @@ function setQStatus(msg, cls) {
 async function loadQuery() {
     const timeVal = document.getElementById('q-time').value;
     if (!timeVal) { setQStatus('Pick a time.', 'err'); return; }
+    const product = document.getElementById('q-product').value;
     const params = {
         time: timeVal + ':00Z',
-        band: document.getElementById('q-band').value,
         satellite: document.getElementById('q-satellite').value,
-        cmap: document.getElementById('q-cmap').value,
     };
+    if (product) {
+        params.product = product;
+    } else {
+        params.band = document.getElementById('q-band').value;
+        params.cmap = document.getElementById('q-cmap').value;
+    }
     const center = document.getElementById('q-center').value.trim();
     if (center) {
         params.center = center;
@@ -540,7 +906,8 @@ async function loadQuery() {
         if (data.status !== 'ready') {
             setQStatus('Error: ' + (data.message || 'unknown'), 'err');
         } else {
-            setQStatus(`✓ ${data.satellite} Band ${data.band} (${data.cmap}) — scan ${(data.scan_start || '').slice(0, 16)}Z`, 'ok');
+            const label = data.product ? `Product ${data.product}` : `Band ${data.band} (${data.cmap})`;
+            setQStatus(`✓ ${data.satellite} ${label} — scan ${(data.scan_start || '').slice(0, 16)}Z`, 'ok');
             document.getElementById('query-result').innerHTML = `<img src="${API_BASE + data.png_url}" alt="rendered tile" />`;
             refreshSatelliteCache(); refreshStatus();
         }

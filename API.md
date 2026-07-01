@@ -43,10 +43,21 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | Endpoint | Status |
 |---|---|
 | `GET /v1/health` | 🟢 Live |
-| `GET /v1/satellite/tile` (GOES Band 13 / 9) | 🟢 Live |
+| `GET /v1/satellite/tile` (bands 5, 7, 9, 13) | 🟢 Live |
+| `GET /v1/satellite/tile` (`product=sandwich`, `product=geocolor`) | 🟢 Live (geocolor is an approximation — see `/v1/satellite/products`) |
 | `GET /v1/satellite/status/{key}` | 🟢 Live |
 | `GET /v1/satellite/colortable` | 🟢 Live |
-| `GET /v1/satellite/tile` (Band 2 / GeoColor) | 🟡 Planned |
+| `GET /v1/satellite/products` | 🟢 Live |
+| `GET /v1/satellite/tile` (standalone Band 2 visible) | 🟡 Planned |
+| `GET /v1/storms/years` | 🟢 Live |
+| `GET /v1/storms/{year}` | 🟢 Live |
+| `GET /v1/storms/{year}/{name}` | 🟢 Live |
+| `GET /v1/storms/{year}/{name}/nearest` | 🟢 Live |
+| `GET /v1/recon/years` | 🟢 Live |
+| `GET /v1/recon/{year}` | 🟢 Live |
+| `GET /v1/recon/{year}/{storm_name}` | 🟢 Live |
+| `GET /v1/recon/mission/{mission_id}` | 🟢 Live |
+| `GET /v1/recon/mission/{mission_id}/download` | 🟢 Live |
 | `GET /v1/tdr/missions` | 🟡 Planned |
 | `GET /v1/tdr/sweep` | 🟡 Planned |
 | `GET /v1/raw/netcdf` | 🟡 Planned |
@@ -82,42 +93,72 @@ until `status` becomes `"ready"` or `"error"`.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `time` | ISO 8601 UTC datetime | *required* | e.g. `2024-09-28T12:00:00Z`. Resolved to the nearest available scan. |
-| `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm). Band 2 (visible) and GeoColor are planned, not yet accepted. |
-| `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. |
-| `satellite` | string | `goes-east` | `goes-east` (auto-resolves GOES-16 vs GOES-19 by date) or `goes-west` (auto-resolves GOES-17 vs GOES-18 by date). Both only cover the ABI era (~2017-2018 onward) — see "Satellite coverage" below. |
-| `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. |
+| `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm), `7` = Shortwave IR / "fire temperature" (3.9µm), `5` = Near-IR Snow/Ice (1.6µm, reflectance). Ignored if `product` is given. Standalone Band 2 (visible) isn't accepted yet — see `GET /v1/satellite/products`. |
+| `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `abi7`, `abi5`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. Ignored if `product` is given. |
+| `product` | string | *(none)* | `sandwich` or `geocolor` — a multi-band composite (see below). When given, `band`/`cmap` are ignored. Full-disk only — not compatible with `center`/`dims`. |
+| `satellite` | string | `goes-east` | `goes-east` (auto-resolves GOES-16 vs GOES-19 by date) or `goes-west` (auto-resolves GOES-17 vs GOES-18 by date). Both only cover the ABI era (~2017-2019 onward) — see "Satellite coverage" below. |
+| `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. Not supported with `product`. |
 | `dims` | float | *(none)* | Full width/height of the box centered on `center` (a square box). Requires `center`. Clamped to 10–8000km. |
 | `unit` | string | `nm` | Unit for `dims`: `nm` (nautical miles) or `km`. |
-| `resolution_km` | float | *(native)* | km per output pixel for a bbox request. Omit for the sensor's native resolution (highest detail — 2km for bands 9/13 today). Increase to render faster / produce a smaller file; can't go finer than native (silently clamped up). |
+| `resolution_km` | float | *(native)* | km per output pixel for a bbox request. Omit for the sensor's native resolution (highest detail — 2km for most bands, 1km for band 5). Increase to render faster / produce a smaller file; can't go finer than native (silently clamped up). |
 
 ### Color tables (`cmap`)
 
 `default` is recommended for almost all use — it resolves server-side to
-the correct **per-band** standard enhancement (`abi13` for `band=13`,
-`abi9` for `band=9`). Band 13 (IR window) and Band 9 (water vapor) measure
-different physical quantities and use genuinely different color
-conventions — there is no single colortable that's correct for both, so
+the correct **per-band** standard enhancement. Every band measures a
+different physical quantity (brightness temperature for 7/9/13,
+reflectance for 5) and uses a genuinely different color convention —
+there is no single colortable that's correct for all of them, so
 `default` is band-aware rather than a fixed choice.
 
 | Value | Description |
 |---|---|
-| `default` | Resolves to `abi13` or `abi9` based on `band` (see below). |
+| `default` | Resolves to `abi13`/`abi9`/`abi7`/`abi5` based on `band` (see below). |
 | `abi13` | **Band 13 standard enhancement.** White at the most extreme cold overshooting tops (-110°C) down through black (-80°C), a rainbow band from -80°C to -32°C highlighting severe convection, a hard cut to light grey at -31°C, then greyscale (light=cold, dark=warm) to black at +57°C — most scenes are mostly greyscale, with color only appearing over genuinely severe convection. Exact temperature→hex stops, not an approximation — see `_ABI13_STOPS` in `app/services/goes.py`. |
 | `abi9` | **Band 9 (water vapor) standard enhancement.** Cyan at coldest/moist (-93°C) through green tones, white at the moist/dry transition (-42°C), a purple/navy/indigo band (-30°C to -18°C), then yellow→orange→red to black at warmest/driest (+7°C). Exact temperature→hex stops, not an approximation — see `_ABI9_STOPS` in `app/services/goes.py`. Do not use this for Band 13 (or vice versa) — it represents a different physical quantity. |
+| `abi7` | **Band 7 (shortwave IR, "fire temperature") standard enhancement.** Greyscale over the same cloud-top range as 9/13, then a yellow→red highlight above normal clear-sky warmth (~+57°C) to flag hotspots — this band saturates far higher than 9/13 (fires can push 400K+), inspired by (not identical to) common operational SWIR/fire-temperature displays. See `_ABI7_STOPS` in `app/services/goes.py`. |
+| `abi5` | **Band 5 (near-IR snow/ice) reflectance ramp.** Not a temperature colortable — Band 5 reports reflectance factor (~0-1), rendered as a gamma-stretched 0-100% grayscale (linear reflectance reads unnaturally flat/dark to the eye). See `_reflectance_gray()` in `app/services/goes.py`. |
 | `ir4` | An alternate Band 13 enhancement sourced verbatim from [satpy](https://github.com/pytroll/satpy)'s `colorized_ir_clouds` enhancement: greyscale -20°C to +30°C, then the [ColorBrewer "Spectral"](https://colorbrewer2.org) 11-class diverging palette -80°C to -20°C. Kept for comparison; `abi13` is the recommended default for Band 13. |
 | `bd` | Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue→purple→red for cold convection |
 | `enhanced` | Darker surface/low clouds, white mid/high clouds, color for coldest tops |
 | `nrl` | Naval Research Lab tropical cyclone enhancement — smooth yellow-green→cyan→blue→purple→red ramp |
 | `grayscale` | Plain linear greyscale by brightness temperature |
 
+`bd`/`enhanced`/`nrl`/`grayscale`/`ir4` were tuned for bands 9/13's
+-113..+42°C range — applying them to Band 7 works (its brightness
+temperature is on the same Kelvin scale) but clips anything above +42°C
+to the same color, silently losing Band 7's fire-highlighting range.
+Use `abi7` (the default) if that matters.
+
+### Composite products (`product`)
+
+| Value | Description |
+|---|---|
+| `sandwich` | Band 13 IR (the `abi13` enhancement) modulated by Band 2 visible brightness, to show convective texture (overshooting tops, gravity waves) a pure IR colorization smooths over. Falls back to a darkened plain-IR look at night (no visible signal to show texture from). |
+| `geocolor` | A **simplified approximation** of NOAA/CIRA's GeoColor — day side: synthetic true color from Bands 1/2/3 (green is synthesized via `0.45*red + 0.10*NIR + 0.45*blue`, CIRA's published recipe, since ABI has no native green channel); night side: `abi13` colorized IR; blended by solar zenith angle across the terminator. **Not** the official product: no city-lights layer, no atmospheric/Rayleigh correction. See `GET /v1/satellite/products` for the exact same description in machine-readable form. |
+
+Both composites fetch every companion band from the *exact same scan
+cycle* (ABI captures all bands simultaneously per scan, so there's no
+time-misalignment between e.g. the IR and visible channels) and are
+full-disk only for now — `center`/`dims` isn't supported yet.
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&product=sandwich"
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&product=geocolor"
+```
+
 ### Satellite coverage (`satellite`)
 
 | Satellite | Bucket | Active dates |
 |---|---|---|
-| GOES-16 (East) | `noaa-goes16` | until 2025-01-14 |
+| GOES-16 (East) | `noaa-goes16` | 2017-12-18 until 2025-01-14 |
 | GOES-19 (East) | `noaa-goes19` | 2025-01-14 onward |
-| GOES-17 (West) | `noaa-goes17` | until 2023-01-10 (earliest data ~2018) |
+| GOES-17 (West) | `noaa-goes17` | 2019-02-12 until 2023-01-10 |
 | GOES-18 (West) | `noaa-goes18` | 2023-01-10 onward |
+
+`GET /v1/satellite/products` returns these same dates in machine-readable
+form (`satellites.goes-east`/`satellites.goes-west`), so a client doesn't
+need to hardcode them either.
 
 `satellite=goes-east`/`goes-west` auto-resolve to the right satellite for
 the requested `time`; you don't need to track these cutover dates
@@ -275,6 +316,141 @@ curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
 
 ---
 
+## `GET /v1/satellite/products` 🟢
+
+Discovery endpoint: every single-band and composite product this API can
+render, plus the exact UTC date range each satellite covers — so a client
+can build a product picker without hardcoding any of this project's
+band/cmap/coverage knowledge.
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/products"
+```
+
+```json
+{
+  "bands": [
+    {"band": 5, "name": "Near-IR (Snow/Ice), 1.6µm", "kind": "reflectance",
+     "default_cmap": "abi5", "cmaps": ["abi5"], "native_resolution_km": 1.0, "bbox_supported": true},
+    {"band": 7, "name": "Shortwave IR (\"Fire Temperature\"), 3.9µm", "kind": "brightness_temp",
+     "default_cmap": "abi7", "cmaps": ["abi7", "bd", "enhanced", "grayscale", "ir4", "nrl"],
+     "native_resolution_km": 2.0, "bbox_supported": true},
+    {"band": 9, "...": "..."},
+    {"band": 13, "...": "..."}
+  ],
+  "products": [
+    {"product": "sandwich", "name": "IR/VIS Sandwich", "description": "...", "bbox_supported": false},
+    {"product": "geocolor", "name": "GeoColor-style composite (approximate)", "description": "...", "bbox_supported": false}
+  ],
+  "satellites": {
+    "goes-east": [
+      {"satellite": "GOES-16", "start": "2017-12-18", "end": "2025-01-14"},
+      {"satellite": "GOES-19", "start": "2025-01-14", "end": null}
+    ],
+    "goes-west": [
+      {"satellite": "GOES-17", "start": "2019-02-12", "end": "2023-01-10"},
+      {"satellite": "GOES-18", "start": "2023-01-10", "end": null}
+    ]
+  }
+}
+```
+
+`kind` tells you whether a band's colortables are temperature-based
+(`brightness_temp`) or a reflectance ramp (`reflectance`) — relevant if
+you're building a legend, since the two need different axis units (°C vs
+%). An `end: null` satellite is the current one for that side.
+
+---
+
+## `GET /v1/storms/*` 🟢 — Historical storm tracks
+
+A local best-track database, **named storms only** — year + storm name +
+an arbitrary datetime in, the closest actual track fix out. Not backed by
+TC-Atlas's TDR metadata — that dataset only has fixes at moments a recon
+aircraft happened to fly, which can't answer "what was this storm doing at
+3am on some arbitrary date" or cover a storm still in progress. Instead:
+
+- **HURDAT2** — NHC's official reconciled archive (Atlantic since 1950,
+  East/Central Pacific since 1950s), the authoritative source but only
+  republished once a year, months after each season ends.
+- **ATCF b-decks** — NHC's operational best-track feed, updated
+  near-real-time all season and archived by season once it closes. Fills
+  the gap between HURDAT2's last reconciled year and today, so the
+  database stays current through the storm happening right now.
+
+Every unnamed depression/invest is filtered out of both sources (see
+`is_real_storm_name()` in [`app/services/storms.py`](app/services/storms.py)),
+which as a side effect also drops the 19th/early-20th-century tail —
+Atlantic storms didn't get real names until 1950.
+
+A nightly systemd timer (`deploy/storm-archive-update.timer`) re-runs
+[`scripts/ingest_storms.py`](scripts/ingest_storms.py) to pick up the
+latest advisory for any storm currently active; see the README's
+"Storm archive updates" section to install it. Every storm upserts by
+`atcf_id` and replaces its own track points, so re-running is always safe
+whether triggered by the timer or by hand.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/storms/years` | Every year with at least one storm on record. |
+| `GET /v1/storms/{year}` | Every storm tracked in that year: `{name, basin, atcf_id}[]`. `basin` is `AL` (Atlantic), `EP` (East Pacific), or `CP` (Central Pacific). |
+| `GET /v1/storms/{year}/{name}` | Full best-track for one storm — every ~6-hourly fix: `datetime_utc`, `status` (HURDAT2 code), `category` (Saffir-Simpson label for hurricanes, a plain status label otherwise), `lat`/`lon` (decimal degrees, negative = S/W), `wind_kt`, `pressure_mb`. |
+| `GET /v1/storms/{year}/{name}/nearest?datetime=...` | The single fix closest in time to an arbitrary ISO 8601 UTC `datetime` — the core "feed a year/name/datetime, get the closest relevant data" lookup. |
+
+Both `{year}/{name}` endpoints accept an optional `?basin=AL\|EP\|CP` to
+disambiguate the rare case of the same name reused across basins in the
+same year — omitting it returns a `409` listing the candidates if that
+happens.
+
+```bash
+curl "https://joshmurdock.net/api/v1/storms/2023/LEE/nearest?datetime=2023-09-10T12:00:00Z"
+# {"datetime_utc":"2023-09-10T12:00:00Z","status":"HU","category":"Category 2",
+#  "lat":21.5,"lon":-60.8,"wind_kt":95,"pressure_mb":956,
+#  "year":2023,"name":"LEE","basin":"AL","atcf_id":"AL132023"}
+```
+
+---
+
+## `GET /v1/recon/*` 🟢 — Recon MET (1-second flight-level) archive
+
+A local archive of NOAA hurricane hunter aircraft flight-level observation
+data — every mission NOAA has flown into a storm since 2011, decimated to
+0.2 Hz (every 5th raw 1-second sample) and stored with lat/lon, flight-level
+wind, SFMR surface wind, wind direction, and altitude per point. Same
+year -> storm -> mission discovery shape as `/v1/storms/*` above, so the
+two archives can be cross-referenced (e.g. "show me every recon fix within
+an hour of this best-track point") from one API. Crawled from NOAA's raw
+archive at `seb.omao.noaa.gov/pub/acdata` — see
+[`app/services/recon_met.py`](app/services/recon_met.py) for the crawler
+and [`scripts/ingest_recon_met.py`](scripts/ingest_recon_met.py) for the
+ingestion entry point (also a nightly systemd timer — see the README's
+"Recon MET archive" section).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/recon/years` | Every year with at least one archived mission. |
+| `GET /v1/recon/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. Unidentified flights (training, calibration) are grouped under `storm_name: "Unknown / Training"` rather than one bucket per flight. |
+| `GET /v1/recon/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, flight_date, start_unix, end_unix, obs_count, source_url}[]`, ordered chronologically. |
+| `GET /v1/recon/mission/{mission_id}` | The mission's full decimated track — `mission_id` alone is enough to look it up (unique across every year/storm). Returns metadata plus `obs`: an array of `[unix_time, lat, lon, wind_kt, wind_dir, sfmr_kt, alt_m]` tuples (any field can be `null` if that sensor didn't report). Also includes `source_url`. |
+| `GET /v1/recon/mission/{mission_id}/download` | Streams NOAA's original full-resolution NetCDF file for this mission (600+ variables — attitude, airspeed, every raw sensor channel — not just the ~7 fields `/mission/{id}` decimates). Not a redirect: the bytes are proxied through this API with `Content-Type: application/x-netcdf`, since a redirect's success depends on the caller's HTTP client following it, which isn't guaranteed for every netCDF-consuming tool. |
+
+```bash
+curl "https://joshmurdock.net/api/v1/recon/2024/Beryl"
+# {"year":2024,"storm_name":"Beryl","missions":[
+#   {"mission_id":"20240630I1","aircraft":"NOAA 43 (Miss Piggy)","tail_num":"N43",
+#    "flight_date":"2024-06-30","start_unix":1719732180,"end_unix":1719765800,
+#    "obs_count":6725,"source_url":"https://seb.omao.noaa.gov/pub/acdata/2024/MET/20240630I1/20240630I1_A.nc"},
+#   ...]}
+
+curl -o mission.nc "https://joshmurdock.net/api/v1/recon/mission/20240630I1/download"
+# streams the full ~85MB original file (632 variables in a typical mission,
+# vs. the ~7 this project decimates) — use this if you need anything
+# beyond position/wind/SFMR/altitude: attitude (yaw/pitch/roll), airspeed,
+# Mach number, multiple GPS/temperature sensor variants, etc.
+```
+
+---
+
 ## `GET /v1/tdr/missions` 🟡 / `GET /v1/tdr/sweep` 🟡
 
 Not implemented yet — both return `501` today. Planned shape (subject to
@@ -319,10 +495,14 @@ https://joshmurdock.net/api/demo/netcdf-three/
 A login-gated web UI for operating this deployment: cache status/storage
 stats, browsing and deleting cached rendered tiles and raw netCDF
 downloads, submitting one-off queries, and bulk-prefetching a timeframe
-into the cache. Static page at `app/console/index.html`, calling the
-`/v1/admin/*` JSON endpoints below. See the README's "Admin console"
-section for the credentials file (`admin_credentials.json`, gitignored,
-default `admin`/`password` — change it before exposing this publicly).
+into the cache. Also a "Databases" panel showing storm-track and recon MET
+archive size/record counts, a browsable viewer (year -> storm -> track
+points/missions) over both, and a "force update" button per archive to
+run the nightly ingest on demand instead of waiting for the timer. Static
+page at `app/console/index.html`, calling the `/v1/admin/*` JSON endpoints
+below. See the README's "Admin console" section for the credentials file
+(`admin_credentials.json`, gitignored, default `admin`/`password` —
+change it before exposing this publicly).
 
 ```
 https://joshmurdock.net/api/
@@ -332,10 +512,11 @@ https://joshmurdock.net/api/
 
 | Endpoint | Method | Purpose |
 |---|---|---|
+| `/v1/admin/public-stats` | GET | **No login required.** Shown on the console's login screen so anyone can see basic health before authenticating: `{healthy, uptime_seconds, calls_last_hour, total_calls}`. Deliberately excludes cache/storage figures — those stay behind login in `/status` below. In-memory counters, reset on process restart. |
 | `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie or `401`. |
 | `/v1/admin/logout` | POST | Clears the session. |
 | `/v1/admin/whoami` | GET | `{authenticated: bool}` — no login required, used by the console to decide whether to show the login form. |
-| `/v1/admin/status` | GET | Cache stats: file count + bytes for `satellite` (rendered tiles) and `goes_nc` (raw downloads) separately, plus a total. |
+| `/v1/admin/status` | GET | Cache stats (`satellite`/`goes_nc` file count + bytes + total) **and** database stats: `databases.storms` (`bytes`, `storm_count`), `databases.recon_met` (`bytes`, `mission_count`), a `databases.total_bytes`, and a `grand_total_bytes` across everything. |
 | `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry — **every field the render pipeline wrote** (key, status, band, cmap, satellite, sat_lon, scan_start, bounds, center, width_km, resolution_km, png_url, size, modified), not a curated subset, so the console's preview pane has everything without a second round-trip. |
 | `/v1/admin/cache/satellite/{key}` | DELETE | Delete one entry's `.png`/`.json`/`.lock` files. |
 | `/v1/admin/cache/satellite` | DELETE | Delete all rendered-tile cache entries. |
@@ -346,6 +527,8 @@ https://joshmurdock.net/api/
 | `/v1/admin/prefetch` | POST | Bulk-load a timeframe into cache — see below. Returns a job immediately; poll for progress. |
 | `/v1/admin/prefetch/{job_id}` | GET | Poll a prefetch job's progress. |
 | `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
+| `/v1/admin/archive-update/{archive}` | POST | Force-run the storms or recon MET nightly ingest immediately — `archive` is `storms` or `recon_met`. Same code path as the systemd timer (`storms.run_ingest()` / `recon_met.run_ingest()`), just triggered on demand for data that hasn't been picked up yet. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). |
+| `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done, started_at, finished_at, summary, error}`. |
 
 ### Bulk prefetch
 

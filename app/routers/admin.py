@@ -14,14 +14,31 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
 from app import auth
-from app.paths import CACHE_ROOT
+from app.paths import CACHE_ROOT, RECON_MET_DB_PATH, STORMS_DB_PATH
 from app.routers.satellite import VALID_BANDS, VALID_CMAPS, _cache, _nc_cache_dir, _parse_center
-from app.services import goes
+from app.services import goes, recon_met, stats, storms
+from app.services.netcdf_lock import NC_LOCK
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 MAX_PREFETCH_SLOTS = 500
 _prefetch_jobs: dict[str, dict] = {}
+
+# Singleton (not job-id-keyed, unlike prefetch above) — there's only ever
+# one "update the whole archive" job per archive type at a time.
+_archive_update_jobs: dict[str, dict] = {
+    "storms": {"status": "idle", "started_at": None, "finished_at": None, "summary": None, "error": None},
+    "recon_met": {"status": "idle", "started_at": None, "finished_at": None, "summary": None, "error": None},
+}
+
+
+# ── Public status (no login) ────────────────────────────────────────────
+# Shown on the console's login screen so anyone can eyeball API health
+# before authenticating. Intentionally excludes cache/storage figures —
+# those stay behind login in /status below.
+@router.get("/public-stats")
+async def public_stats():
+    return stats.get_public_stats()
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────
@@ -58,17 +75,40 @@ def _dir_stats(directory: Path) -> dict:
     return {"file_count": count, "bytes": total_bytes}
 
 
+def _db_file_stats(path: Path) -> dict:
+    return {"bytes": path.stat().st_size if path.exists() else 0}
+
+
 @router.get("/status", dependencies=[Depends(auth.require_login)])
 async def status():
     satellite_stats = _cache.stats()
     nc_stats = _dir_stats(_nc_cache_dir)
+    cache_total = satellite_stats["bytes"] + nc_stats["bytes"]
+
+    storms_conn = storms.get_connection()
+    storm_count = storms_conn.execute("SELECT COUNT(*) FROM storms").fetchone()[0]
+    storms_conn.close()
+    recon_conn = recon_met.get_connection()
+    mission_count = recon_conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0]
+    recon_conn.close()
+
+    storms_db_stats = {**_db_file_stats(STORMS_DB_PATH), "storm_count": storm_count}
+    recon_db_stats = {**_db_file_stats(RECON_MET_DB_PATH), "mission_count": mission_count}
+    databases_total = storms_db_stats["bytes"] + recon_db_stats["bytes"]
+
     return {
         "healthy": True,
         "cache": {
             "satellite": satellite_stats,
             "goes_nc": nc_stats,
-            "total_bytes": satellite_stats["bytes"] + nc_stats["bytes"],
+            "total_bytes": cache_total,
         },
+        "databases": {
+            "storms": storms_db_stats,
+            "recon_met": recon_db_stats,
+            "total_bytes": databases_total,
+        },
+        "grand_total_bytes": cache_total + databases_total,
     }
 
 
@@ -141,22 +181,23 @@ async def get_goes_nc_info(filename: str):
 
     import netCDF4 as nc4
 
-    ds = nc4.Dataset(str(path), "r")
-    try:
-        dimensions = {name: len(dim) for name, dim in ds.dimensions.items()}
-        variables = []
-        for name, var in ds.variables.items():
-            variables.append({
-                "name": name,
-                "dimensions": list(var.dimensions),
-                "shape": list(var.shape),
-                "dtype": str(var.dtype),
-                "units": getattr(var, "units", None),
-                "long_name": getattr(var, "long_name", None),
-            })
-        global_attrs = {attr: str(getattr(ds, attr)) for attr in ds.ncattrs()}
-    finally:
-        ds.close()
+    with NC_LOCK:  # see app/services/netcdf_lock.py — HDF5 isn't thread-safe
+        ds = nc4.Dataset(str(path), "r")
+        try:
+            dimensions = {name: len(dim) for name, dim in ds.dimensions.items()}
+            variables = []
+            for name, var in ds.variables.items():
+                variables.append({
+                    "name": name,
+                    "dimensions": list(var.dimensions),
+                    "shape": list(var.shape),
+                    "dtype": str(var.dtype),
+                    "units": getattr(var, "units", None),
+                    "long_name": getattr(var, "long_name", None),
+                })
+            global_attrs = {attr: str(getattr(ds, attr)) for attr in ds.ncattrs()}
+        finally:
+            ds.close()
 
     return {
         "filename": filename,
@@ -301,3 +342,42 @@ async def get_prefetch_status(job_id: str):
 @router.get("/prefetch", dependencies=[Depends(auth.require_login)])
 async def list_prefetch_jobs():
     return {"jobs": sorted(_prefetch_jobs.values(), key=lambda j: j["started_at"], reverse=True)}
+
+
+# ── Force-update the storms / recon MET archives ────────────────────────
+# Same nightly-timer code path (storms.run_ingest() / recon_met.run_ingest()),
+# just triggerable on demand for data that hasn't been picked up yet by the
+# scheduled run — see deploy/storm-archive-update.timer and
+# deploy/recon-met-update.timer.
+def _run_archive_update(archive: str):
+    job = _archive_update_jobs[archive]
+    job["status"] = "running"
+    job["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    job["finished_at"] = None
+    job["error"] = None
+    try:
+        job["summary"] = storms.run_ingest() if archive == "storms" else recon_met.run_ingest()
+    except Exception as e:  # noqa: BLE001 - report and let the console show it, don't crash the worker
+        job["error"] = str(e)
+    finally:
+        job["status"] = "done"
+        job["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+@router.post("/archive-update/{archive}", dependencies=[Depends(auth.require_login)])
+async def start_archive_update(archive: str, background_tasks: BackgroundTasks):
+    if archive not in _archive_update_jobs:
+        raise HTTPException(404, f"Unknown archive: {archive} (expected 'storms' or 'recon_met')")
+    job = _archive_update_jobs[archive]
+    if job["status"] == "running":
+        raise HTTPException(409, f"{archive} update is already running")
+    job["status"] = "queued"
+    background_tasks.add_task(_run_archive_update, archive)
+    return job
+
+
+@router.get("/archive-update/{archive}", dependencies=[Depends(auth.require_login)])
+async def get_archive_update_status(archive: str):
+    if archive not in _archive_update_jobs:
+        raise HTTPException(404, f"Unknown archive: {archive} (expected 'storms' or 'recon_met')")
+    return _archive_update_jobs[archive]

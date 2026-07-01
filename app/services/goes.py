@@ -29,6 +29,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from app.services.netcdf_lock import NC_LOCK
+
 log = logging.getLogger("noaa_recon_api.goes")
 
 # ── Temperature → colormap index ────────────────────────────────────────────
@@ -223,32 +225,72 @@ def _abi9(t_k):
     return _interp_stops(t_k - 273.15, _ABI9_STOPS)
 
 
+# Band 7 (Shortwave IR window, 3.9um): a brightness-temperature band like
+# 9/13, but a much wider practical range than either — it sees clear-sky/
+# sunlit-surface temperatures up to ~330K+ (driven partly by reflected
+# sunlight, not just emitted heat, a known quirk of this wavelength) and
+# saturates far higher over actual fires/hotspots (400K+). Grayscale for
+# the cloud-top range shared with 9/13, then a "fire temperature"-style
+# yellow->red highlight above normal clear-sky warmth to flag hotspots —
+# inspired by (not identical to) the common SWIR/"fire temperature"
+# products used operationally for wildfire detection.
+_ABI7_STOPS = [
+    (-90, (255, 255, 255)),  # coldest overshooting tops (rare at 3.9um) — white
+    (-60, (0, 0, 0)),        # black — cold convective tops
+    (-20, (90, 90, 90)),
+    (0, (150, 150, 150)),
+    (30, (210, 210, 210)),   # near-surface/clear-sky, light grey
+    (57, (255, 255, 255)),   # ~330K — warm clear sky / sunlit ground, white
+    (90, (255, 255, 0)),     # ~363K — hotspot threshold, yellow
+    (130, (255, 0, 0)),      # ~403K — fire-hot, red
+]
+
+
+def _abi7(t_k):
+    return _interp_stops(t_k - 273.15, _ABI7_STOPS)
+
+
 LUTS = {
     "bd": _build_lut(_bd),
     "enhanced": _build_lut(_enhanced),
     "nrl": _build_lut(_nrl),
     "grayscale": _build_lut(_grayscale),
     "ir4": _build_lut(_goes_ir4),
-    # abi13/abi9 are intentionally NOT routed through the shared 256-bucket
-    # LUT above (_build_lut quantizes the full 160-315K range into 256
-    # steps, ~0.6C/step) — their source data has a deliberate 1C-wide hard
-    # cut (Band 13: cyan@-32C -> light grey@-31C) that quantization smears
-    # into a muddy blended color, and a range (Band 13 needs up to +57C)
-    # wider than the shared LUT's 160-315K (-113..+42C) window, clamping
-    # the warm end before it reaches true black. See STOPS_BY_CMAP /
-    # _colorize_exact below — these are evaluated exactly, per-pixel,
-    # directly from _ABI13_STOPS/_ABI9_STOPS instead.
+    # abi13/abi9/abi7 are intentionally NOT routed through the shared
+    # 256-bucket LUT above (_build_lut quantizes the full 160-315K range
+    # into 256 steps, ~0.6C/step) — their source data has deliberately
+    # sharp cuts (Band 13: cyan@-32C -> light grey@-31C) that quantization
+    # smears into a muddy blended color, and ranges wider than the shared
+    # LUT's 160-315K (-113..+42C) window (Band 13 to +57C, Band 7 to
+    # +130C for fires), clamping the warm end before it reaches true
+    # value. See STOPS_BY_CMAP / _colorize_exact below — these are
+    # evaluated exactly, per-pixel, directly from their _STOPS tables.
 }
 
+# Bands 1-6 report reflectance factor (~0-1.2, unitless), not brightness
+# temperature — they need a different colorization path (see _colorize)
+# since there's no "temperature" to map through a thermal LUT. Only band 5
+# is exposed as a standalone single-band product today; 1/2/3 are used
+# internally by the sandwich/geocolor composites (see render_sandwich_to_png
+# / render_geocolor_to_png).
+REFLECTANCE_BANDS = {1, 2, 3, 4, 5, 6}
+
 # cmap="default" resolves to one of these based on the requested band, since
-# Band 13 (IR window) and Band 9 (water vapor) use genuinely different
-# enhancement conventions — there's no single "default" LUT independent of
-# which physical quantity is being displayed.
-DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9"}
+# each band is a genuinely different physical quantity/enhancement
+# convention — there's no single "default" independent of which band.
+# "abi5" is a sentinel, not a temperature colortable — see REFLECTANCE_BANDS.
+DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9", 7: "abi7", 5: "abi5"}
 
 # Colortables evaluated exactly (vectorized, full float precision) rather
 # than through the shared quantized LUT — see comment above LUTS.
-STOPS_BY_CMAP = {"abi13": _ABI13_STOPS, "abi9": _ABI9_STOPS}
+STOPS_BY_CMAP = {"abi13": _ABI13_STOPS, "abi9": _ABI9_STOPS, "abi7": _ABI7_STOPS}
+
+# Reflectance-band cmaps: not temperature stops, handled by _colorize's
+# separate reflectance branch. Kept as its own set (rather than folding
+# into STOPS_BY_CMAP/LUTS) so callers can tell "no temperature semantics
+# apply here" apart from "this is a LUT/stops cmap that happens not to
+# match the requested band".
+REFLECTANCE_CMAPS = {"abi5"}
 
 
 # ── ABI Fixed Grid → geographic lat/lon (PUG Volume 5, Section 4.2) ─────────
@@ -414,6 +456,28 @@ def resolve_nearest(target: datetime.datetime, band: int, satellite: str = "east
     return ResolvedScan(bucket=bucket, key=key, satellite=satellite_num, band=band, scan_start=scan_start)
 
 
+def resolve_companion_band(resolved: ResolvedScan, band: int) -> ResolvedScan:
+    """Given an already-resolved scan, finds the sibling file for a
+    different band from the exact same scan cycle — every ABI band is
+    captured simultaneously per scan, so the sibling file shares the
+    resolved scan's exact `scan_start` (not just "close"), which is what
+    lets the composite products (sandwich, geocolor) combine multiple
+    bands without any time-alignment error between them."""
+    hour_dt = resolved.scan_start.replace(minute=0, second=0, microsecond=0)
+    prefix = f"ABI-L2-CMIPF/{hour_dt.year}/{hour_dt.timetuple().tm_yday:03d}/{hour_dt.hour:02d}/"
+    chan = f"C{band:02d}"
+    keys = list_s3_prefix(resolved.bucket, prefix)
+    for k in keys:
+        if chan not in k or not k.endswith(".nc"):
+            continue
+        if _parse_scan_start(k) == resolved.scan_start:
+            return ResolvedScan(bucket=resolved.bucket, key=k, satellite=resolved.satellite, band=band, scan_start=resolved.scan_start)
+    raise FileNotFoundError(
+        f"No companion Band {band} file found for the scan at {resolved.scan_start.isoformat()} "
+        f"in {resolved.bucket} (needed to render this composite product)"
+    )
+
+
 def ensure_downloaded(resolved: ResolvedScan, nc_cache_dir: Path) -> Path:
     nc_cache_dir.mkdir(parents=True, exist_ok=True)
     local_path = nc_cache_dir / os.path.basename(resolved.key)
@@ -425,10 +489,12 @@ def ensure_downloaded(resolved: ResolvedScan, nc_cache_dir: Path) -> Path:
 
 
 # ── Bounding-box requests ───────────────────────────────────────────────────
-# Native ground sample distance for the "2km" ABI bands this service handles.
-# Used as the default (highest-fidelity) render resolution for a bbox request,
-# and as the floor for the `resolution_km` coarsening param.
-NATIVE_GSD_KM = {9: 2.0, 13: 2.0}
+# Native ground sample distance per ABI band. Used as the default
+# (highest-fidelity) render resolution for a bbox request, and as the floor
+# for the `resolution_km` coarsening param. Bands 1/2/3 aren't standalone
+# products (see REFLECTANCE_BANDS) but are listed since the sandwich/
+# geocolor composites fetch them internally.
+NATIVE_GSD_KM = {1: 1.0, 2: 0.5, 3: 1.0, 5: 1.0, 7: 2.0, 9: 2.0, 13: 2.0}
 
 KM_PER_DEG_LAT = 111.32
 MIN_BBOX_WIDTH_KM = 10.0
@@ -539,12 +605,27 @@ def _apply_stops_exact(output_k: np.ndarray, stops: list) -> np.ndarray:
     return out
 
 
-def _colorize(output: np.ndarray, cmap_name: str, out_png: Path) -> None:
+def _reflectance_gray(refl: np.ndarray, gamma: float = 1.5) -> np.ndarray:
+    """Maps a reflectance-factor array (~0-1.2, can exceed 1 under sun
+    glint) to 0-255 grayscale, with a mild gamma stretch — linear
+    reflectance reads unnaturally dark/flat to the eye, so VIS/near-IR
+    imagery is conventionally displayed gamma-stretched (same idea as
+    satpy's default reflectance enhancement, though not tuned to match it
+    exactly)."""
+    return np.clip(refl, 0.0, 1.0) ** (1.0 / gamma) * 255.0
+
+
+def _colorize(output: np.ndarray, cmap_name: str, out_png: Path, band_kind: str = "brightness_temp") -> None:
     good = np.isfinite(output)
     out_size = output.shape[0]
     rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
 
-    if cmap_name in STOPS_BY_CMAP:
+    if band_kind == "reflectance":
+        v = _reflectance_gray(output)
+        rgba[good, 0] = v[good]
+        rgba[good, 1] = v[good]
+        rgba[good, 2] = v[good]
+    elif cmap_name in STOPS_BY_CMAP:
         rgb = _apply_stops_exact(output, STOPS_BY_CMAP[cmap_name])
         rgba[good, 0] = rgb[good, 0]
         rgba[good, 1] = rgb[good, 1]
@@ -568,18 +649,53 @@ def _read_source(nc_path: Path):
     import netCDF4 as nc4
 
     log.info("Reading %s", nc_path)
-    ds = nc4.Dataset(str(nc_path), "r")
-    try:
-        cmi_raw = ds.variables["CMI"][:]
-        x_rad = ds.variables["x"][:]
-        y_rad = ds.variables["y"][:]
-        proj = ds.variables["goes_imager_projection"]
-        sat_lon = float(proj.longitude_of_projection_origin)
-        h = float(proj.perspective_point_height)
-        r_eq = float(proj.semi_major_axis)
-        r_pol = float(proj.semi_minor_axis)
-    finally:
-        ds.close()
+    with NC_LOCK:
+        ds = nc4.Dataset(str(nc_path), "r")
+        try:
+            cmi_raw = ds.variables["CMI"][:]
+            x_rad = ds.variables["x"][:]
+            y_rad = ds.variables["y"][:]
+            proj = ds.variables["goes_imager_projection"]
+            sat_lon = float(proj.longitude_of_projection_origin)
+            h = float(proj.perspective_point_height)
+            r_eq = float(proj.semi_major_axis)
+            r_pol = float(proj.semi_minor_axis)
+        finally:
+            ds.close()
+    return cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol
+
+
+def _read_source_downsampled(nc_path: Path, max_dim: int = 2160):
+    """Like _read_source, but reads a strided view directly from the
+    netCDF variable instead of materializing the full-resolution array
+    first. Matters a lot for the composite products below: Band 2 at its
+    native 0.5km resolution is a ~21700x21700 full-disk array (multiple
+    GB as float64/masked) even though every composite only ever renders a
+    ~2160px preview — reading `[:]` then downsampling in numpy (what
+    _read_source does, fine for the 2km bands 9/13 render path, which
+    render_bbox_to_png also needs at full resolution for accurate
+    cropping) needlessly held that entire array in memory and was
+    reproducible as an OOM kill on this project's ~4GB deployment host
+    when two composite renders overlapped."""
+    import netCDF4 as nc4
+
+    log.info("Reading (downsampled) %s", nc_path)
+    with NC_LOCK:
+        ds = nc4.Dataset(str(nc_path), "r")
+        try:
+            cmi_var = ds.variables["CMI"]
+            ny, nx = cmi_var.shape
+            step = max(1, max(ny, nx) // max_dim)
+            cmi_raw = cmi_var[::step, ::step]
+            x_rad = ds.variables["x"][::step]
+            y_rad = ds.variables["y"][::step]
+            proj = ds.variables["goes_imager_projection"]
+            sat_lon = float(proj.longitude_of_projection_origin)
+            h = float(proj.perspective_point_height)
+            r_eq = float(proj.semi_major_axis)
+            r_pol = float(proj.semi_minor_axis)
+        finally:
+            ds.close()
     return cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol
 
 
@@ -589,6 +705,7 @@ def render_to_png(
     out_png: Path,
     out_size: int = 2048,
     downsample_step: int | None = None,
+    band: int = 13,
 ) -> dict:
     """Read GOES ABI L2 CMI NetCDF, reproject the full disk to EPSG:4326,
     apply the color LUT, save a georeferenced RGBA PNG. Returns bounds/metadata."""
@@ -632,7 +749,8 @@ def render_to_png(
     output = fill_gaps(output, iterations=6)
     if cmap_name not in STOPS_BY_CMAP:  # exact colortables show true peak values, unblurred
         output = _smooth(output)
-    _colorize(output, cmap_name, out_png)
+    band_kind = "reflectance" if band in REFLECTANCE_BANDS else "brightness_temp"
+    _colorize(output, cmap_name, out_png, band_kind=band_kind)
 
     return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
 
@@ -714,7 +832,8 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
     output = fill_gaps(output, iterations=6)
     if cmap_name not in STOPS_BY_CMAP:  # exact colortables show true peak values, unblurred
         output = _smooth(output)
-    _colorize(output, cmap_name, out_png)
+    band_kind = "reflectance" if band in REFLECTANCE_BANDS else "brightness_temp"
+    _colorize(output, cmap_name, out_png, band_kind=band_kind)
 
     return {
         "bounds": [[lat_S, lon_W], [lat_N, lon_E]],
@@ -722,6 +841,170 @@ def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, 
         "resolution_km": bbox.resolution_km,
         "out_size": out_size,
     }
+
+
+def _project_to_canvas(cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size):
+    """Shared reprojection step used by the composite products below: reads
+    one band's already-loaded CMI array and paints it onto a shared
+    out_size x out_size canvas defined by the given lon/Mercator-Y bounds
+    (the same disk bounds every band of a full-disk scan shares, since they
+    come from the same satellite/projection). Each band keeps its own
+    native pixel density going in — only the *output* canvas is shared, so
+    a 0.5km Band 2 and a 2km Band 13 land on the same grid without either
+    needing to be resampled to match the other's resolution first."""
+    ny, nx = cmi_raw.shape
+    step = max(1, max(ny, nx) // 2160)
+    x_ds, y_ds = x_rad[::step], y_rad[::step]
+    cmi_ds = (cmi_raw[::step, ::step].filled(np.nan) if isinstance(cmi_raw, np.ma.MaskedArray) else cmi_raw[::step, ::step]).astype(np.float32)
+
+    XX, YY = np.meshgrid(x_ds, y_ds)
+    LON, LAT = abi_to_latlon(XX, YY, sat_lon, h, r_eq, r_pol)
+
+    col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
+    row = ((merc_y_N - _mercator_y(LAT)) / (merc_y_N - merc_y_S) * out_size).astype(np.int32)
+    valid = (
+        np.isfinite(LON) & np.isfinite(LAT) & np.isfinite(cmi_ds)
+        & (col >= 0) & (col < out_size) & (row >= 0) & (row < out_size)
+    )
+    output = _paint_coldest(out_size, row, col, cmi_ds, valid)
+    return fill_gaps(output, iterations=6)
+
+
+def render_sandwich_to_png(nc_ir_path: Path, nc_vis_path: Path, out_png: Path, out_size: int = 2048) -> dict:
+    """IR/VIS "sandwich" composite: the standard abi13 colorized IR,
+    modulated (multiplied) by Band 2 visible brightness. This surfaces
+    convective texture (overshooting tops, gravity waves, low cloud
+    streets) that a pure IR colorization smooths right over, since it
+    only sees cloud-top temperature. The night side has no visible
+    signal to show texture from, so it falls back to a darkened (not
+    hidden) version of the plain IR colorization — real sandwich products
+    behave the same way outside daylight."""
+    ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_ir_path)
+    vis_cmi, vis_x, vis_y, _, _, _, _ = _read_source_downsampled(nc_vis_path)
+
+    lat_S, lat_N = -81.3, 81.3
+    lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
+    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+
+    ir_k = _project_to_canvas(ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+    vis_refl = _project_to_canvas(vis_cmi, vis_x, vis_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+
+    ir_rgb = _apply_stops_exact(ir_k, _ABI13_STOPS)  # (H, W, 3), float 0-255
+    brightness = 0.35 + 0.65 * np.clip(np.nan_to_num(vis_refl, nan=0.0), 0.0, 1.0)
+    blended = np.clip(ir_rgb * brightness[..., None], 0, 255)
+
+    good = np.isfinite(ir_k)
+    rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
+    rgba[good, :3] = blended[good].astype(np.uint8)
+    rgba[good, 3] = 220
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgba, "RGBA").save(str(out_png))
+    log.info("Saved sandwich PNG: %s", out_png)
+
+    return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
+
+
+# ── Solar position (for geocolor's day/night terminator blend) ────────────
+def _solar_zenith_deg(lat_deg: np.ndarray, lon_deg: np.ndarray, dt: datetime.datetime) -> np.ndarray:
+    """Low-precision solar zenith angle (NOAA/Spencer Fourier-series
+    approximation — public-domain, the same formula behind NOAA's online
+    solar calculator). Accurate to a fraction of a degree, which is
+    plenty for a several-degree-wide terminator blend; not ephemeris-grade."""
+    doy = dt.timetuple().tm_yday
+    frac_year = 2 * np.pi / 365.0 * (doy - 1 + (dt.hour - 12) / 24.0)
+    decl = (
+        0.006918
+        - 0.399912 * np.cos(frac_year) + 0.070257 * np.sin(frac_year)
+        - 0.006758 * np.cos(2 * frac_year) + 0.000907 * np.sin(2 * frac_year)
+        - 0.002697 * np.cos(3 * frac_year) + 0.00148 * np.sin(3 * frac_year)
+    )
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * np.cos(frac_year) - 0.032077 * np.sin(frac_year)
+        - 0.014615 * np.cos(2 * frac_year) - 0.040849 * np.sin(2 * frac_year)
+    )
+    time_offset = eqtime + 4 * lon_deg  # minutes; using UTC directly + longitude, no local-timezone term needed
+    true_solar_time = dt.hour * 60 + dt.minute + dt.second / 60.0 + time_offset
+    hour_angle = np.radians(true_solar_time / 4.0 - 180.0)
+    lat_rad = np.radians(lat_deg)
+    cos_zenith = np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(hour_angle)
+    return np.degrees(np.arccos(np.clip(cos_zenith, -1.0, 1.0)))
+
+
+def render_geocolor_to_png(
+    nc_c1_path: Path, nc_c2_path: Path, nc_c3_path: Path, nc_ir_path: Path,
+    scan_time: datetime.datetime, out_png: Path, out_size: int = 2048,
+) -> dict:
+    """A simplified GeoColor-*style* day/night composite. This is NOT
+    NOAA/CIRA's proprietary GeoColor algorithm — that includes full
+    atmospheric (Rayleigh) correction and a static city-lights layer this
+    project doesn't have access to. What this does instead, openly:
+
+    - Day side: synthetic true color from Bands 1 (blue)/2 (red)/3
+      (veggie/NIR) reflectance. ABI has no native green channel, so green
+      is synthesized via CIRA's published recipe:
+      green = 0.45*red + 0.10*NIR + 0.45*blue (the same formula behind
+      most open-source ABI "true color" composites, e.g. satpy's).
+    - Night side: the standard abi13 colorized IR (same enhancement as
+      the standalone Band 13 product).
+    - Blended per-pixel by solar zenith angle (see _solar_zenith_deg) —
+      full day color inside ~85 degrees zenith, full night IR beyond ~95
+      degrees, linearly blended across the ~10-degree terminator band in
+      between.
+
+    No city lights, no aerosol/Rayleigh correction — a defensible
+    approximation for "which side of the planet is lit", not a faithful
+    reproduction of the licensed product some tools call GeoColor."""
+    c1, x1, y1, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_c1_path)
+    c2, x2, y2, _, _, _, _ = _read_source_downsampled(nc_c2_path)
+    c3, x3, y3, _, _, _, _ = _read_source_downsampled(nc_c3_path)
+    c13, x13, y13, _, _, _, _ = _read_source_downsampled(nc_ir_path)
+
+    lat_S, lat_N = -81.3, 81.3
+    lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
+    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+
+    def _proj(cmi, x, y):
+        return _project_to_canvas(cmi, x, y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+
+    blue = _proj(c1, x1, y1)
+    red = _proj(c2, x2, y2)
+    veggie = _proj(c3, x3, y3)
+    ir_k = _proj(c13, x13, y13)
+
+    green = 0.45 * np.nan_to_num(red, nan=0.0) + 0.10 * np.nan_to_num(veggie, nan=0.0) + 0.45 * np.nan_to_num(blue, nan=0.0)
+    day_rgb = np.stack([
+        _reflectance_gray(np.nan_to_num(red, nan=0.0)),
+        _reflectance_gray(green),
+        _reflectance_gray(np.nan_to_num(blue, nan=0.0)),
+    ], axis=-1)
+
+    night_rgb = np.nan_to_num(_apply_stops_exact(ir_k, _ABI13_STOPS), nan=0.0)
+
+    # Output canvas's own lat/lon (independent of any one band's source
+    # projection — every pixel of the shared canvas maps to a fixed
+    # lat/lon by construction) for the solar zenith angle at each pixel.
+    cols = np.arange(out_size)
+    rows = np.arange(out_size)
+    lon_out = lon_W + (cols + 0.5) / out_size * (lon_E - lon_W)
+    merc_y = merc_y_N - (rows[:, None] + 0.5) / out_size * (merc_y_N - merc_y_S)
+    lat_out = np.degrees(2 * np.arctan(np.exp(merc_y)) - np.pi / 2)
+    lon_grid, lat_grid = np.meshgrid(lon_out, lat_out[:, 0])
+
+    zenith = _solar_zenith_deg(lat_grid, lon_grid, scan_time)
+    day_weight = np.clip((95.0 - zenith) / (95.0 - 85.0), 0.0, 1.0)[..., None]
+
+    blended = np.clip(day_weight * day_rgb + (1.0 - day_weight) * night_rgb, 0, 255)
+
+    good = np.isfinite(ir_k)  # IR always covers the full disk regardless of day/night
+    rgba = np.zeros((out_size, out_size, 4), dtype=np.uint8)
+    rgba[good, :3] = blended[good].astype(np.uint8)
+    rgba[good, 3] = 220
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgba, "RGBA").save(str(out_png))
+    log.info("Saved geocolor PNG: %s", out_png)
+
+    return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
 
 
 def render_and_store(
@@ -733,7 +1016,7 @@ def render_and_store(
         nc_path = ensure_downloaded(resolved, nc_cache_dir)
         out_png = cache.output_path(key, "png")
         if bbox is None:
-            render_meta = render_to_png(nc_path, cmap_name, out_png)
+            render_meta = render_to_png(nc_path, cmap_name, out_png, band=resolved.band)
         else:
             render_meta = render_bbox_to_png(nc_path, resolved.band, cmap_name, out_png, bbox)
 
@@ -755,4 +1038,52 @@ def render_and_store(
         cache.write_result(key, meta)
     except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
         log.exception("GOES render failed for key=%s", key)
+        cache.write_result(key, {"status": "error", "key": key, "message": str(e)})
+
+
+COMPOSITE_BANDS = {"sandwich": (13, 2), "geocolor": (1, 2, 3, 13)}
+
+
+def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, nc_cache_dir: Path, cache) -> None:
+    """Entry point for a FastAPI BackgroundTask, composite-product version
+    of render_and_store: resolves and downloads every companion band a
+    composite needs (see COMPOSITE_BANDS), renders it, and writes the
+    result into the shared ResultCache. `resolved_ir` is Band 13's already-
+    resolved scan for the requested time/satellite — every other band
+    needed is a companion of it (see resolve_companion_band), so this is
+    the only "resolve_nearest" call needed; the rest share its exact
+    scan_start. Full-disk only for now — bbox cropping isn't implemented
+    for composites yet (see API.md)."""
+    try:
+        if product == "sandwich":
+            resolved_vis = resolve_companion_band(resolved_ir, 2)
+            nc_ir = ensure_downloaded(resolved_ir, nc_cache_dir)
+            nc_vis = ensure_downloaded(resolved_vis, nc_cache_dir)
+            out_png = cache.output_path(key, "png")
+            render_meta = render_sandwich_to_png(nc_ir, nc_vis, out_png)
+        elif product == "geocolor":
+            resolved_c1 = resolve_companion_band(resolved_ir, 1)
+            resolved_c2 = resolve_companion_band(resolved_ir, 2)
+            resolved_c3 = resolve_companion_band(resolved_ir, 3)
+            nc_c1 = ensure_downloaded(resolved_c1, nc_cache_dir)
+            nc_c2 = ensure_downloaded(resolved_c2, nc_cache_dir)
+            nc_c3 = ensure_downloaded(resolved_c3, nc_cache_dir)
+            nc_ir = ensure_downloaded(resolved_ir, nc_cache_dir)
+            out_png = cache.output_path(key, "png")
+            render_meta = render_geocolor_to_png(nc_c1, nc_c2, nc_c3, nc_ir, resolved_ir.scan_start, out_png)
+        else:
+            raise ValueError(f"unknown composite product: {product}")
+
+        cache.write_result(key, {
+            "status": "ready",
+            "key": key,
+            "png_url": f"/cache/satellite/{key}.png",
+            "bounds": render_meta["bounds"],
+            "product": product,
+            "satellite": f"GOES-{resolved_ir.satellite}",
+            "sat_lon": render_meta["sat_lon"],
+            "scan_start": resolved_ir.scan_start.isoformat(),
+        })
+    except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
+        log.exception("Composite render failed for key=%s product=%s", key, product)
         cache.write_result(key, {"status": "error", "key": key, "message": str(e)})

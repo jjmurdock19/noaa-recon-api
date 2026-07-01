@@ -1,0 +1,12 @@
+# See storm-archive-update.service for install instructions — install both
+# files together, then enable/start only the .timer (it pulls in the
+# .service each time it fires).
+[Unit]
+Description=Nightly trigger for storm-archive-update.service
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
