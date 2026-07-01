@@ -1038,7 +1038,19 @@ def render_and_store(
         cache.write_result(key, meta)
     except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
         log.exception("GOES render failed for key=%s", key)
-        cache.write_result(key, {"status": "error", "key": key, "message": str(e)})
+        error_meta = {
+            "status": "error",
+            "key": key,
+            "message": str(e),
+            "band": resolved.band,
+            "cmap": cmap_name,
+            "satellite": f"GOES-{resolved.satellite}",
+            "scan_start": resolved.scan_start.isoformat(),
+        }
+        if bbox is not None:
+            error_meta["center"] = [bbox.center_lat, bbox.center_lon]
+            error_meta["width_km"] = bbox.width_km
+        cache.write_result(key, error_meta)
 
 
 COMPOSITE_BANDS = {"sandwich": (13, 2), "geocolor": (1, 2, 3, 13)}
@@ -1086,4 +1098,11 @@ def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, 
         })
     except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
         log.exception("Composite render failed for key=%s product=%s", key, product)
-        cache.write_result(key, {"status": "error", "key": key, "message": str(e)})
+        cache.write_result(key, {
+            "status": "error",
+            "key": key,
+            "message": str(e),
+            "product": product,
+            "satellite": f"GOES-{resolved_ir.satellite}",
+            "scan_start": resolved_ir.scan_start.isoformat(),
+        })
