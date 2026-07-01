@@ -3,7 +3,13 @@
 # noaa-recon-api installer / updater / uninstaller.
 #
 # Quick install (as your normal user, not root):
-#   curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh | bash
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
+#
+# (Deliberately NOT `curl ... | bash` — piping straight into bash hands bash
+# its own script over a live pipe, and this script needs real keyboard input
+# on stdin for its prompts. `bash -c "$(curl ...)"` downloads the whole
+# script into memory first via command substitution, so bash's stdin stays
+# the real terminal throughout and the wizard can read from it normally.)
 #
 # Or clone the repo first and run it locally:
 #   git clone --recurse-submodules https://github.com/jjmurdock19/noaa-recon-api.git
@@ -16,12 +22,12 @@
 #
 set -euo pipefail
 
-# `curl ... | bash` connects stdin to the pipe, not the keyboard, which would
-# silently turn every prompt below into "accept the default" with no way to
-# answer. Re-point stdin at the real terminal when one exists so the wizard
-# stays interactive even when launched that way.
-if [[ ! -t 0 ]] && ( : < /dev/tty ) 2>/dev/null; then
-    exec < /dev/tty
+if [[ ! -t 0 ]]; then
+    printf 'Heads up: stdin isn'"'"'t a terminal, so the prompts below will\n' >&2
+    printf 'silently accept their defaults instead of waiting for input.\n' >&2
+    printf 'For an interactive install, use:\n' >&2
+    printf '  bash -c "$(curl -fsSL %s)"\n\n' \
+        "https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh" >&2
 fi
 
 # ---------------------------------------------------------------------------

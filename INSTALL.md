@@ -10,7 +10,7 @@ On a fresh Linux machine (Fedora, Rocky/RHEL/CentOS, Debian, Ubuntu, or
 anything running the Nix package manager), log in, and paste this:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
 ```
 
 That downloads and runs `install.sh` from this repo. Nothing happens to
@@ -22,6 +22,18 @@ curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/ins
 less install.sh      # read it
 bash install.sh      # run it
 ```
+
+Note the command is `bash -c "$(curl ...)"`, **not** `curl ... | bash`.
+That's deliberate, not a typo: the installer asks interactive questions,
+which means it needs to read your keystrokes from stdin — but a plain
+`curl | bash` pipe hands bash *the script itself* over stdin, leaving
+nothing for the prompts to read (and on some systems it fails outright
+with `curl: (23) Failure writing output to destination`, because bash
+stops reading the piped script partway through). `bash -c "$(...)"`
+downloads the whole script into memory first, so stdin stays free for
+your answers. If you want to pass flags (see below) with this form, add
+a placeholder for `$0` right after the script:
+`bash -c "$(curl -fsSL .../install.sh)" bash --update`.
 
 You do **not** need to run it as `root`. If it needs to install packages
 or write system files, it'll ask for your password via `sudo` at that

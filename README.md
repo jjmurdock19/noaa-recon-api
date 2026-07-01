@@ -20,7 +20,7 @@ dependencies, systemd service, nginx/Apache + HTTPS if you want a domain,
 and the storm/recon archives, all via an interactive wizard:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
 ```
 
 Works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and
