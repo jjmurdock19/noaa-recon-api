@@ -32,13 +32,25 @@ class ResultCache:
             if age > self.lock_timeout:
                 lock_path.unlink(missing_ok=True)
                 return None
-            return {"status": "generating", "key": key, "elapsed": int(age)}
+            params = {}
+            try:
+                loaded = json.loads(lock_path.read_text())
+                if isinstance(loaded, dict):
+                    params = loaded
+            except (json.JSONDecodeError, OSError):
+                pass  # pre-existing plain-timestamp lock file, or a race with acquire_lock's write
+            return {**params, "status": "generating", "key": key, "elapsed": int(age)}
         return None
 
-    def acquire_lock(self, key: str) -> None:
+    def acquire_lock(self, key: str, params: Optional[dict] = None) -> None:
+        """`params` (band/cmap/satellite/center/etc.) is whatever the caller
+        already knows about the request before rendering starts — persisting
+        it here is what lets get_status() report it back while still
+        "generating", instead of only once the render finishes (see
+        app/routers/satellite.py's acquire_lock() calls)."""
         json_path, lock_path = self._paths(key)
         json_path.unlink(missing_ok=True)
-        lock_path.write_text(str(time.time()))
+        lock_path.write_text(json.dumps(params or {}))
 
     def write_result(self, key: str, meta: dict) -> None:
         json_path, lock_path = self._paths(key)

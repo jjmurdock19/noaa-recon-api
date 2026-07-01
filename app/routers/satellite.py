@@ -113,9 +113,14 @@ async def get_tile(
         status = _cache.get_status(key)
         if status:
             return status
-        _cache.acquire_lock(key)
+        lock_params = {
+            "product": product,
+            "satellite": f"GOES-{resolved_ir.satellite}",
+            "scan_start": resolved_ir.scan_start.isoformat(),
+        }
+        _cache.acquire_lock(key, lock_params)
         background_tasks.add_task(goes.render_product_and_store, product, resolved_ir, key, _nc_cache_dir, _cache)
-        return {"status": "generating", "key": key}
+        return {"status": "generating", "key": key, **lock_params}
 
     if band not in VALID_BANDS:
         raise HTTPException(400, f"band must be one of {sorted(VALID_BANDS)}")
@@ -146,9 +151,18 @@ async def get_tile(
     if status:
         return status
 
-    _cache.acquire_lock(key)
+    lock_params = {
+        "band": band,
+        "cmap": cmap,
+        "satellite": f"GOES-{resolved.satellite}",
+        "scan_start": resolved.scan_start.isoformat(),
+    }
+    if bbox is not None:
+        lock_params["center"] = [bbox.center_lat, bbox.center_lon]
+        lock_params["width_km"] = bbox.width_km
+    _cache.acquire_lock(key, lock_params)
     background_tasks.add_task(goes.render_and_store, resolved, cmap, key, _nc_cache_dir, _cache, bbox)
-    return {"status": "generating", "key": key}
+    return {"status": "generating", "key": key, **lock_params}
 
 
 @router.get("/status/{key}", response_model=TileStatus)

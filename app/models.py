@@ -10,6 +10,7 @@ class TileStatus(BaseModel):
     bounds: Optional[list[list[float]]] = None
     band: Optional[int] = None
     cmap: Optional[str] = None
+    product: Optional[str] = None
     satellite: Optional[str] = None
     sat_lon: Optional[float] = None
     scan_start: Optional[str] = None
