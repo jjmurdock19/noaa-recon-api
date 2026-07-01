@@ -10,7 +10,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import auth
 from app.logging_config import configure_logging
 from app.paths import CACHE_ROOT, REPO_ROOT
-from app.routers import admin, health, raw, satellite, tdr
+from app.routers import admin, health, raw, recon, satellite, storms, tdr
+from app.services import stats
 
 configure_logging()
 access_log = logging.getLogger("noaa_recon_api.access")
@@ -56,6 +57,7 @@ async def log_requests(request: Request, call_next):
         duration_ms = (time.monotonic() - start) * 1000
         client = request.client.host if request.client else "-"
         access_log.exception("%s %s -> EXCEPTION (%.1fms) client=%s", request.method, request.url.path, duration_ms, client)
+        stats.record_request()
         raise
     duration_ms = (time.monotonic() - start) * 1000
     client = request.client.host if request.client else "-"
@@ -63,6 +65,7 @@ async def log_requests(request: Request, call_next):
         "%s %s -> %d (%.1fms) client=%s",
         request.method, request.url.path, response.status_code, duration_ms, client,
     )
+    stats.record_request()
     return response
 
 app.mount("/cache", StaticFiles(directory=str(CACHE_ROOT)), name="cache")
@@ -76,6 +79,8 @@ app.include_router(health.router, prefix="/v1")
 app.include_router(satellite.router, prefix="/v1")
 app.include_router(tdr.router, prefix="/v1")
 app.include_router(raw.router, prefix="/v1")
+app.include_router(storms.router, prefix="/v1")
+app.include_router(recon.router, prefix="/v1")
 app.include_router(admin.router, prefix="/v1")
 
 

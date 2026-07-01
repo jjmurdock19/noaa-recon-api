@@ -13,6 +13,7 @@ dependencies = [
     "pillow>=10.0",
     "httpx>=0.27",
     "itsdangerous>=2.1",
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

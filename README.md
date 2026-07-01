@@ -38,9 +38,19 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   full ABI era (~2017-2018 onward). Pre-ABI storms (e.g. Katrina, 2005)
   aren't reachable this way; see "Satellite coverage" in API.md for why.
 - **The correct color table for the band you asked for.** `cmap=default`
-  resolves to `abi13` or `abi9` — the real per-band standard enhancements,
-  built from exact temperature→color stops, not a generic approximation.
+  resolves to the right per-band standard enhancement — `abi13` (Clean
+  IR), `abi9` (water vapor), `abi7` (shortwave IR / "fire temperature"),
+  or `abi5` (near-IR reflectance) — built from exact temperature→color
+  stops (or a reflectance ramp for band 5), not a generic approximation.
   See [the live color legend tool](#color-legend) below.
+- **Composite products**: `product=sandwich` (Band 13 IR modulated by
+  Band 2 visible texture) and `product=geocolor` (a documented
+  approximation of NOAA's day/night true-color+IR composite — see `GET
+  /v1/satellite/products` for exactly what's simplified). Full-disk only
+  for now.
+- **`GET /v1/satellite/products`** — discovery endpoint listing every band/
+  product this API can render and the exact UTC date range each satellite
+  covers, so a client can build a picker without hardcoding any of that.
 - **Fast, high-detail regional crops.** Pass `center` + `dims` (km or
   nautical miles) instead of rendering the slow, coarse full disk —
   ~11x faster, ~130x smaller files, at the sensor's native ~2km/pixel
@@ -51,10 +61,30 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
 - **A raw-netCDF path for client-side rendering** (in progress) feeding a
   Three.js/WebGL volumetric viewer, for users who want the data itself
   rather than a pre-rendered image.
+- **Historical storm tracks, named storms only.** Feed a year, storm
+  name, and any UTC datetime and get back the closest actual best-track
+  fix — lat/lon, Saffir-Simpson category, wind, and pressure. Backed by
+  NHC's HURDAT2 archive (Atlantic + East/Central Pacific since 1950) for
+  the reconciled historical record, plus NHC's operational ATCF b-decks to
+  bridge the gap up through the storm happening right now — kept current
+  by a nightly systemd timer. Plus discovery endpoints for what
+  years/storms are on record. See `GET /v1/storms/*` in API.md and "Storm
+  archive updates" below.
+- **Recon MET archive — every hurricane hunter flight since 2011.**
+  Look up archived flight-level observation data (position, wind,
+  SFMR surface wind, altitude) by year and storm name, then fetch one
+  mission by `mission_id` — decimated data inline for quick plotting, or
+  `GET /v1/recon/mission/{id}/download` to stream NOAA's original
+  full-resolution NetCDF file (600+ variables — attitude, airspeed, every
+  raw sensor channel, not just the ~7 fields this project decimates).
+  Same year/storm discovery shape as the storm-track archive, so the two
+  can be cross-referenced from one API. Kept current by its own nightly
+  systemd timer. See `GET /v1/recon/*` in API.md and "Recon MET archive" below.
 
-**Status:** MVP. Satellite tiles are fully implemented and verified
-against live NOAA data. Band 2/GeoColor, TDR, and the raw-netCDF
-passthrough are stubbed (`501 Not Implemented`) — see "Roadmap" below.
+**Status:** MVP. Satellite tiles, storm tracks, and the recon MET archive
+are fully implemented and verified against live NOAA data. Band
+2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed (`501 Not
+Implemented`) — see "Roadmap" below.
 
 ## Color legend
 
@@ -188,6 +218,92 @@ rebuild. The live API is at `https://joshmurdock.net/api`.*
    hurricanes site, same-origin (no CORS needed for that consumer; CORS is
    still open for other sites hitting the API directly).
 
+### Deploying elsewhere (fresh host, building both archives from scratch)
+
+Both `GET /v1/storms/*` and `GET /v1/recon/*` are backed by local SQLite
+databases under `data/` (gitignored — not part of the repo, built by the
+ingestion scripts below). A brand-new deployment has neither database yet;
+build both once, then install the nightly timers so they stay current
+without further attention:
+
+```bash
+# Storms: always does a full HURDAT2 + ATCF backfill automatically (fast, ~10s)
+.venv/bin/python3 scripts/ingest_storms.py
+
+# Recon MET: --full crawls every year since 2011 from scratch — this is
+# thousands of small requests plus large NetCDF downloads and PDF parses,
+# expect this to take HOURS on a fresh deployment (the nightly default,
+# current + previous year only, is what runs afterward and is quick)
+.venv/bin/python3 scripts/ingest_recon_met.py --full
+```
+
+Then install both nightly timers (details in the two sections below) so
+each archive keeps itself current going forward without manual re-runs.
+The admin console's "Databases" panel also has a **Force update** button
+per archive if you ever want to trigger an update immediately instead of
+waiting for the timer (e.g. right after a storm you care about was flown).
+
+### Storm archive updates
+
+`data/storms.sqlite` (the `GET /v1/storms/*` backing store) is populated
+by `scripts/ingest_storms.py` — see app/services/storms.py's module
+docstring for the HURDAT2 + ATCF b-deck pipeline. Run it manually any time:
+
+```bash
+.venv/bin/python3 scripts/ingest_storms.py
+```
+
+To keep it current automatically (picks up the latest advisory for any
+storm active right now), install the nightly timer:
+
+```bash
+sudo cp deploy/storm-archive-update.service deploy/storm-archive-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now storm-archive-update.timer
+```
+
+Fires nightly at 03:15 (server local time); `Persistent=true` means a
+missed run (host was down) fires on next boot instead of waiting a full
+day. Both units show up in Cockpit's Services page like any other systemd
+unit — search "storm-archive-update" to check last-run status or trigger
+a manual run from there instead of the command line.
+
+### Recon MET archive
+
+`data/recon_met.sqlite` (the `GET /v1/recon/*` backing store) is populated
+by `scripts/ingest_recon_met.py` — see app/services/recon_met.py's module
+docstring for the crawl/decimation pipeline (NOAA's raw 1-second
+flight-level data at `seb.omao.noaa.gov`, stored at 0.2 Hz). Run it
+manually any time:
+
+```bash
+.venv/bin/python3 scripts/ingest_recon_met.py               # current + previous year (nightly default)
+.venv/bin/python3 scripts/ingest_recon_met.py --full         # every year since 2011 — see the warning above
+.venv/bin/python3 scripts/ingest_recon_met.py --year 2024    # one year only
+```
+
+Idempotent: each mission is skipped unless its QC version on the server
+changed, so a nightly re-run only does real work for new/upgraded
+missions. Install the nightly timer the same way:
+
+```bash
+sudo cp deploy/recon-met-update.service deploy/recon-met-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now recon-met-update.timer
+```
+
+Fires nightly at 03:45 (30 minutes after the storm archive timer, so the
+two crawls don't compete for network/CPU at the same instant);
+`Persistent=true` for the same missed-run-catches-up-on-boot behavior.
+Also visible in Cockpit's Services page (search "recon-met-update").
+
+This deployment's `data/recon_met.sqlite` was seeded via
+`scripts/import_existing_met_archive.py`, a one-time local copy from the
+hurricanes site's already-harvested `met_archive.sqlite` (same underlying
+data, this project just now owns the feature) rather than re-crawling
+years of identical data over the network — not needed on a fresh
+deployment with no pre-existing archive, hence `--full` above instead.
+
 ### Admin console
 
 Visiting the API's root (`/` locally, `https://joshmurdock.net/api` in
@@ -195,7 +311,12 @@ production) serves a login-gated admin console — status/cache stats,
 browsing and deleting cached rendered tiles and raw netCDF downloads,
 submitting a one-off query, and bulk-loading a timeframe into the cache
 (e.g. pre-warm an entire storm's lifecycle in one request instead of
-loading frame-by-frame later).
+loading frame-by-frame later). A "Databases" panel covers the storm-track
+and recon MET archives: size/record-count cards folded into the same
+overall totals, a browsable viewer (pick a database, year, and storm to
+see its track points or missions), and a **force update** button per
+archive to run that archive's nightly ingest immediately instead of
+waiting for the timer.
 
 Default credentials are `admin` / `password`, stored in
 **`admin_credentials.json`** at the repo root (created automatically with
@@ -401,13 +522,43 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    the failing fetch is actually constructing by inspecting the rendered HTML
    or browser devtools).
 
+7. **netCDF4/HDF5 concurrent-access crash + reflectance-band OOM.** Found
+   while adding the sandwich/geocolor composites: `BackgroundTasks` runs
+   synchronous task functions in a thread pool, so two renders landing at
+   the same moment call into `netCDF4`/HDF5 from different threads
+   simultaneously — HDF5 isn't guaranteed thread-safe for this, and it
+   reproducibly crashed the whole process (`double free or corruption`)
+   the first time two composite renders (each opening several files)
+   overlapped in testing. Fixed with a single process-wide
+   `threading.Lock()` (`app/services/netcdf_lock.py`) that every
+   `netCDF4.Dataset(...)` open/read/close anywhere in the project must
+   hold — see that module's docstring. Compounding it: reading a
+   reflectance band's full-resolution array before downsampling (fine for
+   the 2km bands 9/13, ~118MB) is multiple GB for Band 2 at its native
+   0.5km (~21700×21700px full disk) — enough to reproduce an OOM kill on
+   this project's ~4GB deployment host with two composites running at
+   once. Fixed by reading a strided (already-downsampled) view straight
+   from the netCDF variable (`_read_source_downsampled()`) for the
+   composite products instead of materializing the full array first. If
+   you add another product that reads Band 1/2/3/4/6 at anything near
+   full resolution, use `_read_source_downsampled()`, not `_read_source()`.
+
 ### Roadmap (not yet implemented)
 
-1. **Band 2 (visible) / GeoColor** satellite products — `app/services/goes.py`
-   currently only handles single-band brightness-temperature LUTs (bands 9/13).
-   Visible/RGB composite products need different processing (reflectance,
-   not brightness temperature; GeoColor blends multiple bands/products).
-2. **TDR**: see `app/services/tdr.py` docstring. In short: crawl
+1. **Standalone Band 2 (visible) as its own product**, and **bbox (`center`/
+   `dims`) support for the sandwich/geocolor composites** — both composites
+   are full-disk only today (see `app/services/goes.py`'s
+   `render_sandwich_to_png`/`render_geocolor_to_png`); cropping would need
+   each companion band to go through the same locate-then-crop logic
+   `render_bbox_to_png` already has for single bands.
+2. **A closer-to-official GeoColor** — today's `product=geocolor` is a
+   documented approximation (synthetic true color + colorized IR, blended
+   by solar zenith angle; see `GET /v1/satellite/products`). No city-lights
+   layer, no atmospheric/Rayleigh correction. Closing that gap means
+   sourcing (or building) a city-lights raster and implementing real
+   atmospheric correction — a substantially bigger lift than the rest of
+   this project's rendering pipeline.
+3. **TDR**: see `app/services/tdr.py` docstring. In short: crawl
    `https://seb.omao.noaa.gov/pub/acdata/{year}/` for `YYYYMMDD[N|I|H]#/`
    mission directories (no manifest exists — build a local index, e.g.
    SQLite), download/extract the `.tar.gz` bundles in each mission's
@@ -416,18 +567,20 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    same storm-relative grid + Plotly-colorscale shape the hurricanes site's
    `js/tdr-archive.js` already consumes from TC-Atlas (match that response
    shape so the client needs minimal changes when migrated onto this API).
-3. **Raw netCDF passthrough** (`app/routers/raw.py`): for the GOES side this
+4. **Raw netCDF passthrough** (`app/routers/raw.py`): for the GOES side this
    can subset directly from the same file `goes.py` already downloads (no new
    data source) — implement as a `netCDF4` variable slice by
    center/dimensions, streamed back with `Content-Type: application/x-netcdf`.
-   The TDR side depends on (2) above.
-4. **Migrate the hurricanes site's `goes-archive.js`/`tdr-archive.js`** onto
+   The recon MET side already has this — see `GET /v1/recon/mission/{id}/download`.
+   The TDR side depends on (3) above.
+5. **Migrate the hurricanes site's `goes-archive.js`/`tdr-archive.js`** onto
    this API instead of the local `goes_tile.py` subprocess / TC-Atlas proxy
    — not done in the MVP since those already work in production; this is a
-   deliberate follow-up, not an oversight.
-5. Move off this host into its own container — `Dockerfile`/
+   deliberate follow-up, not an oversight. (`recon-archive.js` and the storm
+   track archive have already been migrated onto this API.)
+6. Move off this host into its own container — `Dockerfile`/
    `docker-compose.yml` already exist for this.
-6. **Extend historical satellite coverage** — see the note in API.md /
+7. **Extend historical satellite coverage** — see the note in API.md /
    the project's GOES satellite history research; pre-2017 storms (e.g.
    Katrina, 2005) predate the ABI instrument entirely and need a
    different data source and file-format parser, not just another S3

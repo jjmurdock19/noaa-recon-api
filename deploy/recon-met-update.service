@@ -1,0 +1,25 @@
+# Install: sudo cp deploy/recon-met-update.service deploy/recon-met-update.timer /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now recon-met-update.timer
+#
+# Runs scripts/ingest_recon_met.py (crawls NOAA's raw recon aircraft
+# archive — see app/services/recon_met.py for the pipeline). Triggered by
+# recon-met-update.timer, not run directly. Shows up in Cockpit's Services
+# page like any other systemd unit (search "recon-met-update").
+#
+# Matches the convention of the existing noaa-recon-api.service,
+# storm-archive-update.service, and the hurricanes project's
+# recon_harvester.service/.timer and met_harvester.service/.timer on this host.
+[Unit]
+Description=Nightly NOAA recon MET archive update (current + previous season)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/html/noaa-recon-api
+ExecStart=/var/www/html/noaa-recon-api/.venv/bin/python3 scripts/ingest_recon_met.py
+User=server
+Group=server
+
+[Install]
+WantedBy=multi-user.target
