@@ -28,6 +28,18 @@ anything running the Nix package manager. See **[INSTALL.md](INSTALL.md)**
 for a plain-language walkthrough of every question it asks, or the
 ["Manual setup"](#manual-setup) section below to do each step by hand.
 
+**On Windows**, for local testing (`install.sh` above is the one for an
+actual server deployment):
+
+```powershell
+irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
+```
+
+`install.ps1` is intentionally smaller in scope than `install.sh` — no
+reverse proxy/domain/HTTPS, and the API runs as a plain background process
+you start/stop yourself (`noaa-recon-api start`/`stop`), not a Windows
+Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)**.
+
 ---
 
 ## Hurricane Melissa, rendered by this API

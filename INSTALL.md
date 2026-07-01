@@ -205,6 +205,57 @@ Re-run the installer and choose **Reconfigure** — your previous answers
 are pre-filled as the defaults, so you only need to change what's
 actually different.
 
+## Windows (local testing)
+
+`install.sh` above is for a real Linux server. If you're on Windows and
+just want to try the API out locally, use `install.ps1` instead — same
+idea, deliberately smaller scope:
+
+```powershell
+irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
+```
+
+(That's PowerShell's `curl | bash` equivalent — download and run in one
+step. It reads keystrokes from the real console rather than the download
+pipe, so — unlike the bash installer — there's no gotcha here; it's just
+as safe to pipe directly. Prefer to read it first? `irm ... -OutFile
+install.ps1`, open it, then `.\install.ps1`.)
+
+It asks fewer questions than the Linux installer on purpose:
+
+- **Where to install** (defaults to `%LOCALAPPDATA%\noaa-recon-api` — no
+  admin rights needed).
+- **Localhost-only vs. LAN-accessible** and a port. That's it for
+  networking — no domain, no reverse proxy, no HTTPS, no firewall rules.
+  This installer is for testing on your own machine, not serving the
+  internet.
+- The same admin-console username/password and storm/recon-archive
+  questions as the Linux installer.
+
+It installs a `noaa-recon-api` command (open a **new** terminal window
+after install for it to show up on PATH):
+
+```powershell
+noaa-recon-api start       # launch it in the background
+noaa-recon-api stop        # stop it
+noaa-recon-api status      # is it running?
+noaa-recon-api logs        # tail the logs
+noaa-recon-api update      # pull the latest from GitHub and restart
+noaa-recon-api uninstall   # remove everything
+```
+
+**On purpose, it does not run as a Windows Service or start itself at
+login** — you run `noaa-recon-api start` when you want to test it, same
+as you'd run any other local dev server. If you later want it to survive
+reboots and restart itself on a crash the way the Linux systemd service
+does, that's a genuinely different tool (a registered Service or
+Scheduled Task) — ask if you want that built out; it wasn't in scope here
+by request.
+
+Prerequisites (git, Python 3.9+) are installed via `winget` if missing
+and you approve it — `winget` ships with Windows 10 (1809+) and 11 by
+default. No `winget`? The installer prints direct download links instead.
+
 ## Doing it by hand instead
 
 If you'd rather not run a script at all, every step above corresponds to
