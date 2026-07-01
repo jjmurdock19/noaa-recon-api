@@ -12,6 +12,22 @@ curl/JavaScript/Python examples
 🤖 **[llms.txt](llms.txt)** — terse agent-discovery summary, also served
 live at `{base}/llms.txt`
 
+## Deploy your own copy
+
+Want to run this on your own machine instead of calling the hosted one?
+One command gets you a fully configured, self-updating instance —
+dependencies, systemd service, nginx/Apache + HTTPS if you want a domain,
+and the storm/recon archives, all via an interactive wizard:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh | bash
+```
+
+Works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and
+anything running the Nix package manager. See **[INSTALL.md](INSTALL.md)**
+for a plain-language walkthrough of every question it asks, or the
+["Manual setup"](#manual-setup) section below to do each step by hand.
+
 ---
 
 ## Hurricane Melissa, rendered by this API
@@ -168,6 +184,12 @@ sequenceDiagram
 
 ## Manual setup
 
+*Deploying to a server and want the systemd service, nginx/HTTPS, and
+archives set up for you instead? Use `./install.sh` — see
+[INSTALL.md](INSTALL.md) or "Deploy your own copy" above. What follows
+is the same thing done by hand, step by step, for local dev or anyone
+who wants full manual control.*
+
 ```bash
 git clone --recurse-submodules <this-repo-url>
 cd noaa-recon-api
@@ -219,6 +241,10 @@ rebuild. The live API is at `https://joshmurdock.net/api`.*
    still open for other sites hitting the API directly).
 
 ### Deploying elsewhere (fresh host, building both archives from scratch)
+
+*`./install.sh` does everything below automatically, including asking
+whether to build the full recon archive or the fast current-season-only
+version. This section is the manual equivalent, for anyone not using it.*
 
 Both `GET /v1/storms/*` and `GET /v1/recon/*` are backed by local SQLite
 databases under `data/` (gitignored — not part of the repo, built by the
@@ -415,7 +441,10 @@ app/
 admin_credentials.json        Gitignored, auto-created on first run — admin console login (see README).
 logs/app.log                  Gitignored, auto-created on first run — rotating request/error log (see API.md "Logging").
 clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" above)
-deploy/                       nginx snippet + systemd unit for this host
+deploy/                       nginx snippet + systemd unit for this specific host (joshmurdock.net) —
+                               install.sh generates its own versions of these for other machines
+install.sh                    Interactive installer/updater/uninstaller (dnf/apt/nix) — see INSTALL.md
+scripts/render_ascii_logo.py  Regenerates install.sh's terminal banner from assets/branding/noaa_logo.bbcode
 docs/assets/                  README example images
 docs/colortable_sources/      Source JSON for the abi13/abi9 exact color stops
 tests/test_satellite.py       Offline math/parsing tests + one network-gated e2e test
