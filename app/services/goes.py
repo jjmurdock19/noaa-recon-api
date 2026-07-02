@@ -278,8 +278,8 @@ REFLECTANCE_BANDS = {1, 2, 3, 4, 5, 6}
 # cmap="default" resolves to one of these based on the requested band, since
 # each band is a genuinely different physical quantity/enhancement
 # convention — there's no single "default" independent of which band.
-# "abi5" is a sentinel, not a temperature colortable — see REFLECTANCE_BANDS.
-DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9", 7: "abi7", 5: "abi5"}
+# "abi5"/"abi3" are sentinels, not temperature colortables — see REFLECTANCE_BANDS.
+DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9", 7: "abi7", 5: "abi5", 3: "abi3"}
 
 # Colortables evaluated exactly (vectorized, full float precision) rather
 # than through the shared quantized LUT — see comment above LUTS.
@@ -290,7 +290,7 @@ STOPS_BY_CMAP = {"abi13": _ABI13_STOPS, "abi9": _ABI9_STOPS, "abi7": _ABI7_STOPS
 # into STOPS_BY_CMAP/LUTS) so callers can tell "no temperature semantics
 # apply here" apart from "this is a LUT/stops cmap that happens not to
 # match the requested band".
-REFLECTANCE_CMAPS = {"abi5"}
+REFLECTANCE_CMAPS = {"abi5", "abi3"}
 
 
 # ── ABI Fixed Grid → geographic lat/lon (PUG Volume 5, Section 4.2) ─────────
@@ -699,6 +699,71 @@ def _read_source_downsampled(nc_path: Path, max_dim: int = 2160):
     return cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol
 
 
+def _read_source_cropped(nc_path: Path, lat_S: float, lat_N: float, lon_W: float, lon_E: float, fine_step: int = 1):
+    """Like _read_source, but locates the requested lat/lon box first (a
+    cheap sparse pass using only the 1-D x/y coordinate arrays, never
+    touching the 2-D CMI data) and then reads only that crop directly from
+    the netCDF variable at a stride. Never materializes the full-resolution
+    array — needed for the composite products' bbox path, since Band 2 at
+    its native 0.5km resolution is large enough (~21700x21700, multi-GB as
+    a masked float array) that reading it whole first (fine for the
+    single-band bbox path, whose bands are all >=1km) risks an OOM on this
+    project's ~4GB deployment host — see _read_source_downsampled's
+    docstring for the same concern applied to the full-disk composite path.
+
+    Returns (x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol), or None if
+    the box doesn't intersect this file's visible disk — callers should
+    treat that as "this band has nothing here" rather than a hard error,
+    since different bands of the same scan can have very slightly
+    different extents right at the limb."""
+    import netCDF4 as nc4
+
+    with NC_LOCK:
+        ds = nc4.Dataset(str(nc_path), "r")
+        try:
+            cmi_var = ds.variables["CMI"]
+            ny, nx = cmi_var.shape
+            x_rad = ds.variables["x"][:]
+            y_rad = ds.variables["y"][:]
+            proj = ds.variables["goes_imager_projection"]
+            sat_lon = float(proj.longitude_of_projection_origin)
+            h = float(proj.perspective_point_height)
+            r_eq = float(proj.semi_major_axis)
+            r_pol = float(proj.semi_minor_axis)
+
+            step_y = max(1, ny // LOCATE_GRID)
+            step_x = max(1, nx // LOCATE_GRID)
+            XXs, YYs = np.meshgrid(x_rad[::step_x], y_rad[::step_y])
+            LONs, LATs = abi_to_latlon(XXs, YYs, sat_lon, h, r_eq, r_pol)
+            mask = (
+                np.isfinite(LONs) & np.isfinite(LATs)
+                & (LONs >= lon_W) & (LONs <= lon_E)
+                & (LATs >= lat_S) & (LATs <= lat_N)
+            )
+            if not mask.any():
+                return None
+
+            rows_sparse, cols_sparse = np.where(mask)
+            pad_y, pad_x = step_y * 2, step_x * 2
+            row_lo = max(0, rows_sparse.min() * step_y - pad_y)
+            row_hi = min(ny, (rows_sparse.max() + 1) * step_y + pad_y)
+            col_lo = max(0, cols_sparse.min() * step_x - pad_x)
+            col_hi = min(nx, (cols_sparse.max() + 1) * step_x + pad_x)
+
+            x_crop = x_rad[col_lo:col_hi:fine_step]
+            y_crop = y_rad[row_lo:row_hi:fine_step]
+            cmi_slice = cmi_var[row_lo:row_hi:fine_step, col_lo:col_hi:fine_step]  # strided read straight from the file
+        finally:
+            ds.close()
+
+    cmi_crop = (
+        cmi_slice.filled(np.nan).astype(np.float32)
+        if isinstance(cmi_slice, np.ma.MaskedArray)
+        else cmi_slice.astype(np.float32)
+    )
+    return x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol
+
+
 def render_to_png(
     nc_path: Path,
     cmap_name: str,
@@ -758,78 +823,39 @@ def render_to_png(
 def render_bbox_to_png(nc_path: Path, band: int, cmap_name: str, out_png: Path, bbox: BBoxRequest) -> dict:
     """Like render_to_png, but crops to a center+width bounding box and
     renders at (up to) the sensor's native resolution instead of the full
-    disk. Two passes: a cheap sparse "locate" pass finds which slice of the
-    source array covers the requested area, then a fine pass reprojects only
-    that crop — avoiding the full-disk reprojection cost for a small area."""
-    cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol = _read_source(nc_path)
-    ny, nx = cmi_raw.shape
-
+    disk — see _read_source_cropped for the two-pass locate-then-crop
+    strategy that avoids the full-disk reprojection (and materialization)
+    cost for a small area."""
     half_km = bbox.width_km / 2.0
     lat_half_deg = half_km / KM_PER_DEG_LAT
     lon_half_deg = half_km / (KM_PER_DEG_LAT * max(0.01, math.cos(math.radians(bbox.center_lat))))
     lat_S, lat_N = bbox.center_lat - lat_half_deg, bbox.center_lat + lat_half_deg
     lon_W, lon_E = bbox.center_lon - lon_half_deg, bbox.center_lon + lon_half_deg
 
-    # ---- Pass 1: sparse locate ----
-    step_y = max(1, ny // LOCATE_GRID)
-    step_x = max(1, nx // LOCATE_GRID)
-    XXs, YYs = np.meshgrid(x_rad[::step_x], y_rad[::step_y])
-    LONs, LATs = abi_to_latlon(XXs, YYs, sat_lon, h, r_eq, r_pol)
+    gsd_km = NATIVE_GSD_KM.get(band, 2.0)
+    fine_step = max(1, round(bbox.resolution_km / gsd_km))
 
-    mask = (
-        np.isfinite(LONs) & np.isfinite(LATs)
-        & (LONs >= lon_W) & (LONs <= lon_E)
-        & (LATs >= lat_S) & (LATs <= lat_N)
-    )
-    if not mask.any():
+    cropped = _read_source_cropped(nc_path, lat_S, lat_N, lon_W, lon_E, fine_step)
+    if cropped is None:
         raise ValueError(
             f"Requested area ({lat_S:.2f},{lon_W:.2f})-({lat_N:.2f},{lon_E:.2f}) "
             "is outside this scan's visible disk"
         )
-
-    rows_sparse, cols_sparse = np.where(mask)
-    pad_y, pad_x = step_y * 2, step_x * 2
-    row_lo = max(0, rows_sparse.min() * step_y - pad_y)
-    row_hi = min(ny, (rows_sparse.max() + 1) * step_y + pad_y)
-    col_lo = max(0, cols_sparse.min() * step_x - pad_x)
-    col_hi = min(nx, (cols_sparse.max() + 1) * step_x + pad_x)
-
-    # ---- Pass 2: fine crop at native (or coarsened) resolution ----
-    gsd_km = NATIVE_GSD_KM.get(band, 2.0)
-    fine_step = max(1, round(bbox.resolution_km / gsd_km))
-
-    x_crop = x_rad[col_lo:col_hi:fine_step]
-    y_crop = y_rad[row_lo:row_hi:fine_step]
-    cmi_slice = cmi_raw[row_lo:row_hi:fine_step, col_lo:col_hi:fine_step]
-    if isinstance(cmi_raw, np.ma.MaskedArray):
-        cmi_crop = cmi_slice.filled(np.nan).astype(np.float32)
-    else:
-        cmi_crop = cmi_slice.astype(np.float32)
+    x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol = cropped
 
     log.info(
-        "BBox crop %dx%d native px (rows %d:%d, cols %d:%d, step=%d) for %.0fkm box @ %.1fkm/px",
-        cmi_crop.shape[0], cmi_crop.shape[1], row_lo, row_hi, col_lo, col_hi, fine_step,
-        bbox.width_km, bbox.resolution_km,
+        "BBox crop %dx%d native px (step=%d) for %.0fkm box @ %.1fkm/px",
+        cmi_crop.shape[0], cmi_crop.shape[1], fine_step, bbox.width_km, bbox.resolution_km,
     )
-
-    XX, YY = np.meshgrid(x_crop, y_crop)
-    LON, LAT = abi_to_latlon(XX, YY, sat_lon, h, r_eq, r_pol)
 
     out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
-
     merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
-    col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
-    row = ((merc_y_N - _mercator_y(LAT)) / (merc_y_N - merc_y_S) * out_size).astype(np.int32)
-    valid = (
-        np.isfinite(LON) & np.isfinite(LAT) & np.isfinite(cmi_crop)
-        & (col >= 0) & (col < out_size) & (row >= 0) & (row < out_size)
+    output = _project_crop_to_canvas(
+        x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size
     )
-    if not valid.any():
+    if output is None:
         raise ValueError("Requested area has no valid data in this scan (off-disk or no-data)")
-    output = _paint_coldest(out_size, row, col, cmi_crop, valid)
-    log.info("Painted %d / %d source pixels into %dx%d output", int(valid.sum()), int(valid.size), out_size, out_size)
 
-    output = fill_gaps(output, iterations=6)
     if cmap_name not in STOPS_BY_CMAP:  # exact colortables show true peak values, unblurred
         output = _smooth(output)
     band_kind = "reflectance" if band in REFLECTANCE_BANDS else "brightness_temp"
@@ -870,7 +896,31 @@ def _project_to_canvas(cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol, lon_W, lo
     return fill_gaps(output, iterations=6)
 
 
-def render_sandwich_to_png(nc_ir_path: Path, nc_vis_path: Path, out_png: Path, out_size: int = 2048) -> dict:
+def _project_crop_to_canvas(x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size):
+    """The bbox-crop counterpart to _project_to_canvas: paints an
+    already-cropped native-resolution array (from _read_source_cropped)
+    onto a shared out_size x out_size canvas. Returns None (rather than
+    raising) if none of the crop lands inside the canvas bounds, so
+    composite renderers can decide per-band whether that's fatal (the
+    primary/IR band) or just "this input is unavailable here" (a
+    secondary band near the limb)."""
+    XX, YY = np.meshgrid(x_crop, y_crop)
+    LON, LAT = abi_to_latlon(XX, YY, sat_lon, h, r_eq, r_pol)
+    col = ((LON - lon_W) / (lon_E - lon_W) * out_size).astype(np.int32)
+    row = ((merc_y_N - _mercator_y(LAT)) / (merc_y_N - merc_y_S) * out_size).astype(np.int32)
+    valid = (
+        np.isfinite(LON) & np.isfinite(LAT) & np.isfinite(cmi_crop)
+        & (col >= 0) & (col < out_size) & (row >= 0) & (row < out_size)
+    )
+    if not valid.any():
+        return None
+    output = _paint_coldest(out_size, row, col, cmi_crop, valid)
+    return fill_gaps(output, iterations=6)
+
+
+def render_sandwich_to_png(
+    nc_ir_path: Path, nc_vis_path: Path, out_png: Path, out_size: int = 2048, bbox: BBoxRequest | None = None
+) -> dict:
     """IR/VIS "sandwich" composite: the standard abi13 colorized IR,
     modulated (multiplied) by Band 2 visible brightness. This surfaces
     convective texture (overshooting tops, gravity waves, low cloud
@@ -878,19 +928,57 @@ def render_sandwich_to_png(nc_ir_path: Path, nc_vis_path: Path, out_png: Path, o
     only sees cloud-top temperature. The night side has no visible
     signal to show texture from, so it falls back to a darkened (not
     hidden) version of the plain IR colorization — real sandwich products
-    behave the same way outside daylight."""
-    ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_ir_path)
-    vis_cmi, vis_x, vis_y, _, _, _, _ = _read_source_downsampled(nc_vis_path)
+    behave the same way outside daylight.
 
-    lat_S, lat_N = -81.3, 81.3
-    lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
-    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+    `bbox`, if given, crops to a center+width box the same way
+    render_bbox_to_png does for a single band, instead of full-disk —
+    reading only the cropped region straight from each file (see
+    _read_source_cropped) so a bbox request never pays Band 2's
+    full-disk-materialization memory cost."""
+    if bbox is not None:
+        half_km = bbox.width_km / 2.0
+        lat_half_deg = half_km / KM_PER_DEG_LAT
+        lon_half_deg = half_km / (KM_PER_DEG_LAT * max(0.01, math.cos(math.radians(bbox.center_lat))))
+        lat_S, lat_N = bbox.center_lat - lat_half_deg, bbox.center_lat + lat_half_deg
+        lon_W, lon_E = bbox.center_lon - lon_half_deg, bbox.center_lon + lon_half_deg
+        out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
+        merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
 
-    ir_k = _project_to_canvas(ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
-    vis_refl = _project_to_canvas(vis_cmi, vis_x, vis_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+        ir_step = max(1, round(bbox.resolution_km / NATIVE_GSD_KM.get(13, 2.0)))
+        ir_cropped = _read_source_cropped(nc_ir_path, lat_S, lat_N, lon_W, lon_E, ir_step)
+        if ir_cropped is None:
+            raise ValueError(
+                f"Requested area ({lat_S:.2f},{lon_W:.2f})-({lat_N:.2f},{lon_E:.2f}) "
+                "is outside this scan's visible disk"
+            )
+        ir_x, ir_y, ir_cmi, sat_lon, h, r_eq, r_pol = ir_cropped
+        ir_k = _project_crop_to_canvas(ir_x, ir_y, ir_cmi, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+        if ir_k is None:
+            raise ValueError("Requested area has no valid data in this scan (off-disk or no-data)")
+
+        vis_step = max(1, round(bbox.resolution_km / NATIVE_GSD_KM.get(2, 0.5)))
+        vis_cropped = _read_source_cropped(nc_vis_path, lat_S, lat_N, lon_W, lon_E, vis_step)
+        vis_refl = None
+        if vis_cropped is not None:
+            vis_x, vis_y, vis_cmi, _, _, _, _ = vis_cropped
+            vis_refl = _project_crop_to_canvas(vis_x, vis_y, vis_cmi, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+    else:
+        ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_ir_path)
+        vis_cmi, vis_x, vis_y, _, _, _, _ = _read_source_downsampled(nc_vis_path)
+
+        lat_S, lat_N = -81.3, 81.3
+        lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
+        merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+
+        ir_k = _project_to_canvas(ir_cmi, ir_x, ir_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+        vis_refl = _project_to_canvas(vis_cmi, vis_x, vis_y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
 
     ir_rgb = _apply_stops_exact(ir_k, _ABI13_STOPS)  # (H, W, 3), float 0-255
-    brightness = 0.35 + 0.65 * np.clip(np.nan_to_num(vis_refl, nan=0.0), 0.0, 1.0)
+    if vis_refl is not None:
+        brightness = 0.35 + 0.65 * np.clip(np.nan_to_num(vis_refl, nan=0.0), 0.0, 1.0)
+    else:
+        # VIS missing for this crop (e.g. right at the limb) -- same darkened fallback as the night side.
+        brightness = np.full_like(ir_k, 0.35)
     blended = np.clip(ir_rgb * brightness[..., None], 0, 255)
 
     good = np.isfinite(ir_k)
@@ -901,7 +989,11 @@ def render_sandwich_to_png(nc_ir_path: Path, nc_vis_path: Path, out_png: Path, o
     Image.fromarray(rgba, "RGBA").save(str(out_png))
     log.info("Saved sandwich PNG: %s", out_png)
 
-    return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
+    result = {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
+    if bbox is not None:
+        result["resolution_km"] = bbox.resolution_km
+        result["out_size"] = out_size
+    return result
 
 
 # ── Solar position (for geocolor's day/night terminator blend) ────────────
@@ -934,6 +1026,7 @@ def _solar_zenith_deg(lat_deg: np.ndarray, lon_deg: np.ndarray, dt: datetime.dat
 def render_geocolor_to_png(
     nc_c1_path: Path, nc_c2_path: Path, nc_c3_path: Path, nc_ir_path: Path,
     scan_time: datetime.datetime, out_png: Path, out_size: int = 2048,
+    bbox: BBoxRequest | None = None,
 ) -> dict:
     """A simplified GeoColor-*style* day/night composite. This is NOT
     NOAA/CIRA's proprietary GeoColor algorithm — that includes full
@@ -954,30 +1047,78 @@ def render_geocolor_to_png(
 
     No city lights, no aerosol/Rayleigh correction — a defensible
     approximation for "which side of the planet is lit", not a faithful
-    reproduction of the licensed product some tools call GeoColor."""
-    c1, x1, y1, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_c1_path)
-    c2, x2, y2, _, _, _, _ = _read_source_downsampled(nc_c2_path)
-    c3, x3, y3, _, _, _, _ = _read_source_downsampled(nc_c3_path)
-    c13, x13, y13, _, _, _, _ = _read_source_downsampled(nc_ir_path)
+    reproduction of the licensed product some tools call GeoColor.
 
-    lat_S, lat_N = -81.3, 81.3
-    lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
-    merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+    `bbox`, if given, crops to a center+width box the same way
+    render_bbox_to_png does for a single band, instead of full-disk —
+    same memory-safety motivation as render_sandwich_to_png's bbox path
+    (Band 2 at native 0.5km is too large to read whole)."""
+    if bbox is not None:
+        half_km = bbox.width_km / 2.0
+        lat_half_deg = half_km / KM_PER_DEG_LAT
+        lon_half_deg = half_km / (KM_PER_DEG_LAT * max(0.01, math.cos(math.radians(bbox.center_lat))))
+        lat_S, lat_N = bbox.center_lat - lat_half_deg, bbox.center_lat + lat_half_deg
+        lon_W, lon_E = bbox.center_lon - lon_half_deg, bbox.center_lon + lon_half_deg
+        out_size = int(np.clip(round(bbox.width_km / bbox.resolution_km), MIN_OUT_SIZE, MAX_OUT_SIZE))
+        merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
 
-    def _proj(cmi, x, y):
-        return _project_to_canvas(cmi, x, y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+        ir_step = max(1, round(bbox.resolution_km / NATIVE_GSD_KM.get(13, 2.0)))
+        ir_cropped = _read_source_cropped(nc_ir_path, lat_S, lat_N, lon_W, lon_E, ir_step)
+        if ir_cropped is None:
+            raise ValueError(
+                f"Requested area ({lat_S:.2f},{lon_W:.2f})-({lat_N:.2f},{lon_E:.2f}) "
+                "is outside this scan's visible disk"
+            )
+        ir_x, ir_y, ir_cmi, sat_lon, h, r_eq, r_pol = ir_cropped
+        ir_k = _project_crop_to_canvas(ir_x, ir_y, ir_cmi, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+        if ir_k is None:
+            raise ValueError("Requested area has no valid data in this scan (off-disk or no-data)")
 
-    blue = _proj(c1, x1, y1)
-    red = _proj(c2, x2, y2)
-    veggie = _proj(c3, x3, y3)
-    ir_k = _proj(c13, x13, y13)
+        def _load_vis(nc_path, band):
+            step = max(1, round(bbox.resolution_km / NATIVE_GSD_KM.get(band, 1.0)))
+            cropped = _read_source_cropped(nc_path, lat_S, lat_N, lon_W, lon_E, step)
+            if cropped is None:
+                return None
+            x, y, cmi, _, _, _, _ = cropped
+            return _project_crop_to_canvas(x, y, cmi, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
 
-    green = 0.45 * np.nan_to_num(red, nan=0.0) + 0.10 * np.nan_to_num(veggie, nan=0.0) + 0.45 * np.nan_to_num(blue, nan=0.0)
-    day_rgb = np.stack([
-        _reflectance_gray(np.nan_to_num(red, nan=0.0)),
-        _reflectance_gray(green),
-        _reflectance_gray(np.nan_to_num(blue, nan=0.0)),
-    ], axis=-1)
+        blue = _load_vis(nc_c1_path, 1)
+        red = _load_vis(nc_c2_path, 2)
+        veggie = _load_vis(nc_c3_path, 3)
+    else:
+        c1, x1, y1, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_c1_path)
+        c2, x2, y2, _, _, _, _ = _read_source_downsampled(nc_c2_path)
+        c3, x3, y3, _, _, _, _ = _read_source_downsampled(nc_c3_path)
+        c13, x13, y13, _, _, _, _ = _read_source_downsampled(nc_ir_path)
+
+        lat_S, lat_N = -81.3, 81.3
+        lon_W, lon_E = sat_lon - 81.0, sat_lon + 81.0
+        merc_y_S, merc_y_N = _mercator_y(lat_S), _mercator_y(lat_N)
+
+        def _proj(cmi, x, y):
+            return _project_to_canvas(cmi, x, y, sat_lon, h, r_eq, r_pol, lon_W, lon_E, merc_y_S, merc_y_N, out_size)
+
+        blue = _proj(c1, x1, y1)
+        red = _proj(c2, x2, y2)
+        veggie = _proj(c3, x3, y3)
+        ir_k = _proj(c13, x13, y13)
+
+    # Day color needs all three of blue/red/veggie for this crop; if any are
+    # missing (bbox mode, near the limb) there's no valid recipe for day
+    # color here, so render night-side IR everywhere in this tile instead —
+    # day_weight is forced to 0 below rather than trusting the zenith
+    # calculation, since a partial/wrong-looking day color would be worse
+    # than consistently falling back.
+    have_day_color = blue is not None and red is not None and veggie is not None
+    if have_day_color:
+        green = 0.45 * np.nan_to_num(red, nan=0.0) + 0.10 * np.nan_to_num(veggie, nan=0.0) + 0.45 * np.nan_to_num(blue, nan=0.0)
+        day_rgb = np.stack([
+            _reflectance_gray(np.nan_to_num(red, nan=0.0)),
+            _reflectance_gray(green),
+            _reflectance_gray(np.nan_to_num(blue, nan=0.0)),
+        ], axis=-1)
+    else:
+        day_rgb = np.zeros(ir_k.shape + (3,), dtype=np.float64)
 
     night_rgb = np.nan_to_num(_apply_stops_exact(ir_k, _ABI13_STOPS), nan=0.0)
 
@@ -993,6 +1134,8 @@ def render_geocolor_to_png(
 
     zenith = _solar_zenith_deg(lat_grid, lon_grid, scan_time)
     day_weight = np.clip((95.0 - zenith) / (95.0 - 85.0), 0.0, 1.0)[..., None]
+    if not have_day_color:
+        day_weight = np.zeros_like(day_weight)
 
     blended = np.clip(day_weight * day_rgb + (1.0 - day_weight) * night_rgb, 0, 255)
 
@@ -1004,7 +1147,11 @@ def render_geocolor_to_png(
     Image.fromarray(rgba, "RGBA").save(str(out_png))
     log.info("Saved geocolor PNG: %s", out_png)
 
-    return {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
+    result = {"bounds": [[lat_S, lon_W], [lat_N, lon_E]], "sat_lon": round(sat_lon, 1)}
+    if bbox is not None:
+        result["resolution_km"] = bbox.resolution_km
+        result["out_size"] = out_size
+    return result
 
 
 def render_and_store(
@@ -1056,7 +1203,9 @@ def render_and_store(
 COMPOSITE_BANDS = {"sandwich": (13, 2), "geocolor": (1, 2, 3, 13)}
 
 
-def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, nc_cache_dir: Path, cache) -> None:
+def render_product_and_store(
+    product: str, resolved_ir: ResolvedScan, key: str, nc_cache_dir: Path, cache, bbox: BBoxRequest | None = None
+) -> None:
     """Entry point for a FastAPI BackgroundTask, composite-product version
     of render_and_store: resolves and downloads every companion band a
     composite needs (see COMPOSITE_BANDS), renders it, and writes the
@@ -1064,15 +1213,15 @@ def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, 
     resolved scan for the requested time/satellite — every other band
     needed is a companion of it (see resolve_companion_band), so this is
     the only "resolve_nearest" call needed; the rest share its exact
-    scan_start. Full-disk only for now — bbox cropping isn't implemented
-    for composites yet (see API.md)."""
+    scan_start. `bbox`, if given, is passed straight through to the
+    renderer (see render_sandwich_to_png / render_geocolor_to_png)."""
     try:
         if product == "sandwich":
             resolved_vis = resolve_companion_band(resolved_ir, 2)
             nc_ir = ensure_downloaded(resolved_ir, nc_cache_dir)
             nc_vis = ensure_downloaded(resolved_vis, nc_cache_dir)
             out_png = cache.output_path(key, "png")
-            render_meta = render_sandwich_to_png(nc_ir, nc_vis, out_png)
+            render_meta = render_sandwich_to_png(nc_ir, nc_vis, out_png, bbox=bbox)
         elif product == "geocolor":
             resolved_c1 = resolve_companion_band(resolved_ir, 1)
             resolved_c2 = resolve_companion_band(resolved_ir, 2)
@@ -1082,11 +1231,11 @@ def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, 
             nc_c3 = ensure_downloaded(resolved_c3, nc_cache_dir)
             nc_ir = ensure_downloaded(resolved_ir, nc_cache_dir)
             out_png = cache.output_path(key, "png")
-            render_meta = render_geocolor_to_png(nc_c1, nc_c2, nc_c3, nc_ir, resolved_ir.scan_start, out_png)
+            render_meta = render_geocolor_to_png(nc_c1, nc_c2, nc_c3, nc_ir, resolved_ir.scan_start, out_png, bbox=bbox)
         else:
             raise ValueError(f"unknown composite product: {product}")
 
-        cache.write_result(key, {
+        result = {
             "status": "ready",
             "key": key,
             "png_url": f"/cache/satellite/{key}.png",
@@ -1095,14 +1244,23 @@ def render_product_and_store(product: str, resolved_ir: ResolvedScan, key: str, 
             "satellite": f"GOES-{resolved_ir.satellite}",
             "sat_lon": render_meta["sat_lon"],
             "scan_start": resolved_ir.scan_start.isoformat(),
-        })
+        }
+        if bbox is not None:
+            result["center"] = [bbox.center_lat, bbox.center_lon]
+            result["width_km"] = bbox.width_km
+            result["resolution_km"] = render_meta["resolution_km"]
+        cache.write_result(key, result)
     except Exception as e:  # noqa: BLE001 - report all failures to the client via cache
         log.exception("Composite render failed for key=%s product=%s", key, product)
-        cache.write_result(key, {
+        error_meta = {
             "status": "error",
             "key": key,
             "message": str(e),
             "product": product,
             "satellite": f"GOES-{resolved_ir.satellite}",
             "scan_start": resolved_ir.scan_start.isoformat(),
-        })
+        }
+        if bbox is not None:
+            error_meta["center"] = [bbox.center_lat, bbox.center_lon]
+            error_meta["width_km"] = bbox.width_km
+        cache.write_result(key, error_meta)
