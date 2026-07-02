@@ -12,32 +12,28 @@ curl/JavaScript/Python examples
 🤖 **[llms.txt](llms.txt)** — terse agent-discovery summary, also served
 live at `{base}/llms.txt`
 
-## Deploy your own copy
+## Installation
 
-Want to run this on your own machine instead of calling the hosted one?
-One command gets you a fully configured, self-updating instance —
-dependencies, systemd service, nginx/Apache + HTTPS if you want a domain,
-and the storm/recon archives, all via an interactive wizard:
+**Linux**
+
+Utilize the following install script to automatically install the API on your hardware. The installer works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and NixOS (`nix`) distros, and other distributions sharing one of these package managers.
+This install script creates a fully-configured, self-updating instance, including dependencies, systemd service, nginx/Apache + SSL support for self-hosted domains, and the storm/recon archives.
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
 ```
-
-Works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and
-anything running the Nix package manager. See **[INSTALL.md](INSTALL.md)**
-for a plain-language walkthrough of every question it asks, or the
+See **[INSTALL.md](INSTALL.md)** for a plain-language walkthrough of each prompt from the install wizard, or the
 ["Manual setup"](#manual-setup) section below to do each step by hand.
 
-**On Windows**, for local testing (`install.sh` above is the one for an
-actual server deployment):
+**Windows**
+
+The API can be deployed on Windows for local testing.
 
 ```powershell
 irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
 ```
 
-`install.ps1` is intentionally smaller in scope than `install.sh` — no
-reverse proxy/domain/HTTPS, and the API runs as a plain background process
-you start/stop yourself (`noaa-recon-api start`/`stop`), not a Windows
+The API runs as a plain background process started/stoped by the user (`noaa-recon-api start`/`stop`). This is not a Windows
 Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)**.
 
 ---
@@ -117,8 +113,7 @@ Implemented`) — see "Roadmap" below.
 
 ## Data sources
 
-Every byte this API serves is fetched live (and then cached) from NOAA's
-own public archives — nothing here is a private/licensed dataset. Exact
+All data served by this API is fetched and cached from publicly-accessible NOAA data sources. Exact
 endpoints, for reproducibility and citation:
 
 **GOES satellite imagery** — [NOAA GOES-R Series on AWS Open Data](https://registry.opendata.aws/noaa-goes/),
@@ -157,12 +152,9 @@ mission directory rather than the MET NetCDF file. See `app/routers/tdr.py`'s
 docstring for exactly what's missing (there's no manifest, so it needs a
 crawler over the mission-directory listing).
 
-## Color legend
+## Colortables
 
-`GET /v1/satellite/colortable` returns the exact stops a render actually
-used, so a client can show a legend that's guaranteed to match — this is
-what powers the live gradient legend in the hurricanes site's API
-explorer panel:
+`GET /v1/satellite/colortable` returns the exact colortable used to render a product, giving the end user the power to create an exact-copy legend. Default colortables are sources from the ABI colortables.
 
 ```bash
 curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
@@ -170,11 +162,13 @@ curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
 
 ## Try it right now
 
-No setup needed — it's already deployed:
+Try loading a live demo image:
 
 ```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=$(date -u +%FT%TZ)&band=13"
+curl "https://joshmurdock.net/api/v1/satellite/tile?time=2026-07-01T12:00:00Z&band=13"
 ```
+
+After the image is generated, the API will serve an image URL.
 
 See [API.md](API.md) for the full reference and curl/JavaScript/Python
 integration examples.
