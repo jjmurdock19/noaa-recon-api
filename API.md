@@ -47,6 +47,7 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | `GET /v1/satellite/tile` (`product=sandwich`, `product=geocolor`) | 🟢 Live (geocolor is an approximation — see `/v1/satellite/products`) |
 | `GET /v1/satellite/status/{key}` | 🟢 Live |
 | `GET /v1/satellite/colortable` | 🟢 Live |
+| `GET /v1/satellite/colortables` | 🟢 Live |
 | `GET /v1/satellite/products` | 🟢 Live |
 | `GET /v1/satellite/tile` (standalone Band 2 visible) | 🟡 Planned |
 | `GET /v1/storms/years` | 🟢 Live |
@@ -323,6 +324,66 @@ curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
   `linear-gradient(to right, hex1 pct1%, hex2 pct2%, ...)`. This is
   exactly what the hurricanes site's `js/api-explorer.js` does (see
   `_renderLegend()`).
+
+---
+
+## `GET /v1/satellite/colortables` 🟢
+
+Discovery endpoint: every color table usable with a given `band`, with
+human-readable names/descriptions — for building a color-table picker UI
+(dropdown/swatch list) without hardcoding this project's cmap catalog
+client-side. Complements `/colortable` above, which returns the actual
+stops for one cmap at a time (call `/colortable?cmap=<picked>&band=<band>`
+once the user picks one from this list to render its legend).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `band` | int | `13` | One of `3`, `5`, `7`, `9`, `13`. Mutually exclusive with `product`. |
+| `product` | string | *(none)* | `sandwich` or `geocolor` — composites don't accept a `cmap` choice (see `/tile`), so this returns the single fixed enhancement each one uses instead of a picker list. Mutually exclusive with `band`. |
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/colortables?band=13"
+```
+
+```json
+{
+  "band": 13,
+  "kind": "brightness_temp",
+  "default_cmap": "abi13",
+  "colortables": [
+    {"cmap": "abi13", "is_default": true, "kind": "brightness_temp", "unit": "C",
+     "name": "Band 13 Standard Enhancement", "description": "White at the most extreme..."},
+    {"cmap": "bd", "is_default": false, "kind": "brightness_temp", "unit": "C",
+     "name": "NWS/Dvorak BD Enhancement", "description": "..."},
+    {"cmap": "enhanced", "...": "..."},
+    {"cmap": "grayscale", "...": "..."},
+    {"cmap": "ir4", "...": "..."},
+    {"cmap": "nrl", "...": "..."}
+  ]
+}
+```
+
+For a reflectance band (`3`/`5`) there's only ever one entry — those bands
+have no alternate enhancements, only the single gamma-stretched grayscale
+ramp (`kind: "reflectance"`, `unit: "%"`):
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/colortables?band=5"
+# {"band":5,"kind":"reflectance","default_cmap":"abi5",
+#  "colortables":[{"cmap":"abi5","is_default":true,"kind":"reflectance","unit":"%","name":"...","description":"..."}]}
+```
+
+```bash
+curl "https://joshmurdock.net/api/v1/satellite/colortables?product=geocolor"
+# {"product":"geocolor","colortables":[{"cmap":"abi13","is_default":true,...}],
+#  "note":"Composite products always use the abi13 IR enhancement..."}
+```
+
+This is the "list every color table for a product" counterpart to
+`/products` above — `/products` tells you *which* cmaps apply to each band
+in one bulk response (for a product picker); `/colortables` gives you the
+same list scoped to one band, with full names/descriptions attached (for a
+color-table picker once a band's already chosen).
 
 ---
 

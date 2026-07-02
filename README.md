@@ -66,13 +66,17 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   IR), `abi9` (water vapor), `abi7` (shortwave IR / "fire temperature"),
   `abi5` (near-IR reflectance), or `abi3` (Veggie/vegetation reflectance)
   — built from exact temperature→color stops (or a reflectance ramp for
-  bands 3/5), not a generic approximation. See
-  [the live color legend tool](#color-legend) below.
+  bands 3/5), not a generic approximation. See ["How the imagery is
+  processed"](#how-the-imagery-is-processed) below for exactly how each
+  one is computed, and [the live color legend tool](#color-legend) for
+  rendering one client-side.
 - **Composite products**: `product=sandwich` (Band 13 IR modulated by
   Band 2 visible texture) and `product=geocolor` (a documented
-  approximation of NOAA's day/night true-color+IR composite — see `GET
-  /v1/satellite/products` for exactly what's simplified). Both support
-  `center`/`dims` bbox cropping the same as a single-band tile.
+  approximation of NOAA's day/night true-color+IR composite — see
+  ["How the imagery is processed"](#how-the-imagery-is-processed) below
+  for the exact blend formulas, or `GET /v1/satellite/products` for a
+  machine-readable summary). Both support `center`/`dims` bbox cropping
+  the same as a single-band tile.
 - **`GET /v1/satellite/products`** — discovery endpoint listing every band/
   product this API can render and the exact UTC date range each satellite
   covers, so a client can build a picker without hardcoding any of that.
@@ -152,6 +156,128 @@ mission directory rather than the MET NetCDF file. See `app/routers/tdr.py`'s
 docstring for exactly what's missing (there's no manifest, so it needs a
 crawler over the mission-directory listing).
 
+## How the imagery is processed
+
+Every tile goes through the same four stages — `app/services/goes.py` is
+the whole pipeline, no external image-processing service involved:
+
+1. **Fetch.** `resolve_nearest()` picks the closest actual ABI scan to the
+   requested `time` (~10-minute cadence), then `ensure_downloaded()` pulls
+   that scan's raw `ABI-L2-CMIPF` netCDF (~25MB per band) straight from
+   NOAA's public S3 bucket — see "Data sources" above. Composites
+   (`sandwich`, `geocolor`) fetch every companion band from that *same*
+   scan cycle, since ABI captures all bands simultaneously and there's no
+   time-misalignment to correct for.
+2. **Reproject.** Raw ABI data is on a satellite-fixed scan grid (radians
+   from the sub-satellite point), not lat/lon. `abi_to_latlon()` converts
+   it per the GOES-R Product User Guide's Volume 5 Section 4.2 formula,
+   then each output row is spaced linearly in **Web Mercator Y**
+   (`_mercator_y()`), not linearly by latitude — because that's what
+   `L.imageOverlay` and every standard web map actually assume when they
+   stretch an image between two corner coordinates. Getting this wrong
+   visibly mispositions the image (see bug #4 below); it's easy to get
+   wrong because a plain equirectangular projection *looks* almost right
+   at low latitudes and only clearly breaks near the poles or on a large
+   box. Where multiple source pixels land on the same output cell (common
+   — several hundred collisions on a typical crop), `_paint_coldest()`
+   deterministically keeps the coldest value, since that's the
+   meteorologically significant one for cloud-top imagery, not whichever
+   pixel numpy happened to process last.
+3. **Colorize** — see the next section for exactly how each band/cmap gets
+   its color.
+4. **Encode.** The colorized array becomes an RGBA PNG: pixels with actual
+   scan data get `alpha=220` (~86% opaque, so the base map still shows
+   faintly through the overlay); off-disk or no-data pixels get
+   `alpha=0` (fully transparent, so Leaflet never paints a hard edge
+   where the satellite's view ends). Saved straight to the on-disk cache
+   (`ResultCache`) that `/v1/satellite/status` and `png_url` read from.
+
+### Color grading — two different code paths, on purpose
+
+`_colorize()` picks one of three strategies depending on the band/cmap,
+and which one matters for accuracy:
+
+- **Reflectance bands (3, 5)** have no "temperature" — `_reflectance_gray()`
+  gamma-stretches the 0–1 reflectance factor (`refl ** (1/1.5) * 255`)
+  to a 0–100% grayscale ramp. Linear reflectance reads unnaturally
+  dark/flat to the eye, so VIS/near-IR imagery is conventionally displayed
+  gamma-stretched — the same idea (not a tuned match) as satpy's default
+  reflectance enhancement.
+- **`abi13`/`abi9`/`abi7`** (the recommended per-band default enhancements)
+  are evaluated **exactly**, per-pixel, via `_apply_stops_exact()`
+  (vectorized `np.interp` over the literal temperature→color stops in
+  `_ABI13_STOPS`/`_ABI9_STOPS`/`_ABI7_STOPS`) rather than through a
+  quantized lookup table. This is deliberate, not an optimization detail:
+  `abi13`'s source palette has a genuinely sharp 1°C-wide cut (cyan@-32°C
+  → light grey@-31°C, marking the severe-convection threshold), and
+  quantizing that into ~0.6°C buckets smears it into a muddy blended color
+  that isn't in the source palette at all — see bug #2 below for the
+  before/after. **If you add a colortable with a similarly sharp
+  transition or a range outside ~-113..+42°C, add it to `STOPS_BY_CMAP`,
+  not `LUTS`.**
+- **Everything else** (`bd`, `enhanced`, `nrl`, `grayscale`, `ir4`) goes
+  through a shared 256-entry LUT (`_build_lut()`), built once at import
+  time by sampling each palette function every ~0.6°C across a fixed
+  -113..+42°C window. Fine for palettes without a hard cut, cheaper than
+  exact evaluation, but the fixed window means these clip anything warmer
+  than +42°C to the same color — irrelevant for 9/13, but it silently
+  loses Band 7's fire-highlighting range above that, which is exactly why
+  `abi7` (not one of these) is Band 7's default.
+
+`GET /v1/satellite/colortable` (below) reads these same structures
+(`STOPS_BY_CMAP`/`LUTS`) at request time, so a legend built from it is
+guaranteed to match what a render actually produced — not a hand-copied
+approximation that can drift out of sync.
+
+### `product=sandwich` — how the composite is built
+
+`render_sandwich_to_png()` colorizes Band 13 with the exact `abi13`
+enhancement, then **multiplies** every pixel's RGB by a brightness factor
+derived from Band 2 (visible) reflectance: `brightness = 0.35 + 0.65 *
+clip(vis_reflectance, 0, 1)`. Fully sunlit, high-reflectance cloud tops
+(fresh overshooting tops, gravity waves) stay near full IR color;
+low-reflectance areas darken toward 35% — enough to reveal visible-light
+texture the IR channel alone smooths over, without ever fully hiding the
+underlying IR colorization. At night (or wherever Band 2 has no data for
+the requested crop, e.g. right at the scan's limb), there's no visible
+signal to modulate with, so it falls back to a flat 0.35 brightness — a
+uniformly darkened plain-IR look, matching how real sandwich products
+behave outside daylight rather than hiding the night side entirely.
+
+### `product=geocolor` — how the composite is built
+
+`render_geocolor_to_png()` is an explicitly-labeled **approximation**,
+not NOAA/CIRA's proprietary GeoColor algorithm (that includes full
+atmospheric/Rayleigh correction and a static city-lights layer this
+project has no access to). What it does instead:
+
+- **Day side:** synthetic true color from Bands 1 (blue) / 2 (red) / 3
+  (veggie/NIR) reflectance. ABI has no native green channel, so green is
+  synthesized with CIRA's published recipe —
+  `green = 0.45*red + 0.10*NIR + 0.45*blue` — the same formula behind most
+  open-source ABI "true color" composites (e.g. satpy's).
+- **Night side:** the standard `abi13` colorized IR, identical to the
+  standalone Band 13 product.
+- **Terminator blend:** `_solar_zenith_deg()` computes a low-precision
+  per-pixel solar zenith angle (NOAA/Spencer Fourier-series approximation
+  — public-domain, the same formula behind NOAA's online solar
+  calculator; accurate to a fraction of a degree, plenty for a
+  several-degree-wide blend, not ephemeris-grade). Full day color inside
+  ~85° zenith, full night IR beyond ~95°, linearly blended across that
+  ~10° terminator band in between.
+- **What's missing vs. the real thing:** no city-lights layer, no
+  aerosol/Rayleigh atmospheric correction. It's a defensible
+  approximation of "which side of the planet is lit and what does it
+  roughly look like", not a faithful reproduction of the licensed
+  product some tools call GeoColor — `GET /v1/satellite/products` states
+  this same caveat in machine-readable form so a client can surface it.
+
+Both composites crop and read each companion band directly from its
+source file at a stride for a bbox request (`_read_source_cropped()`)
+rather than materializing the full disk first — see bug #7 below for why
+that matters (Band 2 at native 0.5km resolution is large enough to OOM a
+small deployment host if read whole).
+
 ## Colortables
 
 `GET /v1/satellite/colortable` returns the exact colortable used to render a product, giving the end user the power to create an exact-copy legend. Default colortables are sources from the ABI colortables.
@@ -159,6 +285,13 @@ crawler over the mission-directory listing).
 ```bash
 curl "https://joshmurdock.net/api/v1/satellite/colortable?cmap=default&band=13"
 ```
+
+`GET /v1/satellite/colortables?band=13` (plural) lists every color table
+usable with a given band — names, descriptions, and which one's the
+default — for building a picker UI without hardcoding the cmap catalog
+client-side; `?product=sandwich`/`geocolor` returns the single fixed
+enhancement a composite uses instead, since composites don't take a
+`cmap` choice. See API.md for both.
 
 ## Try it right now
 

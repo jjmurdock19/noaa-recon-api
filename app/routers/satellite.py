@@ -26,6 +26,64 @@ BAND_NAMES = {
     13: "Clean IR Window, 10.3µm",
 }
 
+# Human-readable name/description per cmap, for /colortables (and reused by
+# /colortable if a client wants a label to go with the stops). Kept here
+# rather than in goes.py since it's presentation-layer text, not renderer
+# logic — mirrors API.md's "Color tables" table so both stay in sync.
+CMAP_DESCRIPTIONS = {
+    "abi13": {
+        "name": "Band 13 Standard Enhancement",
+        "description": "White at the most extreme cold overshooting tops (-110C) down through black (-80C), "
+        "a rainbow band -80C to -32C highlighting severe convection, a hard cut to light grey at -31C, then "
+        "greyscale (light=cold, dark=warm) to black at +57C.",
+    },
+    "abi9": {
+        "name": "Band 9 (Water Vapor) Standard Enhancement",
+        "description": "Cyan at coldest/moist (-93C) through green tones, white at the moist/dry transition "
+        "(-42C), a purple/navy/indigo band (-30C to -18C), then yellow-orange-red to black at warmest/driest "
+        "(+7C).",
+    },
+    "abi7": {
+        "name": "Band 7 (Shortwave IR / Fire Temperature) Standard Enhancement",
+        "description": "Greyscale over the same cloud-top range as 9/13, then a yellow-red highlight above "
+        "normal clear-sky warmth (~+57C) to flag hotspots — this band saturates far higher than 9/13.",
+    },
+    "abi5": {
+        "name": "Band 5 (Near-IR Snow/Ice) Reflectance Ramp",
+        "description": "Not a temperature colortable — reports reflectance factor (~0-1), rendered as a "
+        "gamma-stretched 0-100% grayscale.",
+    },
+    "abi3": {
+        "name": "Band 3 (Veggie / Vegetation-NIR) Reflectance Ramp",
+        "description": "Same treatment as abi5 — reflectance, not temperature, rendered as a gamma-stretched "
+        "grayscale. Sensitive to chlorophyll/vegetation reflectance.",
+    },
+    "ir4": {
+        "name": "IR4 (satpy colorized_ir_clouds)",
+        "description": "An alternate Band 13 enhancement sourced from satpy: greyscale -20C to +30C, then the "
+        "ColorBrewer 'Spectral' 11-class diverging palette -80C to -20C. Kept for comparison — abi13 is the "
+        "recommended default for Band 13.",
+    },
+    "bd": {
+        "name": "NWS/Dvorak BD Enhancement",
+        "description": "Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue-purple-red "
+        "for cold convection.",
+    },
+    "enhanced": {
+        "name": "Enhanced",
+        "description": "Darker surface/low clouds, white mid/high clouds, color for coldest tops.",
+    },
+    "nrl": {
+        "name": "NRL Tropical Cyclone",
+        "description": "Naval Research Lab tropical cyclone enhancement — smooth yellow-green to cyan to blue "
+        "to purple to red ramp.",
+    },
+    "grayscale": {
+        "name": "Grayscale",
+        "description": "Plain linear greyscale by brightness temperature.",
+    },
+}
+
 # Presentation-layer satellite coverage — GOES-16 East operational start,
 # GOES-17 West operational start (both from NOAA's own commissioning
 # announcements; approximate to the day). Cutover dates match
@@ -234,6 +292,66 @@ async def get_colortable(
         exact = False
 
     return {"cmap": cmap, "unit": "C", "exact": exact, "stops": stops}
+
+
+@router.get("/colortables")
+async def list_colortables(
+    band: Optional[int] = Query(
+        None, description="One of 3, 5, 7, 9, 13 — lists every cmap usable with this band. Defaults to 13 if neither `band` nor `product` is given."
+    ),
+    product: Optional[str] = Query(
+        None, description="'sandwich' or 'geocolor' — composites don't accept a `cmap` choice (see GET /tile), "
+        "so this returns the single fixed enhancement each one uses instead of a picker list.",
+    ),
+):
+    """Discovery endpoint: every color table usable for a given band (or the
+    fixed enhancement a given composite `product` uses), with human-readable
+    names/descriptions — for building a color-table picker UI without
+    hardcoding this project's cmap catalog client-side. Complements GET
+    /colortable, which returns the actual stops for one cmap at a time."""
+    if product is not None:
+        if band is not None:
+            raise HTTPException(400, "pass either `band` or `product`, not both")
+        if product not in VALID_PRODUCTS:
+            raise HTTPException(400, f"product must be one of {sorted(VALID_PRODUCTS)}")
+        return {
+            "product": product,
+            "colortables": [
+                {
+                    "cmap": "abi13",
+                    "is_default": True,
+                    "kind": "brightness_temp",
+                    "unit": "C",
+                    **CMAP_DESCRIPTIONS["abi13"],
+                }
+            ],
+            "note": "Composite products always use the abi13 IR enhancement for their thermal component "
+            "(daytime pixels are true-color/blended, not on this scale) — `cmap` is not selectable for `product` requests.",
+        }
+
+    if band is None:
+        band = 13
+    if band not in VALID_BANDS:
+        raise HTTPException(400, f"band must be one of {sorted(VALID_BANDS)}")
+
+    default_cmap = goes.DEFAULT_CMAP_BY_BAND[band]
+    is_reflectance = band in goes.REFLECTANCE_BANDS
+    kind = "reflectance" if is_reflectance else "brightness_temp"
+    cmaps = sorted({default_cmap} | (set() if is_reflectance else set(goes.LUTS.keys())))
+
+    colortables = []
+    for cmap in cmaps:
+        info = CMAP_DESCRIPTIONS.get(cmap, {"name": cmap, "description": ""})
+        entry_kind = "reflectance" if cmap in goes.REFLECTANCE_CMAPS else "brightness_temp"
+        colortables.append({
+            "cmap": cmap,
+            "is_default": cmap == default_cmap,
+            "kind": entry_kind,
+            "unit": "%" if entry_kind == "reflectance" else "C",
+            **info,
+        })
+
+    return {"band": band, "kind": kind, "default_cmap": default_cmap, "colortables": colortables}
 
 
 @router.get("/products")
