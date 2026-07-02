@@ -93,31 +93,32 @@ until `status` becomes `"ready"` or `"error"`.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `time` | ISO 8601 UTC datetime | *required* | e.g. `2024-09-28T12:00:00Z`. Resolved to the nearest available scan. |
-| `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm), `7` = Shortwave IR / "fire temperature" (3.9µm), `5` = Near-IR Snow/Ice (1.6µm, reflectance). Ignored if `product` is given. Standalone Band 2 (visible) isn't accepted yet — see `GET /v1/satellite/products`. |
-| `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `abi7`, `abi5`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. Ignored if `product` is given. |
-| `product` | string | *(none)* | `sandwich` or `geocolor` — a multi-band composite (see below). When given, `band`/`cmap` are ignored. Full-disk only — not compatible with `center`/`dims`. |
+| `band` | int | `13` | `13` = Clean IR (10.3µm), `9` = Water Vapor (6.9µm), `7` = Shortwave IR / "fire temperature" (3.9µm), `5` = Near-IR Snow/Ice (1.6µm, reflectance), `3` = Veggie / Vegetation-NIR (0.86µm, reflectance). Ignored if `product` is given. Standalone Band 2 (visible) isn't accepted yet — see `GET /v1/satellite/products`. |
+| `cmap` | string | `default` | One of `default`, `abi13`, `abi9`, `abi7`, `abi5`, `abi3`, `bd`, `ir4`, `enhanced`, `nrl`, `grayscale` — see color tables below. Ignored if `product` is given. |
+| `product` | string | *(none)* | `sandwich` or `geocolor` — a multi-band composite (see below). When given, `band`/`cmap` are ignored. `center`/`dims` (bbox) are supported the same as a single-band tile. |
 | `satellite` | string | `goes-east` | `goes-east` (auto-resolves GOES-16 vs GOES-19 by date) or `goes-west` (auto-resolves GOES-17 vs GOES-18 by date). Both only cover the ABI era (~2017-2019 onward) — see "Satellite coverage" below. |
-| `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. Not supported with `product`. |
+| `center` | string | *(none)* | `"lat,lon"`, e.g. `"25.5,-80.3"`. Renders a box around this point instead of the full disk — much faster and higher detail (see below). Requires `dims`. Works with `product` too. |
 | `dims` | float | *(none)* | Full width/height of the box centered on `center` (a square box). Requires `center`. Clamped to 10–8000km. |
 | `unit` | string | `nm` | Unit for `dims`: `nm` (nautical miles) or `km`. |
-| `resolution_km` | float | *(native)* | km per output pixel for a bbox request. Omit for the sensor's native resolution (highest detail — 2km for most bands, 1km for band 5). Increase to render faster / produce a smaller file; can't go finer than native (silently clamped up). |
+| `resolution_km` | float | *(native)* | km per output pixel for a bbox request. Omit for the sensor's native resolution (highest detail — 2km for most bands, 1km for bands 3/5). Increase to render faster / produce a smaller file; can't go finer than native (silently clamped up). |
 
 ### Color tables (`cmap`)
 
 `default` is recommended for almost all use — it resolves server-side to
 the correct **per-band** standard enhancement. Every band measures a
 different physical quantity (brightness temperature for 7/9/13,
-reflectance for 5) and uses a genuinely different color convention —
+reflectance for 3/5) and uses a genuinely different color convention —
 there is no single colortable that's correct for all of them, so
 `default` is band-aware rather than a fixed choice.
 
 | Value | Description |
 |---|---|
-| `default` | Resolves to `abi13`/`abi9`/`abi7`/`abi5` based on `band` (see below). |
+| `default` | Resolves to `abi13`/`abi9`/`abi7`/`abi5`/`abi3` based on `band` (see below). |
 | `abi13` | **Band 13 standard enhancement.** White at the most extreme cold overshooting tops (-110°C) down through black (-80°C), a rainbow band from -80°C to -32°C highlighting severe convection, a hard cut to light grey at -31°C, then greyscale (light=cold, dark=warm) to black at +57°C — most scenes are mostly greyscale, with color only appearing over genuinely severe convection. Exact temperature→hex stops, not an approximation — see `_ABI13_STOPS` in `app/services/goes.py`. |
 | `abi9` | **Band 9 (water vapor) standard enhancement.** Cyan at coldest/moist (-93°C) through green tones, white at the moist/dry transition (-42°C), a purple/navy/indigo band (-30°C to -18°C), then yellow→orange→red to black at warmest/driest (+7°C). Exact temperature→hex stops, not an approximation — see `_ABI9_STOPS` in `app/services/goes.py`. Do not use this for Band 13 (or vice versa) — it represents a different physical quantity. |
 | `abi7` | **Band 7 (shortwave IR, "fire temperature") standard enhancement.** Greyscale over the same cloud-top range as 9/13, then a yellow→red highlight above normal clear-sky warmth (~+57°C) to flag hotspots — this band saturates far higher than 9/13 (fires can push 400K+), inspired by (not identical to) common operational SWIR/fire-temperature displays. See `_ABI7_STOPS` in `app/services/goes.py`. |
 | `abi5` | **Band 5 (near-IR snow/ice) reflectance ramp.** Not a temperature colortable — Band 5 reports reflectance factor (~0-1), rendered as a gamma-stretched 0-100% grayscale (linear reflectance reads unnaturally flat/dark to the eye). See `_reflectance_gray()` in `app/services/goes.py`. |
+| `abi3` | **Band 3 ("Veggie", vegetation/near-IR) reflectance ramp.** Same treatment as `abi5` — reflectance, not temperature, rendered as a gamma-stretched grayscale via `_reflectance_gray()`. Sensitive to chlorophyll/vegetation reflectance, hence the nickname (this is NOAA's own name for the band, not this project's). |
 | `ir4` | An alternate Band 13 enhancement sourced verbatim from [satpy](https://github.com/pytroll/satpy)'s `colorized_ir_clouds` enhancement: greyscale -20°C to +30°C, then the [ColorBrewer "Spectral"](https://colorbrewer2.org) 11-class diverging palette -80°C to -20°C. Kept for comparison; `abi13` is the recommended default for Band 13. |
 | `bd` | Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue→purple→red for cold convection |
 | `enhanced` | Darker surface/low clouds, white mid/high clouds, color for coldest tops |
@@ -139,8 +140,17 @@ Use `abi7` (the default) if that matters.
 
 Both composites fetch every companion band from the *exact same scan
 cycle* (ABI captures all bands simultaneously per scan, so there's no
-time-misalignment between e.g. the IR and visible channels) and are
-full-disk only for now — `center`/`dims` isn't supported yet.
+time-misalignment between e.g. the IR and visible channels). `center`/
+`dims` (bbox) work the same as a single-band tile — each companion band is
+cropped and read directly from its source file rather than reprojecting
+the full disk, which matters most for Band 2 (both composites' finest
+input, at native 0.5km): materializing that band's full disk first isn't
+just slow, it risks exhausting memory on a small deployment host, so the
+crop is read straight off the file at a stride instead. If a secondary
+band (e.g. Band 1/3 for `geocolor`) has no data at all in a requested box
+— possible right at the scan's edge — that composite falls back to its
+night-side/no-visible-signal rendering for the whole tile rather than
+guessing at partial color.
 
 ```bash
 curl "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&product=sandwich"
@@ -330,6 +340,8 @@ curl "https://joshmurdock.net/api/v1/satellite/products"
 ```json
 {
   "bands": [
+    {"band": 3, "name": "Veggie (Vegetation/NIR), 0.86µm", "kind": "reflectance",
+     "default_cmap": "abi3", "cmaps": ["abi3"], "native_resolution_km": 1.0, "bbox_supported": true},
     {"band": 5, "name": "Near-IR (Snow/Ice), 1.6µm", "kind": "reflectance",
      "default_cmap": "abi5", "cmaps": ["abi5"], "native_resolution_km": 1.0, "bbox_supported": true},
     {"band": 7, "name": "Shortwave IR (\"Fire Temperature\"), 3.9µm", "kind": "brightness_temp",
@@ -339,8 +351,8 @@ curl "https://joshmurdock.net/api/v1/satellite/products"
     {"band": 13, "...": "..."}
   ],
   "products": [
-    {"product": "sandwich", "name": "IR/VIS Sandwich", "description": "...", "bbox_supported": false},
-    {"product": "geocolor", "name": "GeoColor-style composite (approximate)", "description": "...", "bbox_supported": false}
+    {"product": "sandwich", "name": "IR/VIS Sandwich", "description": "...", "bbox_supported": true},
+    {"product": "geocolor", "name": "GeoColor-style composite (approximate)", "description": "...", "bbox_supported": true}
   ],
   "satellites": {
     "goes-east": [

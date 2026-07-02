@@ -68,14 +68,15 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
 - **The correct color table for the band you asked for.** `cmap=default`
   resolves to the right per-band standard enhancement — `abi13` (Clean
   IR), `abi9` (water vapor), `abi7` (shortwave IR / "fire temperature"),
-  or `abi5` (near-IR reflectance) — built from exact temperature→color
-  stops (or a reflectance ramp for band 5), not a generic approximation.
-  See [the live color legend tool](#color-legend) below.
+  `abi5` (near-IR reflectance), or `abi3` (Veggie/vegetation reflectance)
+  — built from exact temperature→color stops (or a reflectance ramp for
+  bands 3/5), not a generic approximation. See
+  [the live color legend tool](#color-legend) below.
 - **Composite products**: `product=sandwich` (Band 13 IR modulated by
   Band 2 visible texture) and `product=geocolor` (a documented
   approximation of NOAA's day/night true-color+IR composite — see `GET
-  /v1/satellite/products` for exactly what's simplified). Full-disk only
-  for now.
+  /v1/satellite/products` for exactly what's simplified). Both support
+  `center`/`dims` bbox cropping the same as a single-band tile.
 - **`GET /v1/satellite/products`** — discovery endpoint listing every band/
   product this API can render and the exact UTC date range each satellite
   covers, so a client can build a picker without hardcoding any of that.
@@ -622,18 +623,22 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    this project's ~4GB deployment host with two composites running at
    once. Fixed by reading a strided (already-downsampled) view straight
    from the netCDF variable (`_read_source_downsampled()`) for the
-   composite products instead of materializing the full array first. If
-   you add another product that reads Band 1/2/3/4/6 at anything near
-   full resolution, use `_read_source_downsampled()`, not `_read_source()`.
+   full-disk composite path instead of materializing the full array first.
+   The same concern applies to the composites' bbox path (`center`/`dims`)
+   — `_read_source_cropped()` locates the requested box first (a cheap
+   sparse pass over just the 1-D coordinate arrays) and then reads only
+   that crop directly from the file at a stride, so a bbox request never
+   pays Band 2's full-disk-materialization cost either. If you add another
+   product that reads Band 1/2/3/4/6 at anything near full resolution, use
+   one of these two, not `_read_source()`.
 
 ### Roadmap (not yet implemented)
 
-1. **Standalone Band 2 (visible) as its own product**, and **bbox (`center`/
-   `dims`) support for the sandwich/geocolor composites** — both composites
-   are full-disk only today (see `app/services/goes.py`'s
-   `render_sandwich_to_png`/`render_geocolor_to_png`); cropping would need
-   each companion band to go through the same locate-then-crop logic
-   `render_bbox_to_png` already has for single bands.
+1. **Standalone Band 2 (visible) as its own product** — bands 3/5/7/9/13
+   are all exposed standalone today; Band 2 isn't yet, mainly because at
+   native 0.5km it needs the same crop-read treatment `render_bbox_to_png`
+   uses for other bands rather than the full-disk downsample path bands
+   3/5 use today (see the `_read_source_cropped()` note above).
 2. **A closer-to-official GeoColor** — today's `product=geocolor` is a
    documented approximation (synthetic true color + colorized IR, blended
    by solar zenith angle; see `GET /v1/satellite/products`). No city-lights

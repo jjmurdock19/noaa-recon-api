@@ -14,11 +14,12 @@ _cache = ResultCache(CACHE_ROOT / "satellite")
 _nc_cache_dir = CACHE_ROOT / "goes_nc"
 
 VALID_CMAPS = set(goes.LUTS.keys()) | set(goes.STOPS_BY_CMAP.keys()) | goes.REFLECTANCE_CMAPS | {"default"}
-VALID_BANDS = {5, 7, 9, 13}  # Band 2 standalone / TDR remain follow-up phases
+VALID_BANDS = {3, 5, 7, 9, 13}  # Band 2 standalone / TDR remain follow-up phases
 VALID_PRODUCTS = {"sandwich", "geocolor"}
 NM_PER_KM = 1.0 / 1.852
 
 BAND_NAMES = {
+    3: "Veggie (Vegetation/NIR), 0.86µm",
     5: "Near-IR (Snow/Ice), 1.6µm",
     7: "Shortwave IR (\"Fire Temperature\"), 3.9µm",
     9: "Mid-Level Water Vapor, 6.9µm",
@@ -58,10 +59,10 @@ def _parse_center(center: str) -> tuple[float, float]:
 async def get_tile(
     background_tasks: BackgroundTasks,
     time: datetime.datetime = Query(..., description="UTC timestamp, e.g. 2024-09-28T12:00:00Z"),
-    band: int = Query(13, description="13 = Clean IR, 9 = Water Vapor, 7 = Shortwave IR, 5 = Near-IR Snow/Ice. Ignored if `product` is given."),
+    band: int = Query(13, description="13 = Clean IR, 9 = Water Vapor, 7 = Shortwave IR, 5 = Near-IR Snow/Ice, 3 = Veggie (Vegetation/NIR). Ignored if `product` is given."),
     cmap: str = Query(
         "default",
-        description="default | abi13 | abi9 | abi7 | abi5 | bd | ir4 | enhanced | nrl | grayscale. "
+        description="default | abi13 | abi9 | abi7 | abi5 | abi3 | bd | ir4 | enhanced | nrl | grayscale. "
         "'default' resolves to the correct per-band standard enhancement — bands are different physical "
         "quantities (temperature vs. reflectance) and aren't interchangeable. Ignored if `product` is given.",
     ),
@@ -69,7 +70,7 @@ async def get_tile(
         None,
         description="'sandwich' (Band 13 IR x Band 2 VIS blend) or 'geocolor' (simplified day/night true-color "
         "+ IR composite — see API.md, this is NOT NOAA's proprietary GeoColor). When given, `band`/`cmap` are "
-        "ignored. Full-disk only — bbox (`center`/`dims`) isn't supported for composites yet.",
+        "ignored. `center`/`dims` (bbox) are supported the same as a single-band tile.",
     ),
     satellite: str = Query(
         "goes-east",
@@ -78,7 +79,7 @@ async def get_tile(
         "onward) — pre-ABI satellites used a different instrument/format with no open archive.",
     ),
     center: Optional[str] = Query(
-        None, description="'lat,lon' — render only a box around this point instead of the full disk. Requires `dims`. Not supported with `product`."
+        None, description="'lat,lon' — render only a box around this point instead of the full disk. Requires `dims`. Works with `product` too."
     ),
     dims: Optional[float] = Query(
         None, description="Full width/height of the bounding box, centered on `center`. Requires `center`."
@@ -87,7 +88,7 @@ async def get_tile(
     resolution_km: Optional[float] = Query(
         None,
         description="km per output pixel for a bbox request. Omit for the sensor's native resolution "
-        "(highest detail — ~2km for most bands, 1km for band 5). Increase to render faster / smaller files.",
+        "(highest detail — ~2km for most bands, 1km for bands 3/5). Increase to render faster / smaller files.",
     ),
 ):
     if satellite not in ("goes-east", "goes-west"):
@@ -101,8 +102,19 @@ async def get_tile(
     if product is not None:
         if product not in VALID_PRODUCTS:
             raise HTTPException(400, f"product must be one of {sorted(VALID_PRODUCTS)}")
+
+        bbox = None
         if center is not None:
-            raise HTTPException(400, "center/dims (bbox) aren't supported for composite products yet — full-disk only")
+            lat, lon = _parse_center(center)
+            width_km = dims if unit == "km" else dims * 1.852
+            try:
+                # band=2 here only picks which band's native GSD floors the
+                # resolution clamp -- Band 2 (0.5km) is the finest of any
+                # band either composite uses, so this lets a bbox request
+                # go as sharp as the sharpest input actually supports.
+                bbox = goes.resolve_bbox_request(lat, lon, width_km, resolution_km, band=2)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
 
         try:
             resolved_ir = goes.resolve_nearest(time, 13, sat_side)
@@ -110,6 +122,9 @@ async def get_tile(
             raise HTTPException(404, str(e)) from e
 
         key = f"goes_{product}_{resolved_ir.satellite}_{resolved_ir.scan_start.strftime('%Y%m%dT%H%M%S')}"
+        if bbox is not None:
+            key += f"_c{bbox.center_lat:.3f}_{bbox.center_lon:.3f}_w{bbox.width_km:.0f}_r{bbox.resolution_km:.1f}"
+
         status = _cache.get_status(key)
         if status:
             return status
@@ -118,8 +133,11 @@ async def get_tile(
             "satellite": f"GOES-{resolved_ir.satellite}",
             "scan_start": resolved_ir.scan_start.isoformat(),
         }
+        if bbox is not None:
+            lock_params["center"] = [bbox.center_lat, bbox.center_lon]
+            lock_params["width_km"] = bbox.width_km
         _cache.acquire_lock(key, lock_params)
-        background_tasks.add_task(goes.render_product_and_store, product, resolved_ir, key, _nc_cache_dir, _cache)
+        background_tasks.add_task(goes.render_product_and_store, product, resolved_ir, key, _nc_cache_dir, _cache, bbox)
         return {"status": "generating", "key": key, **lock_params}
 
     if band not in VALID_BANDS:
@@ -245,7 +263,7 @@ async def list_products():
             "name": "IR/VIS Sandwich",
             "description": "Band 13 IR colorized with the abi13 enhancement, modulated by Band 2 visible "
             "brightness to show convective texture. Falls back to darkened plain IR at night (no visible signal).",
-            "bbox_supported": False,
+            "bbox_supported": True,
         },
         {
             "product": "geocolor",
@@ -254,7 +272,7 @@ async def list_products():
             "green recipe) by day, abi13 colorized IR by night, blended by solar zenith angle near the "
             "terminator. NOT NOAA/CIRA's proprietary GeoColor — no city lights layer, no atmospheric "
             "(Rayleigh) correction.",
-            "bbox_supported": False,
+            "bbox_supported": True,
         },
     ]
     return {"bands": bands, "products": products, "satellites": SATELLITE_COVERAGE}

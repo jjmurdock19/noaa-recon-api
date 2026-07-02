@@ -263,6 +263,37 @@ def test_resolve_and_render_matches_goes_tile_py_bounds(tmp_path):
 
 
 @pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
+def test_band3_veggie_renders_as_reflectance_not_ir(tmp_path):
+    """Regression test for "band 3 (Veggie) just returns a clean IR
+    window": render Band 3 and Band 13 for the same scan and confirm
+    they're genuinely different, and that Band 3 actually took the
+    reflectance (grayscale) path rather than silently reusing an IR LUT."""
+    from PIL import Image as PILImage
+
+    target = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=6)
+
+    resolved_3 = goes.resolve_nearest(target, band=3)
+    nc_3 = goes.ensure_downloaded(resolved_3, tmp_path / "nc")
+    out_3 = tmp_path / "band3.png"
+    goes.render_to_png(nc_3, goes.DEFAULT_CMAP_BY_BAND[3], out_3, band=3)
+
+    assert goes.DEFAULT_CMAP_BY_BAND[3] == "abi3"
+    assert "abi3" in goes.REFLECTANCE_CMAPS
+    assert 3 in goes.REFLECTANCE_BANDS
+
+    arr3 = np.array(PILImage.open(out_3))
+    opaque3 = arr3[:, :, 3] > 0
+    assert opaque3.sum() > 0
+    # Reflectance render is grayscale (R==G==B wherever opaque) -- unlike
+    # abi13's colorized IR, which is not -- a cheap, robust way to confirm
+    # this took the reflectance path.
+    assert np.array_equal(arr3[opaque3, 0], arr3[opaque3, 1])
+    assert np.array_equal(arr3[opaque3, 1], arr3[opaque3, 2])
+    # Not a degenerate all-one-value image.
+    assert arr3[opaque3, 0].std() > 1.0
+
+
+@pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
 def test_bbox_render_is_native_resolution_and_correctly_bounded(tmp_path):
     """Render a small box over a known point (Miami) and confirm: the output
     is sized for native ~2km/px resolution (not the full-disk downsample),
@@ -287,3 +318,62 @@ def test_bbox_render_is_native_resolution_and_correctly_bounded(tmp_path):
     assert im.size == (meta["out_size"], meta["out_size"])
     arr = np.array(im)
     assert (arr[:, :, 3] > 0).sum() > 0  # at least some opaque (real data) pixels
+
+
+@pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
+def test_sandwich_bbox_render_is_cropped_and_bounded(tmp_path):
+    """Composite bbox path: render a small box over Miami and confirm it's
+    cropped (not full-disk) with a real, non-empty image at the requested
+    resolution -- covers the memory-safe crop-read path (_read_source_cropped)
+    that Band 2's native 0.5km resolution requires."""
+    from PIL import Image as PILImage
+
+    target = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=6)
+    resolved_ir = goes.resolve_nearest(target, band=13)
+    resolved_vis = goes.resolve_companion_band(resolved_ir, 2)
+    nc_ir = goes.ensure_downloaded(resolved_ir, tmp_path / "nc")
+    nc_vis = goes.ensure_downloaded(resolved_vis, tmp_path / "nc")
+    out_png = tmp_path / "sandwich_bbox.png"
+
+    bbox = goes.resolve_bbox_request(25.7617, -80.1918, 500.0, None, band=2)
+    meta = goes.render_sandwich_to_png(nc_ir, nc_vis, out_png, bbox=bbox)
+
+    assert out_png.exists()
+    (lat_s, lon_w), (lat_n, lon_e) = meta["bounds"]
+    assert lat_n - lat_s == pytest.approx(500.0 / goes.KM_PER_DEG_LAT, rel=0.05)
+    assert meta["out_size"] == pytest.approx(round(500.0 / meta["resolution_km"]), abs=2)
+
+    im = PILImage.open(out_png)
+    assert im.size == (meta["out_size"], meta["out_size"])
+    arr = np.array(im)
+    assert (arr[:, :, 3] > 0).sum() > 0
+
+
+@pytest.mark.skipif(not NETWORK_TESTS, reason="set NOAA_RECON_API_NETWORK_TESTS=1 to hit real NOAA S3")
+def test_geocolor_bbox_render_is_cropped_and_bounded(tmp_path):
+    """Same as the sandwich bbox test, but for geocolor (4 companion bands
+    instead of 2) -- covers the day/night blend path with cropped inputs."""
+    from PIL import Image as PILImage
+
+    target = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=6)
+    resolved_ir = goes.resolve_nearest(target, band=13)
+    resolved_c1 = goes.resolve_companion_band(resolved_ir, 1)
+    resolved_c2 = goes.resolve_companion_band(resolved_ir, 2)
+    resolved_c3 = goes.resolve_companion_band(resolved_ir, 3)
+    nc_ir = goes.ensure_downloaded(resolved_ir, tmp_path / "nc")
+    nc_c1 = goes.ensure_downloaded(resolved_c1, tmp_path / "nc")
+    nc_c2 = goes.ensure_downloaded(resolved_c2, tmp_path / "nc")
+    nc_c3 = goes.ensure_downloaded(resolved_c3, tmp_path / "nc")
+    out_png = tmp_path / "geocolor_bbox.png"
+
+    bbox = goes.resolve_bbox_request(25.7617, -80.1918, 500.0, None, band=2)
+    meta = goes.render_geocolor_to_png(nc_c1, nc_c2, nc_c3, nc_ir, resolved_ir.scan_start, out_png, bbox=bbox)
+
+    assert out_png.exists()
+    (lat_s, lon_w), (lat_n, lon_e) = meta["bounds"]
+    assert lat_n - lat_s == pytest.approx(500.0 / goes.KM_PER_DEG_LAT, rel=0.05)
+
+    im = PILImage.open(out_png)
+    assert im.size == (meta["out_size"], meta["out_size"])
+    arr = np.array(im)
+    assert (arr[:, :, 3] > 0).sum() > 0
