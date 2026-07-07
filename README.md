@@ -33,8 +33,55 @@ The API can be deployed on Windows for local testing.
 irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
 ```
 
-The API runs as a plain background process started/stoped by the user (`noaa-recon-api start`/`stop`). This is not a Windows
+The API runs as a plain background process started/stopped by the user (`noaa-recon-api start`/`stop`). This is not a Windows
 Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)**.
+
+### Requirements
+
+**Linux** — Fedora/RHEL/Rocky/CentOS, Debian/Ubuntu, or a distro with the Nix
+package manager (anything with `dnf`, `apt`, or `nix` on `PATH`), plus `sudo`
+access so the installer can install packages and write system files (it does
+not need to be run as `root`). Everything else — git, Python 3.9+, a C
+compiler (needed to build `netCDF4`'s C extensions), and optionally nginx/
+Apache + certbot for HTTPS — is detected and installed automatically if
+missing; you don't need to pre-install any of it.
+
+**Windows** — git and Python 3.9+ (installed via `winget` if missing and you
+approve it; PowerShell is built in). Local-testing scope only — no reverse
+proxy, domain, or HTTPS, see above.
+
+**Python dependencies** (installed into an isolated virtualenv the installer
+creates — never your system Python): FastAPI, Uvicorn, netCDF4, NumPy,
+Pillow, httpx, itsdangerous, pypdf. Exact pinned versions are in
+[`pyproject.toml`](pyproject.toml).
+
+### What the installer does
+
+`install.sh` is a single self-contained Bash script — no external installer
+framework or package to fetch beyond the script itself:
+
+1. Detects your package manager (`dnf`/`apt`/`nix`) and installs git, Python
+   3, and a C compiler if any are missing.
+2. Clones this repo to an install directory of your choice
+   (`/opt/noaa-recon-api` by default).
+3. Creates a Python virtualenv inside that directory and installs the API's
+   dependencies into it — isolated from system Python.
+4. Writes and enables a **systemd service** so the API starts on boot and
+   restarts itself if it crashes.
+5. Optionally installs/configures **nginx or Apache** as a reverse proxy for
+   a domain deployment, and can request a free **Let's Encrypt** HTTPS
+   certificate via `certbot`.
+6. Builds the storm-track and recon MET archives (SQLite databases under
+   `data/`) and installs two nightly **systemd timers** to keep them current
+   going forward.
+7. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
+   `update`/`uninstall`) for living with the install afterward.
+
+Re-running the same one-liner on a machine that already has it installed
+offers **Update** (pull latest `main`, restart) or **Reconfigure** (re-run
+the wizard with your previous answers pre-filled as defaults) instead of
+installing a second copy. See [INSTALL.md](INSTALL.md) for a plain-language
+walkthrough of every prompt the wizard asks.
 
 ---
 
@@ -626,7 +673,6 @@ clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" 
 deploy/                       nginx snippet + systemd unit for this specific host (joshmurdock.net) —
                                install.sh generates its own versions of these for other machines
 install.sh                    Interactive installer/updater/uninstaller (dnf/apt/nix) — see INSTALL.md
-scripts/render_ascii_logo.py  Regenerates install.sh's terminal banner from assets/branding/noaa_logo.bbcode
 docs/assets/                  README example images
 docs/colortable_sources/      Source JSON for the abi13/abi9 exact color stops
 tests/test_satellite.py       Offline math/parsing tests + one network-gated e2e test

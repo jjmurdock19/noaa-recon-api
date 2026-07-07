@@ -56,8 +56,8 @@ ADMIN_PASS=""
 # UI helpers — everything here writes prompts/decoration to stderr so that
 # `x=$(ask_text ...)` only ever captures the actual answer.
 # ---------------------------------------------------------------------------
-c_reset='\033[0m'; c_bold='\033[1m'; c_dim='\033[2m'
-c_red='\033[1;31m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_cyan='\033[1;36m'
+c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+c_red=$'\033[1;31m'; c_green=$'\033[1;32m'; c_yellow=$'\033[1;33m'; c_cyan=$'\033[1;36m'
 
 log_step() { printf "\n${c_bold}${c_cyan}==>${c_reset} ${c_bold}%s${c_reset}\n" "$1" >&2; }
 log_ok()   { printf "${c_green}  ok${c_reset}  %s\n" "$1" >&2; }
@@ -138,23 +138,22 @@ menu_select() {
 }
 
 print_banner() {
-    # Small (8-row) box-downsampled NOAA logo, printed inline beside the
-    # title/tagline rather than as its own full-width splash. Regenerate
-    # from source with: scripts/render_ascii_logo.py assets/branding/noaa_logo.bbcode --rows 8
-    local logo_raw
-    logo_raw="$(cat <<'NOAA_LOGO_EOF'
-\033[38;5;243m     \033[38;5;24m█████████    \033[0m
-\033[38;5;243m   \033[38;5;24m█\033[38;5;18m███████████\033[38;5;24m█  \033[0m
-\033[38;5;243m    \033[38;5;24m██\033[38;5;18m████████\033[38;5;24m█  \033[38;5;31m█\033[0m
-\033[38;5;243m \033[38;5;31m██   \033[38;5;24m█\033[38;5;18m██████\033[38;5;24m█ \033[38;5;31m█\033[38;5;32m██\033[0m
-\033[38;5;243m \033[38;5;32m███\033[38;5;31m█   \033[38;5;24m████\033[38;5;60m█\033[38;5;31m█\033[38;5;32m████\033[0m
-\033[38;5;243m \033[38;5;31m█\033[38;5;32m█████\033[38;5;31m█\033[38;5;67m██\033[38;5;31m█\033[38;5;32m█\033[38;5;31m█\033[38;5;32m████\033[38;5;31m█\033[0m
-\033[38;5;243m   \033[38;5;32m█████████████\033[38;5;31m█ \033[0m
-\033[38;5;243m     \033[38;5;31m█\033[38;5;32m████████\033[38;5;31m█   \033[0m
-NOAA_LOGO_EOF
-)"
-    local -a logo_lines
-    mapfile -t logo_lines < <(printf '%b\n' "$logo_raw")
+    # "API" in large block letters, printed inline beside the title/tagline
+    # rather than as its own full-width splash.
+    local -a logo_lines=(
+        ""
+        "    ▄▄     ▄▄▄▄▄▄     ▄▄▄▄▄▄  "
+        "   ████    ██▀▀▀▀█▄   ▀▀██▀▀  "
+        "   ████    ██    ██     ██    "
+        "  ██  ██   ██████▀      ██    "
+        "  ██████   ██           ██    "
+        " ▄██  ██▄  ██         ▄▄██▄▄  "
+        " ▀▀    ▀▀  ▀▀         ▀▀▀▀▀▀  "
+    )
+    local i
+    for i in "${!logo_lines[@]}"; do
+        logo_lines[$i]="${c_bold}${c_cyan}${logo_lines[$i]}${c_reset}"
+    done
 
     local -a text_lines=(
         "${c_bold}${c_cyan}noaa-recon-api${c_reset} installer"
@@ -167,13 +166,12 @@ NOAA_LOGO_EOF
 
     local show_logo=1
     [[ "$(tput cols 2>/dev/null || echo 80)" -lt 82 ]] && show_logo=0
-    command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -lt 256 ]] && show_logo=0
 
     echo >&2
     local n=${#logo_lines[@]}
     [[ ${#text_lines[@]} -gt $n ]] && n=${#text_lines[@]}
-    local i blank_logo_line
-    blank_logo_line="$(printf '%*s' 18 '')"
+    local blank_logo_line
+    blank_logo_line="$(printf '%*s' 31 '')"
     for ((i = 0; i < n; i++)); do
         if [[ "$show_logo" -eq 1 ]]; then
             printf "  %s  %s\n" "${logo_lines[$i]:-$blank_logo_line}" "${text_lines[$i]:-}" >&2
