@@ -14,6 +14,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
 from app import auth
+from app.logging_config import LOG_FILE
 from app.paths import CACHE_ROOT, RECON_MET_DB_PATH, STORMS_DB_PATH
 from app.routers.satellite import VALID_BANDS, VALID_CMAPS, _cache, _nc_cache_dir, _parse_center
 from app.services import goes, recon_met, stats, storms
@@ -109,6 +110,40 @@ async def status():
             "total_bytes": databases_total,
         },
         "grand_total_bytes": cache_total + databases_total,
+    }
+
+
+# ── Log tail (for the console's live log terminal) ──────────────────────
+@router.get("/logs", dependencies=[Depends(auth.require_login)])
+async def get_logs(offset: int = Query(0, ge=0), max_bytes: int = Query(65536, ge=1024, le=1_000_000)):
+    """Tail app.log for the console's log terminal. `offset` is the byte
+    position the caller already has (0 for an initial load, otherwise the
+    `offset` a previous call returned) — only bytes past it come back, so
+    repeated polling ships new log lines only, not the whole file each time.
+
+    `reset` is set (and the returned text is the last `max_bytes` of the
+    file instead of a diff) when there's nothing sensible to diff against:
+    the very first load of a file bigger than `max_bytes`, or `offset`
+    pointing past the current size because the RotatingFileHandler rotated
+    the file out from under it. The console clears its view when it sees
+    this instead of appending, since the bytes at a given offset no longer
+    mean what they used to.
+    """
+    if not LOG_FILE.exists():
+        return {"text": "", "offset": 0, "reset": True}
+
+    size = LOG_FILE.stat().st_size
+    reset = offset > size or (offset == 0 and size > max_bytes)
+    start = max(0, size - max_bytes) if reset else offset
+
+    with LOG_FILE.open("rb") as f:
+        f.seek(start)
+        data = f.read(max_bytes)
+
+    return {
+        "text": data.decode("utf-8", errors="replace"),
+        "offset": start + len(data),
+        "reset": reset,
     }
 
 

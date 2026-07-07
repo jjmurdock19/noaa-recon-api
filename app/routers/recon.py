@@ -142,10 +142,17 @@ async def list_storms_for_year(year: int):
         conn.close()
 
 
-@router.get("/{year}/{storm_name}")
+@router.get("/{year}/{storm_name:path}")
 async def list_missions_for_storm(year: int, storm_name: str):
     """Every archived mission for one storm in one year — enough to
-    populate a year -> storm -> mission dropdown chain."""
+    populate a year -> storm -> mission dropdown chain.
+
+    storm_name uses the `:path` converter (not a plain `{storm_name}`)
+    because the "Unknown / Training" bucket name contains a literal "/" —
+    Starlette decodes %2F to a real slash before routing, so a plain path
+    parameter (which never matches across a "/") 404'd on that bucket no
+    matter how the caller encoded it. `:path` allows a slash within this
+    segment; safe here since storm_name is the last path segment."""
     conn = recon_met.get_connection()
     try:
         rows = recon_met.list_missions_for_storm(conn, year, storm_name)

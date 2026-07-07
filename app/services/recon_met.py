@@ -23,6 +23,7 @@ router.
 import datetime
 import io
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -284,6 +285,15 @@ def process_nc_file(nc_path: str, mission_id: str) -> Optional[Dict]:
 
         if not (-90 <= la_f <= 90 and -180 <= lo_f <= 180):
             continue
+        # (0, 0) "null island" is a GPS/INS-dropout sentinel some flights'
+        # instruments fall back to instead of properly masking the reading
+        # (seen trailing the recording on some missions) — within the valid
+        # range check above but not a real position for a hurricane/recon
+        # flight, and left in, it corrupts both the stored lat/lon bounds
+        # and any distance-based matching against it (see
+        # reconcile_junk_storm_buckets in this module).
+        if abs(la_f) < 0.01 and abs(lo_f) < 0.01:
+            continue
         if ws is not None and (ws < 0 or ws > 300):
             ws = None
         if wdv is not None and not (0 <= wdv <= 360):
@@ -433,6 +443,42 @@ def harvest_mission(client: httpx.Client, conn: sqlite3.Connection, year: int, m
         os.unlink(tmp_path)
 
 
+def clean_null_island_observations(conn: sqlite3.Connection) -> int:
+    """One-time-idempotent fixup: deletes any already-stored (0, 0) "null
+    island" observation rows — see the ingestion-time filter added to
+    process_nc_file() above, which only stops *new* harvests from storing
+    these; missions harvested before that filter existed can still have
+    them sitting in the database, which shows up as a bogus jump to the
+    Gulf of Guinea on any client that plots a mission's track. Recomputes
+    each affected mission's obs_count/lat_min/lat_max/lon_min/lon_max
+    afterward so they stay consistent with the remaining real observations.
+    Returns the number of observation rows removed."""
+    affected = conn.execute(
+        "SELECT DISTINCT mission_id FROM observations WHERE ABS(lat) < 0.01 AND ABS(lon) < 0.01"
+    ).fetchall()
+    if not affected:
+        return 0
+
+    removed = 0
+    for row in affected:
+        mid = row["mission_id"]
+        cur = conn.execute(
+            "DELETE FROM observations WHERE mission_id = ? AND ABS(lat) < 0.01 AND ABS(lon) < 0.01", (mid,)
+        )
+        removed += cur.rowcount
+        stats = conn.execute(
+            "SELECT COUNT(*) AS c, MIN(lat) AS lat_min, MAX(lat) AS lat_max, "
+            "MIN(lon) AS lon_min, MAX(lon) AS lon_max FROM observations WHERE mission_id = ?",
+            (mid,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE missions SET obs_count=?, lat_min=?, lat_max=?, lon_min=?, lon_max=? WHERE mission_id=?",
+            (stats["c"], stats["lat_min"], stats["lat_max"], stats["lon_min"], stats["lon_max"], mid),
+        )
+    conn.commit()
+    return removed
+
+
 def migrate_unknown_storm_names(conn: sqlite3.Connection) -> int:
     """One-time-idempotent fixup: any mission whose storm_name is literally
     its own raw mission ID (from old harvests, before the 'Unknown /
@@ -485,6 +531,171 @@ def reconcile_storm_ids(conn: sqlite3.Connection) -> int:
     if fixed:
         conn.commit()
     return fixed
+
+
+# ── Junk storm-name bucket reconciliation ───────────────────────────────
+# NOAA's directory metadata mis-files some flights under a handful of
+# generic bucket names instead of the real storm they flew — confirmed in
+# the wild for 2024: "Tdr" and "Surv"/"Survey" (surveillance-flight jargon
+# leaking into the storm-name field) carrying Helene's/Debby's real
+# storm_id, "Cyclone" (a generic label, seen on G-IV synoptic-surveillance
+# flights) carrying Hone's real storm_id, and both "Invest" and a big chunk
+# of "Unknown / Training" carrying a stale storm_id (AL072012 — a *real*
+# 2012 storm, itself also coincidentally named Helene, most likely a
+# leaked PDF-template example the "(i.e., ...)" strip in extract_from_pdf()
+# didn't catch) that has nothing to do with the actual 2024 flight.
+JUNK_STORM_NAMES = {"CYCLONE", "TDR", "SURV", "SURVEY", "RECON", "INVEST", "UNKNOWN / TRAINING"}
+
+# Recon flights (especially G-IV synoptic-surveillance legs) can operate a
+# few hundred km from a storm's center; ATCF/HURDAT2 track points land every
+# 6 hours. Both bounds are deliberately generous — a false negative just
+# leaves a mission in its junk bucket for manual review, same as the
+# existing reconcile_storm_ids() fixup; a false positive would misfile it
+# under the wrong storm, so neither bound should be loosened further
+# without also tightening the other.
+MAX_STORM_MATCH_DISTANCE_KM = 500
+MAX_STORM_MATCH_TIME_HOURS = 30
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _mission_track_points(conn: sqlite3.Connection, mission_id: str) -> List[Tuple[float, float]]:
+    """All of a mission's decimated (lat, lon) observations, excluding (0, 0)
+    "null island" readings — a GPS/INS-dropout artifact seen trailing some
+    flights' recordings (e.g. the last ~30 observations of 20221030I1), not
+    a real position; no Atlantic/Pacific hurricane recon flight is ever
+    actually at the equator/prime meridian."""
+    rows = conn.execute(
+        "SELECT lat, lon FROM observations WHERE mission_id = ? AND NOT (ABS(lat) < 0.01 AND ABS(lon) < 0.01)",
+        (mission_id,),
+    ).fetchall()
+    return [(r["lat"], r["lon"]) for r in rows]
+
+
+def _mission_min_distance_km(points: List[Tuple[float, float]], lat: float, lon: float) -> Optional[float]:
+    """Closest approach (km) of any of the mission's own flown positions to
+    (lat, lon) — used instead of the mission's position at one exact
+    instant. A single-moment snapshot is fragile for a short repositioning/
+    transit leg (e.g. 20250928N2: a 42-minute hop from 300km off Imelda back
+    to home base, whose position 20+ minutes after landing — the storm
+    track's nearest synoptic hour — is the *far* end of that hop, not the
+    close approach) or a flight with corrupted trailing readings (see
+    _mission_track_points above); the flight's closest approach across its
+    whole track is what actually indicates it was flying that storm."""
+    if not points:
+        return None
+    return min(_haversine_km(la, lo, lat, lon) for la, lo in points)
+
+
+def _find_matching_storm(storms_conn: sqlite3.Connection, recon_conn: sqlite3.Connection,
+                          mission_id: str, year: int, mid_unix: float) -> Optional[sqlite3.Row]:
+    """Among storms active around `year` (+/- 1, in case a mission lands
+    right at a year boundary relative to the storm's own year field), finds
+    the one whose track passed nearest this mission's flown path around the
+    same time — the real signal that a recon flight was flying that storm,
+    independent of whatever bucket name NOAA's directory metadata assigned
+    it. Returns the storms row, or None if nothing is within
+    MAX_STORM_MATCH_DISTANCE_KM/MAX_STORM_MATCH_TIME_HOURS."""
+    points = _mission_track_points(recon_conn, mission_id)
+    if not points:
+        return None
+
+    mid_dt = datetime.datetime.fromtimestamp(mid_unix, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    candidates = storms_conn.execute(
+        "SELECT id, atcf_id, basin, year, name FROM storms WHERE year IN (?, ?, ?)",
+        (year - 1, year, year + 1),
+    ).fetchall()
+
+    best_storm, best_distance = None, None
+    for s in candidates:
+        point = storms_conn.execute(
+            "SELECT datetime_utc, lat, lon FROM track_points WHERE storm_id = ? "
+            "ORDER BY ABS(julianday(datetime_utc) - julianday(?)) LIMIT 1",
+            (s["id"], mid_dt),
+        ).fetchone()
+        if point is None:
+            continue
+        point_dt = datetime.datetime.strptime(point["datetime_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        hours_off = abs(point_dt.timestamp() - mid_unix) / 3600
+        if hours_off > MAX_STORM_MATCH_TIME_HOURS:
+            continue
+
+        dist_km = _mission_min_distance_km(points, point["lat"], point["lon"])
+        if dist_km is None or dist_km > MAX_STORM_MATCH_DISTANCE_KM:
+            continue
+        if best_distance is None or dist_km < best_distance:
+            best_storm, best_distance = s, dist_km
+    return best_storm
+
+
+def reconcile_junk_storm_buckets(conn: sqlite3.Connection) -> int:
+    """One-time-idempotent fixup: missions filed under a generic junk bucket
+    (see JUNK_STORM_NAMES) get reassigned to their real storm, in two tiers:
+
+    1. Trust the mission's own storm_id if it's internally consistent — its
+       embedded year (the last 4 digits of an "AL092024"-style ATCF id)
+       matches this mission's actual year — and look it up directly in the
+       storms archive. Resolves "Tdr"/"Surv"/"Survey"/"Cyclone" cases, which
+       carry a correct storm_id despite the wrong name.
+    2. Otherwise (no storm_id, or a stale one from a different year — e.g.
+       "Invest"/"Unknown / Training" missions carrying a leaked 2012
+       example id on a 2024 flight), fall back to matching the mission's own
+       flown position against every storm's track around that time (see
+       _find_matching_storm). A flight with no real storm nearby (e.g. a
+       January Pacific atmospheric-river mission with no tropical system in
+       play at all) correctly finds no match and stays in its bucket rather
+       than being forced onto an unrelated storm.
+
+    Safe to call after every harvest — a no-op for missions already
+    correctly named, and for genuine non-tropical training/survey flights
+    that will never match tier 1 or 2."""
+    from app.services import storms as storms_svc  # local import: avoids a module-load-order dependency
+
+    placeholders = ",".join("?" * len(JUNK_STORM_NAMES))
+    junk_rows = conn.execute(
+        f"SELECT mission_id, year, storm_id, start_unix, end_unix FROM missions "
+        f"WHERE UPPER(storm_name) IN ({placeholders})",
+        tuple(JUNK_STORM_NAMES),
+    ).fetchall()
+    if not junk_rows:
+        return 0
+
+    storms_conn = storms_svc.get_connection()
+    try:
+        fixed = 0
+        for row in junk_rows:
+            match = None
+
+            sid = (row["storm_id"] or "").strip().upper()
+            m = re.match(r"^[A-Z]{2}\d{2}(\d{4})$", sid)
+            if m and int(m.group(1)) == row["year"]:
+                match = storms_conn.execute(
+                    "SELECT id, atcf_id, basin, year, name FROM storms WHERE atcf_id = ?", (sid,)
+                ).fetchone()
+
+            if match is None:
+                mid_unix = (row["start_unix"] + row["end_unix"]) / 2
+                match = _find_matching_storm(storms_conn, conn, row["mission_id"], row["year"], mid_unix)
+
+            if match is None:
+                continue
+            conn.execute(
+                "UPDATE missions SET storm_name = ?, storm_id = ? WHERE mission_id = ?",
+                (match["name"].title(), match["atcf_id"], row["mission_id"]),
+            )
+            fixed += 1
+        if fixed:
+            conn.commit()
+        return fixed
+    finally:
+        storms_conn.close()
 
 
 # ── Query helpers used by app/routers/recon.py ──────────────────────────
@@ -552,12 +763,18 @@ def run_ingest(years: Optional[list[int]] = None, force: bool = False) -> dict:
                     summary["errors"] += 1
             summary["years"][str(year)] = year_ingested
 
+    cleaned = clean_null_island_observations(conn)
+    if cleaned:
+        summary["null_island_obs_removed"] = cleaned
     fixed = migrate_unknown_storm_names(conn)
     if fixed:
         summary["legacy_names_fixed"] = fixed
     reconciled = reconcile_storm_ids(conn)
     if reconciled:
         summary["storm_ids_reconciled"] = reconciled
+    junk_fixed = reconcile_junk_storm_buckets(conn)
+    if junk_fixed:
+        summary["junk_buckets_reconciled"] = junk_fixed
     summary["total_missions"] = conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0]
     conn.close()
     return summary

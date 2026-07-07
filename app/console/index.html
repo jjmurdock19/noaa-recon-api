@@ -5,11 +5,20 @@
 <title>noaa-recon-api — admin console</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --font-primary: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-code: "Ubuntu Mono", ui-monospace, "SF Mono", Consolas, monospace;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; background: #0f172a; color: #e2e8f0;
-    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px;
+    font-family: var(--font-primary); font-size: 13px;
+  }
+  /* Filenames, cache keys, IDs, and other machine-generated/technical text —
+     kept monospace even though the rest of the console is now sans-serif. */
+  .code, .meta-table, #log-terminal, .nc-var-table {
+    font-family: var(--font-code);
   }
   header {
     display: flex; justify-content: space-between; align-items: center;
@@ -19,7 +28,7 @@
   header .sub { color: #64748b; font-size: 11px; }
   #logout-btn {
     background: #374151; border: 1px solid #4b5563; color: #d1d5db;
-    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+    padding: 5px 12px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 12px;
   }
   #logout-btn:hover { background: #4b5563; }
 
@@ -31,7 +40,7 @@
     min-height: 80vh; gap: 22px;
   }
   #public-stats-box {
-    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    background: #111827; border: 1px solid #334155; border-radius: 0;
     padding: 20px 24px; width: 320px;
   }
   #public-stats-box h2 {
@@ -42,25 +51,25 @@
   #public-stats-box .stat-card { flex: 1 1 120px; min-width: 90px; padding: 8px 10px; }
   #public-stats-box .status-text { font-size: 11px; }
   #login-box {
-    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    background: #111827; border: 1px solid #334155; border-radius: 0;
     padding: 28px 32px; width: 320px;
   }
   #login-box h2 { margin: 0 0 16px; font-size: 14px; color: #7dd3fc; }
   #login-box label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
   #login-box input {
     width: 100%; background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
-    padding: 7px 9px; border-radius: 4px; font-family: inherit; font-size: 13px; margin-bottom: 12px;
+    padding: 7px 9px; border-radius: 0; font-family: inherit; font-size: 13px; margin-bottom: 12px;
   }
   #login-box input:focus { outline: 1px solid #38bdf8; }
   #login-box button {
     width: 100%; background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
-    padding: 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 13px;
+    padding: 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 13px;
   }
   #login-box button:hover { background: #2563eb; }
   #login-error { color: #f87171; font-size: 11px; margin-top: 10px; min-height: 14px; }
 
   section {
-    background: #111827; border: 1px solid #334155; border-radius: 8px;
+    background: #111827; border: 1px solid #334155; border-radius: 0;
     padding: 16px 20px; margin-bottom: 18px;
   }
   section h2 {
@@ -69,25 +78,32 @@
   }
   .stat-row { display: flex; gap: 14px; flex-wrap: wrap; }
   .stat-card {
-    background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+    background: #1e293b; border: 1px solid #334155; border-radius: 0;
     padding: 10px 16px; min-width: 140px;
   }
   .stat-card .label { font-size: 10px; color: #94a3b8; text-transform: uppercase; }
   .stat-card .value { font-size: 20px; color: #e2e8f0; margin-top: 2px; }
 
-  /* Three-column post-login layout: preview pane (left) / archive (middle) / add-to-cache (right) */
+  /* Three-column post-login layout: preview pane (left) / archive (middle) / add-to-cache (right).
+     min-width: 0 on every column overrides the flex default of min-width: auto
+     (= the column's content's intrinsic width) — without it, a column holding
+     a wide table refuses to shrink below that content width and spills out
+     past its flex-allocated space, visually overlapping the neighboring
+     column instead of scrolling its own content (see .table-scroll below). */
   .console-columns { display: flex; align-items: flex-start; gap: 18px; }
-  .col-preview { display: none; flex: 1 1 320px; max-width: 540px; position: sticky; top: 16px; }
+  .col-preview { display: none; flex: 1 1 320px; max-width: 540px; min-width: 0; position: sticky; top: 16px; }
   .col-preview.active { display: block; }
   .col-archive { flex: 2 1 480px; min-width: 0; }
-  .col-add { flex: 1 1 340px; max-width: 420px; }
+  .col-add { flex: 1 1 340px; max-width: 420px; min-width: 0; }
   @media (max-width: 1050px) {
     .console-columns { flex-direction: column; }
     .col-preview, .col-archive, .col-add { max-width: none; width: 100%; position: static; }
   }
 
-  /* Scrolling frames for cache tables so a large cache doesn't blow up the page */
-  .table-scroll { max-height: 320px; overflow-y: auto; }
+  /* Scrolling frames for cache tables so a large cache doesn't blow up the page.
+     overflow-x here is what lets a table wider than its column scroll in
+     place instead of forcing the column (and its siblings) to overflow. */
+  .table-scroll { max-height: 320px; overflow: auto; }
   .table-scroll table { width: 100%; }
   .table-scroll thead th { position: sticky; top: 0; background: #111827; z-index: 1; }
 
@@ -95,19 +111,23 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1e293b; }
   th { color: #94a3b8; font-weight: normal; text-transform: uppercase; font-size: 10px; }
   tr:hover { background: #1e293b; }
+  /* Keep row-action buttons on one line — a narrowed column shrinks the
+     table (or scrolls, see .table-scroll) rather than wrapping the buttons
+     themselves onto a second line. */
+  .actions-cell { white-space: nowrap; }
   .del-btn {
     background: #7f1d1d; border: 1px solid #991b1b; color: #fca5a5;
-    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px;
+    padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px;
   }
   .del-btn:hover { background: #991b1b; }
   .error-btn {
     background: #78350f; border: 1px solid #92400e; color: #fdba74;
-    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
+    padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
   }
   .error-btn:hover { background: #92400e; }
   .clear-btn {
     background: #374151; border: 1px solid #4b5563; color: #fca5a5;
-    padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px;
+    padding: 4px 10px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 11px;
   }
   .clear-btn:hover { background: #4b5563; }
   .empty-row td { color: #475569; text-align: center; padding: 16px; }
@@ -117,12 +137,12 @@
   .field-label { font-size: 10px; color: #94a3b8; }
   input, select {
     background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
-    padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 12px;
+    padding: 5px 8px; border-radius: 0; font-family: inherit; font-size: 12px;
   }
   input:focus, select:focus { outline: 1px solid #38bdf8; }
   .primary-btn {
     background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
-    padding: 7px 16px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+    padding: 7px 16px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 12px;
   }
   .primary-btn:hover { background: #2563eb; }
   .primary-btn:disabled { background: #475569; border-color: #475569; cursor: not-allowed; }
@@ -130,23 +150,33 @@
   .status-text.ok { color: #4ade80; }
   .status-text.err { color: #f87171; }
   .status-text.working { color: #fbbf24; }
-  #query-result img { max-width: 100%; border-radius: 6px; margin-top: 10px; border: 1px solid #334155; }
+  #query-result img { max-width: 100%; border-radius: 0; margin-top: 10px; border: 1px solid #334155; }
   .view-btn {
     background: #1e3a5f; border: 1px solid #1d4ed8; color: #93c5fd;
-    padding: 3px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
+    padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
   }
   .view-btn:hover { background: #1d4ed8; color: #fff; }
   .preview-flex { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
-  .preview-flex img { max-width: 100%; max-height: 480px; border-radius: 6px; border: 1px solid #334155; }
+  .preview-flex img { max-width: 100%; max-height: 480px; border-radius: 0; border: 1px solid #334155; }
   .meta-table { border-collapse: collapse; font-size: 11px; min-width: 280px; }
   .meta-table td { padding: 4px 10px 4px 0; border-bottom: 1px solid #1e293b; vertical-align: top; }
   .meta-table td:first-child { color: #94a3b8; white-space: nowrap; }
   .nc-section-title { color: #7dd3fc; font-size: 11px; text-transform: uppercase; margin: 14px 0 6px; }
 
+  #log-terminal {
+    background: #000; border: 1px solid #334155;
+    height: 260px; overflow-y: auto; padding: 8px 10px;
+    font-size: 11px; line-height: 1.5;
+  }
+  .log-line { color: #86efac; white-space: pre-wrap; word-break: break-all; }
+  .log-line.log-warning { color: #fbbf24; }
+  .log-line.log-error { color: #f87171; }
+  #log-terminal:empty::before { content: "Waiting for log output…"; color: #475569; }
+
   #prefetch-progress {
     margin-top: 10px; display: none;
   }
-  .progress-bar-track { background: #1e293b; border-radius: 4px; height: 10px; overflow: hidden; }
+  .progress-bar-track { background: #1e293b; border-radius: 0; height: 10px; overflow: hidden; }
   .progress-bar-fill { background: #38bdf8; height: 100%; width: 0%; transition: width 0.3s; }
   .error-list { max-height: 120px; overflow-y: auto; font-size: 10px; color: #f87171; margin-top: 8px; }
 </style>
@@ -161,7 +191,7 @@
     </div>
   </div>
   <div id="login-box">
-    <h2>&#128272; noaa-recon-api console</h2>
+    <h2>noaa-recon-api console</h2>
     <label for="login-user">Username</label>
     <input type="text" id="login-user" autocomplete="username" />
     <label for="login-pass">Password</label>
@@ -173,7 +203,7 @@
 
 <header style="display:none;" id="app-header">
   <div>
-    <h1>&#128640; noaa-recon-api — admin console</h1>
+    <h1>noaa-recon-api — admin console</h1>
     <span class="sub">cache management, queries, and bulk prefetch</span>
   </div>
   <button id="logout-btn">Log out</button>
@@ -194,6 +224,17 @@
       <section>
         <h2>Status</h2>
         <div class="stat-row" id="status-cards"></div>
+      </section>
+
+      <section>
+        <h2>
+          <span>Log <span class="field-label">logs/app.log</span></span>
+          <span>
+            <button class="clear-btn" id="log-pause-btn">Pause</button>
+            <button class="clear-btn" id="log-clear-btn">Clear</button>
+          </span>
+        </h2>
+        <div id="log-terminal"></div>
       </section>
 
       <section>
@@ -410,6 +451,7 @@ function showApp() {
     document.getElementById('app-header').style.display = 'flex';
     document.getElementById('app-main').classList.add('shown');
     refreshAll();
+    pollLogs();
     startLiveRefresh();
 }
 
@@ -417,15 +459,27 @@ function showApp() {
 // process/add/delete files, without the operator having to hit refresh.
 // Only ticks while the tab is actually visible, so a console left open in a
 // background tab doesn't keep polling forever.
+//
+// Deliberately excludes the database viewer (refreshDbViewYears) — that
+// rebuilds the year/storm <select> options and wipes the loaded table from
+// scratch, so ticking it on the same 5s timer as everything else reset
+// whatever the operator was actively browsing every few seconds, making the
+// browser unusable. It's still refreshed once on login/on-demand (see
+// refreshAll), just never on the recurring timer.
 let liveRefreshTimer = null;
+let logsPollTimer = null;
 function startLiveRefresh() {
     stopLiveRefresh();
     liveRefreshTimer = setInterval(() => {
-        if (document.visibilityState === 'visible') refreshAll();
+        if (document.visibilityState === 'visible') refreshLive();
     }, 5000);
+    logsPollTimer = setInterval(() => {
+        if (document.visibilityState === 'visible') pollLogs();
+    }, 3000);
 }
 function stopLiveRefresh() {
     if (liveRefreshTimer) { clearInterval(liveRefreshTimer); liveRefreshTimer = null; }
+    if (logsPollTimer) { clearInterval(logsPollTimer); logsPollTimer = null; }
 }
 
 async function checkAuth() {
@@ -447,7 +501,7 @@ async function loadPublicStats() {
         const res = await fetch(API_BASE + '/v1/admin/public-stats');
         const data = await res.json();
         const cards = [
-            ['Health', data.healthy ? '&#128994; OK' : '&#128308; Down'],
+            ['Health', data.healthy ? '<span style="color:#4ade80;">OK</span>' : '<span style="color:#f87171;">Down</span>'],
             ['Calls (last hr)', data.calls_last_hour],
             ['Uptime', fmtUptime(data.uptime_seconds)],
         ];
@@ -532,7 +586,7 @@ async function refreshSatelliteCache() {
     }
     body.innerHTML = data.entries.map(e => `
         <tr>
-            <td title="${e.key}">${e.key.slice(0, 40)}${e.key.length > 40 ? '…' : ''}</td>
+            <td class="code" title="${e.key}">${e.key.slice(0, 40)}${e.key.length > 40 ? '…' : ''}</td>
             <td style="color:${e.status === 'error' ? '#f87171' : e.status === 'ready' ? '#4ade80' : '#fbbf24'};">${e.status || ''}</td>
             <td>${e.band ?? ''}</td>
             <td>${e.cmap ?? ''}</td>
@@ -540,7 +594,7 @@ async function refreshSatelliteCache() {
             <td>${e.center ? e.center.map(c => c.toFixed(2)).join(',') : 'full disk'}</td>
             <td>${fmtBytes(e.size_bytes)}</td>
             <td>${e.modified ? e.modified.slice(0, 16).replace('T', ' ') : ''}</td>
-            <td>
+            <td class="actions-cell">
                 <button class="view-btn" data-key="${e.key}">View</button>
                 ${e.status === 'error' ? `<button class="error-btn" data-key="${e.key}">Error</button>` : ''}
                 <button class="del-btn" data-key="${e.key}">Delete</button>
@@ -571,11 +625,11 @@ async function refreshGoesNcCache() {
     }
     body.innerHTML = data.entries.map(e => `
         <tr>
-            <td title="${e.filename}">${e.filename.slice(0, 50)}${e.filename.length > 50 ? '…' : ''}</td>
+            <td class="code" title="${e.filename}">${e.filename.slice(0, 50)}${e.filename.length > 50 ? '…' : ''}</td>
             <td>${e.scan_start ? e.scan_start.slice(0, 16).replace('T', ' ') : ''}</td>
             <td>${fmtBytes(e.size_bytes)}</td>
             <td>${e.modified.slice(0, 16).replace('T', ' ')}</td>
-            <td>
+            <td class="actions-cell">
                 <button class="view-btn" data-name="${e.filename}">View</button>
                 <button class="del-btn" data-name="${e.filename}">Delete</button>
             </td>
@@ -590,6 +644,67 @@ async function refreshGoesNcCache() {
         });
     });
 }
+
+// ── Log terminal ─────────────────────────────────────────────────────────
+// Polls /v1/admin/logs with the byte offset from the previous response, so
+// each tick only ships the log lines written since the last poll rather
+// than the whole file. Rendered with textContent (never innerHTML) so
+// nothing in a log line — e.g. a request path echoed by the access-log
+// middleware, which can contain attacker-controlled text from any CORS-open
+// caller — can execute as markup in the admin session.
+let _logOffset = 0;
+let _logPending = '';
+let _logPaused = false;
+
+function appendLogText(text) {
+    if (!text) return;
+    const combined = _logPending + text;
+    const lines = combined.split('\n');
+    _logPending = lines.pop(); // trailing partial line (or '' if text ended in \n) carries to next poll
+    if (!lines.length) return;
+
+    const term = document.getElementById('log-terminal');
+    const nearBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 40;
+
+    const frag = document.createDocumentFragment();
+    lines.forEach((line) => {
+        const div = document.createElement('div');
+        div.className = 'log-line' + (/\b(ERROR|CRITICAL)\b/.test(line) ? ' log-error' : /\bWARNING\b/.test(line) ? ' log-warning' : '');
+        div.textContent = line;
+        frag.appendChild(div);
+    });
+    term.appendChild(frag);
+
+    // Bound DOM size for a console left open for a long time.
+    while (term.childNodes.length > 2000) term.removeChild(term.firstChild);
+    if (nearBottom) term.scrollTop = term.scrollHeight;
+}
+
+async function pollLogs() {
+    if (_logPaused) return;
+    try {
+        const res = await api(`/v1/admin/logs?offset=${_logOffset}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.reset) {
+            document.getElementById('log-terminal').innerHTML = '';
+            _logPending = '';
+        }
+        _logOffset = data.offset;
+        appendLogText(data.text);
+    } catch (e) {
+        // Transient network hiccups shouldn't spam the terminal itself —
+        // status-card polling already surfaces connectivity issues.
+    }
+}
+
+document.getElementById('log-pause-btn').addEventListener('click', function () {
+    _logPaused = !_logPaused;
+    this.textContent = _logPaused ? 'Resume' : 'Pause';
+});
+document.getElementById('log-clear-btn').addEventListener('click', () => {
+    document.getElementById('log-terminal').innerHTML = '';
+});
 
 // ── Preview pane ───────────────────────────────────────────────────────
 function showPreview(html) {
@@ -621,7 +736,7 @@ function previewSatelliteError(key) {
     const e = _satelliteEntries.find(x => x.key === key);
     if (!e) return;
     showPreview(`
-        <div style="background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;padding:12px 16px;margin-bottom:14px;">
+        <div style="background:#450a0a;border:1px solid #7f1d1d;border-radius: 0;padding:12px 16px;margin-bottom:14px;">
             <div style="color:#fca5a5;font-weight:bold;margin-bottom:6px;">Error rendering ${key}</div>
             <div style="color:#fecaca;font-size:12px;white-space:pre-wrap;">${e.message || 'No error message recorded.'}</div>
         </div>
@@ -656,7 +771,7 @@ async function previewGoesNcEntry(filename) {
             <div class="nc-section-title">Dimensions</div>
             <table class="meta-table">${dimRows}</table>
             <div class="nc-section-title">Variables</div>
-            <table>
+            <table class="nc-var-table">
                 <thead><tr><th>Name</th><th>Dims</th><th>Shape</th><th>Dtype</th><th>Units</th><th>Long name</th></tr></thead>
                 <tbody>${varRows}</tbody>
             </table>
@@ -679,10 +794,16 @@ document.getElementById('clear-goesnc-btn').addEventListener('click', async () =
     refreshGoesNcCache(); refreshStatus();
 });
 
-function refreshAll() {
+// The subset that's safe to re-run on a recurring timer without disturbing
+// anything the operator is mid-interaction with (see startLiveRefresh above).
+function refreshLive() {
     refreshStatus();
     refreshSatelliteCache();
     refreshGoesNcCache();
+}
+
+function refreshAll() {
+    refreshLive();
     refreshDbViewYears();
 }
 
@@ -827,12 +948,12 @@ function renderDbViewTable(type, data) {
         const missions = data.missions || [];
         tbody.innerHTML = missions.length ? missions.map((m) => `
             <tr>
-                <td>${m.mission_id}</td><td>${m.aircraft ?? ''}</td><td>${m.tail_num ?? ''}</td>
+                <td class="code">${m.mission_id}</td><td>${m.aircraft ?? ''}</td><td class="code">${m.tail_num ?? ''}</td>
                 <td>${m.flight_date ?? ''}</td>
                 <td>${new Date(m.start_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
                 <td>${new Date(m.end_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
                 <td>${m.obs_count}</td>
-                <td><a class="view-btn" href="${API_BASE}/v1/recon/mission/${m.mission_id}/download" target="_blank" rel="noopener">Download</a></td>
+                <td class="actions-cell"><a class="view-btn" href="${API_BASE}/v1/recon/mission/${m.mission_id}/download" target="_blank" rel="noopener">Download</a></td>
             </tr>`).join('') : '<tr class="empty-row"><td colspan="8">No missions.</td></tr>';
         setDbViewStatus(`${missions.length} missions — ${data.storm_name} ${data.year}`, 'ok');
     }
