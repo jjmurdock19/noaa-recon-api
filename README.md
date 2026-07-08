@@ -1,103 +1,31 @@
-# noaa-recon-api
+# NOAA Satellite, Recon, and Hurricane API
 
-**Open-source HTTP API for archival GOES satellite imagery and NOAA Tail
-Doppler Radar data.** CORS-open, no auth, no API key — built for a
-hurricane tracker site, designed to be called from any website.
+**Open-source HTTP API for archival GOES satellite imagery, NOAA Tail
+Doppler Radar data, storm tracks, and aircraft reconaissance data.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Live API](https://img.shields.io/badge/API-live-brightgreen)](https://joshmurdock.net/api/docs)
 
-📖 **[API.md](API.md)** — full endpoint reference, every param, copy-paste
-curl/JavaScript/Python examples
-🤖 **[llms.txt](llms.txt)** — terse agent-discovery summary, also served
+**[API.md](API.md)** — full endpoint reference
+
+**[llms.txt](llms.txt)** — terse agent-discovery summary, also served
 live at `{base}/llms.txt`
 
-## Installation
 
-**Linux**
 
-Utilize the following install script to automatically install the API on your hardware. The installer works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and NixOS (`nix`) distros, and other distributions sharing one of these package managers.
-This install script creates a fully-configured, self-updating instance, including dependencies, systemd service, nginx/Apache + SSL support for self-hosted domains, and the storm/recon archives.
-
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
-```
-See **[INSTALL.md](INSTALL.md)** for a plain-language walkthrough of each prompt from the install wizard, or the
-["Manual setup"](#manual-setup) section below to do each step by hand.
-
-**Windows**
-
-The API can be deployed on Windows for local testing.
-
-```powershell
-irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
-```
-
-The API runs as a plain background process started/stopped by the user (`noaa-recon-api start`/`stop`). This is not a Windows
-Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)**.
-
-### Requirements
-
-**Linux** — Fedora/RHEL/Rocky/CentOS, Debian/Ubuntu, or a distro with the Nix
-package manager (anything with `dnf`, `apt`, or `nix` on `PATH`), plus `sudo`
-access so the installer can install packages and write system files (it does
-not need to be run as `root`). Everything else — git, Python 3.9+, a C
-compiler (needed to build `netCDF4`'s C extensions), and optionally nginx/
-Apache + certbot for HTTPS — is detected and installed automatically if
-missing; you don't need to pre-install any of it.
-
-**Windows** — git and Python 3.9+ (installed via `winget` if missing and you
-approve it; PowerShell is built in). Local-testing scope only — no reverse
-proxy, domain, or HTTPS, see above.
-
-**Python dependencies** (installed into an isolated virtualenv the installer
-creates — never your system Python): FastAPI, Uvicorn, netCDF4, NumPy,
-Pillow, httpx, itsdangerous, pypdf. Exact pinned versions are in
-[`pyproject.toml`](pyproject.toml).
-
-### What the installer does
-
-`install.sh` is a single self-contained Bash script — no external installer
-framework or package to fetch beyond the script itself:
-
-1. Detects your package manager (`dnf`/`apt`/`nix`) and installs git, Python
-   3, and a C compiler if any are missing.
-2. Clones this repo to an install directory of your choice
-   (`/opt/noaa-recon-api` by default).
-3. Creates a Python virtualenv inside that directory and installs the API's
-   dependencies into it — isolated from system Python.
-4. Writes and enables a **systemd service** so the API starts on boot and
-   restarts itself if it crashes.
-5. Optionally installs/configures **nginx or Apache** as a reverse proxy for
-   a domain deployment, and can request a free **Let's Encrypt** HTTPS
-   certificate via `certbot`.
-6. Builds the storm-track and recon MET archives (SQLite databases under
-   `data/`) and installs two nightly **systemd timers** to keep them current
-   going forward.
-7. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
-   `update`/`uninstall`) for living with the install afterward.
-
-Re-running the same one-liner on a machine that already has it installed
-offers **Update** (pull latest `main`, restart) or **Reconfigure** (re-run
-the wizard with your previous answers pre-filled as defaults) instead of
-installing a second copy. See [INSTALL.md](INSTALL.md) for a plain-language
-walkthrough of every prompt the wizard asks.
-
----
-
-## Hurricane Melissa, rendered by this API
-
-Real output from `GET /v1/satellite/tile` — GOES-19, Band 13 (Clean
+Output from `GET /v1/satellite/tile` — GOES-19, Band 13 (Clean
 Longwave IR), the `abi13` standard enhancement, a 1000 nautical-mile box
 centered on the storm (17.55°N, 78.14°W, 2025-10-28 12:00 UTC):
 
 ![Hurricane Melissa, GOES-19 Band 13, abi13 enhancement](docs/assets/melissa-abi13.jpg)
 
+Hurricane Melissa (2025)
+
 ```bash
 curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&band=13&center=17.55,-78.14&dims=1000&unit=nm"
 ```
 
-## What it does
+## What this API does
 
 - **Archival GOES satellite tiles on demand.** Give it any UTC timestamp
   (not just hourly buckets) and it finds the nearest real ABI scan
@@ -157,12 +85,89 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   can be cross-referenced from one API. Kept current by its own nightly
   systemd timer. See `GET /v1/recon/*` in API.md and "Recon MET archive" below.
 
-**Status:** MVP. Satellite tiles, storm tracks, and the recon MET archive
-are fully implemented and verified against live NOAA data. Band
-2/GeoColor, TDR, and the raw-netCDF passthrough are stubbed (`501 Not
+---
+
+# Installation
+
+**Linux**
+
+Utilize the following install script to automatically install the API on your hardware. The installer works on Fedora/RHEL/Rocky/CentOS (`dnf`), Debian/Ubuntu (`apt`), and NixOS (`nix`) distributions, and other distributions sharing one of these package managers.
+This install script creates a fully-configured, self-updating instance, including dependencies, systemd service, nginx/Apache + SSL support for self-hosted domains, and the storm/recon archives.
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.sh)"
+```
+See **[INSTALL.md](INSTALL.md)** for a plain-language walkthrough of each prompt from the install wizard, or the
+["Manual setup"](#manual-setup) section below to do each step by hand.
+
+**Windows**
+
+The API can be deployed on Windows for local testing.
+
+```powershell
+irm https://raw.githubusercontent.com/jjmurdock19/noaa-recon-api/main/install.ps1 | iex
+```
+
+The API runs as a plain background process started/stopped by the user (`noaa-recon-api start`/`stop`). This is not a Windows
+Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)**.
+
+### Requirements
+
+**Linux** — Fedora/RHEL/Rocky/CentOS, Debian/Ubuntu, or a distribution with the Nix
+package manager (anything with `dnf`, `apt`, or `nix` on `PATH`), plus `sudo`
+access so the installer can install packages and write system files (it does
+not need to be run as `root`). Everything else — git, Python 3.9+, a C
+compiler (needed to build `netCDF4`'s C extensions), and optionally nginx/
+Apache + certbot for HTTPS — is detected and installed automatically if
+missing; you don't need to pre-install any of it.
+
+**Windows** — git and Python 3.9+ (installed via `winget` if missing and you
+approve it; PowerShell is built in). Local-testing scope only — no reverse
+proxy, domain, or HTTPS, see above.
+
+**Python dependencies** (installed into an isolated virtualenv the installer
+creates — never your system Python): FastAPI, Uvicorn, netCDF4, NumPy,
+Pillow, httpx, itsdangerous, pypdf. Exact pinned versions are in
+[`pyproject.toml`](pyproject.toml).
+
+### What the installer does
+
+`install.sh` is a single self-contained Bash script — no external installer
+framework or package to fetch beyond the script itself:
+
+1. Detects your package manager (`dnf`/`apt`/`nix`) and installs git, Python
+   3, and a C compiler if any are missing.
+2. Clones this repo to an install directory of your choice
+   (`/opt/noaa-recon-api` by default).
+3. Creates a Python virtualenv inside that directory and installs the API's
+   dependencies into it — isolated from system Python.
+4. Writes and enables a **systemd service** so the API starts on boot and
+   restarts itself if it crashes.
+5. Optionally installs/configures **nginx or Apache** as a reverse proxy for
+   a domain deployment, and can request a free **Let's Encrypt** HTTPS
+   certificate via `certbot`.
+6. Builds the storm-track and recon MET archives (SQLite databases under
+   `data/`) and installs two nightly **systemd timers** to keep them current
+   going forward.
+7. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
+   `update`/`uninstall`) for living with the install afterward.
+
+Re-running the same one-liner on a machine that already has it installed
+offers **Update** (pull latest `main`, restart) or **Reconfigure** (re-run
+the wizard with your previous answers pre-filled as defaults) instead of
+installing a second copy. See [INSTALL.md](INSTALL.md) for a plain-language
+walkthrough of every prompt the wizard asks.
+
+---
+
+# Data Information
+
+
+**Status:** Undergoing active development. Satellite tiles, storm tracks, and the recon archive
+are fully implemented and verified against live NOAA data. TDR data is still in the works (`501 Not
 Implemented`) — see "Roadmap" below.
 
-## Data sources
+## Sources
 
 All data served by this API is fetched and cached from publicly-accessible NOAA data sources. Exact
 endpoints, for reproducibility and citation:
@@ -203,7 +208,7 @@ mission directory rather than the MET NetCDF file. See `app/routers/tdr.py`'s
 docstring for exactly what's missing (there's no manifest, so it needs a
 crawler over the mission-directory listing).
 
-## How the imagery is processed
+## Imagery Processing
 
 Every tile goes through the same four stages — `app/services/goes.py` is
 the whole pipeline, no external image-processing service involved:
@@ -239,7 +244,7 @@ the whole pipeline, no external image-processing service involved:
    where the satellite's view ends). Saved straight to the on-disk cache
    (`ResultCache`) that `/v1/satellite/status` and `png_url` read from.
 
-### Color grading — two different code paths, on purpose
+### Color grading
 
 `_colorize()` picks one of three strategies depending on the band/cmap,
 and which one matters for accuracy:
@@ -276,8 +281,7 @@ and which one matters for accuracy:
 guaranteed to match what a render actually produced — not a hand-copied
 approximation that can drift out of sync.
 
-### `product=sandwich` — how the composite is built
-
+**`product=sandwich`** 
 `render_sandwich_to_png()` colorizes Band 13 with the exact `abi13`
 enhancement, then **multiplies** every pixel's RGB by a brightness factor
 derived from Band 2 (visible) reflectance: `brightness = 0.35 + 0.65 *
@@ -291,19 +295,19 @@ signal to modulate with, so it falls back to a flat 0.35 brightness — a
 uniformly darkened plain-IR look, matching how real sandwich products
 behave outside daylight rather than hiding the night side entirely.
 
-### `product=geocolor` — how the composite is built
+**`product=geocolor`** 
 
 `render_geocolor_to_png()` is an explicitly-labeled **approximation**,
 not NOAA/CIRA's proprietary GeoColor algorithm (that includes full
 atmospheric/Rayleigh correction and a static city-lights layer this
 project has no access to). What it does instead:
 
-- **Day side:** synthetic true color from Bands 1 (blue) / 2 (red) / 3
+- **Day:** synthetic true color from Bands 1 (blue) / 2 (red) / 3
   (veggie/NIR) reflectance. ABI has no native green channel, so green is
-  synthesized with CIRA's published recipe —
-  `green = 0.45*red + 0.10*NIR + 0.45*blue` — the same formula behind most
+  synthesized with CIRA's published recipe
+  `green = 0.45*red + 0.10*NIR + 0.45*blue`, the same formula behind most
   open-source ABI "true color" composites (e.g. satpy's).
-- **Night side:** the standard `abi13` colorized IR, identical to the
+- **Night:** the standard `abi13` colorized IR, identical to the
   standalone Band 13 product.
 - **Terminator blend:** `_solar_zenith_deg()` computes a low-precision
   per-pixel solar zenith angle (NOAA/Spencer Fourier-series approximation
@@ -312,12 +316,8 @@ project has no access to). What it does instead:
   several-degree-wide blend, not ephemeris-grade). Full day color inside
   ~85° zenith, full night IR beyond ~95°, linearly blended across that
   ~10° terminator band in between.
-- **What's missing vs. the real thing:** no city-lights layer, no
-  aerosol/Rayleigh atmospheric correction. It's a defensible
-  approximation of "which side of the planet is lit and what does it
-  roughly look like", not a faithful reproduction of the licensed
-  product some tools call GeoColor — `GET /v1/satellite/products` states
-  this same caveat in machine-readable form so a client can surface it.
+- **Missing versus true Geocolor:** no city-lights, no
+  aerosol/Rayleigh atmospheric correction.
 
 Both composites crop and read each companion band directly from its
 source file at a stride for a bbox request (`_read_source_cropped()`)
@@ -340,22 +340,9 @@ client-side; `?product=sandwich`/`geocolor` returns the single fixed
 enhancement a composite uses instead, since composites don't take a
 `cmap` choice. See API.md for both.
 
-## Try it right now
-
-Try loading a live demo image:
-
-```bash
-curl "https://joshmurdock.net/api/v1/satellite/tile?time=2026-07-01T12:00:00Z&band=13"
-```
-
-After the image is generated, the API will serve an image URL.
-
-See [API.md](API.md) for the full reference and curl/JavaScript/Python
-integration examples.
-
 ---
 
-## Architecture
+# Architecture
 
 ```mermaid
 flowchart LR
