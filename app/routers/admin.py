@@ -5,6 +5,7 @@ app/auth.py). The console frontend (app/console/index.html) is the only
 intended caller, but these are just JSON endpoints — nothing stops other
 authenticated tooling from using them too.
 """
+import asyncio
 import datetime
 import json
 import uuid
@@ -17,7 +18,7 @@ from app import auth
 from app.logging_config import LOG_FILE
 from app.paths import CACHE_ROOT, RECON_MET_DB_PATH, STORMS_DB_PATH
 from app.routers.satellite import VALID_BANDS, VALID_CMAPS, _cache, _nc_cache_dir, _parse_center
-from app.services import goes, recon_met, stats, storms
+from app.services import goes, recon_met, self_update, stats, storms
 from app.services.netcdf_lock import NC_LOCK
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -416,3 +417,55 @@ async def get_archive_update_status(archive: str):
     if archive not in _archive_update_jobs:
         raise HTTPException(404, f"Unknown archive: {archive} (expected 'storms' or 'recon_met')")
     return _archive_update_jobs[archive]
+
+
+# ── Self-update (pull latest code from GitHub, then restart) ───────────
+# See app/services/self_update.py for the git/restart mechanics. A
+# background task (app/main.py, started at app startup) periodically
+# refreshes the cached check below so the console can show an "update
+# available" badge without the operator having to click anything; actually
+# pulling + restarting only ever happens from the explicit apply endpoint.
+_self_update_job: dict = {
+    "status": "idle", "started_at": None, "finished_at": None,
+    "result": None, "error": None, "new_commit": None,
+}
+_SELF_UPDATE_IN_PROGRESS_STATUSES = {"checking", "pulling", "installing_dependencies"}
+
+
+@router.get("/self-update/status", dependencies=[Depends(auth.require_login)])
+async def get_self_update_status():
+    return {"check": self_update.get_cached_check(), "job": _self_update_job}
+
+
+@router.post("/self-update/check", dependencies=[Depends(auth.require_login)])
+async def force_self_update_check():
+    """'Check now' button — bypasses the periodic timer for an immediate fetch."""
+    try:
+        result = await asyncio.to_thread(self_update.check_for_update)
+    except Exception as e:  # noqa: BLE001 - surfaced to the console as the check's own error
+        self_update.set_cached_check(None, error=str(e))
+        raise HTTPException(502, f"Update check failed: {e}") from e
+    self_update.set_cached_check(result, error=None)
+    return self_update.get_cached_check()
+
+
+def _run_self_update():
+    self_update.apply_update(_self_update_job)
+
+
+@router.post("/self-update/apply", dependencies=[Depends(auth.require_login)])
+async def start_self_update(background_tasks: BackgroundTasks):
+    if _self_update_job["status"] in _SELF_UPDATE_IN_PROGRESS_STATUSES:
+        raise HTTPException(409, "An update is already in progress")
+    _self_update_job.update(
+        status="checking",
+        started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        finished_at=None, result=None, error=None, new_commit=None,
+    )
+    background_tasks.add_task(_run_self_update)
+    return _self_update_job
+
+
+@router.get("/self-update/apply", dependencies=[Depends(auth.require_login)])
+async def get_self_update_job():
+    return _self_update_job

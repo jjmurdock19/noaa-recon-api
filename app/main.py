@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -11,7 +12,14 @@ from app import auth
 from app.logging_config import configure_logging
 from app.paths import CACHE_ROOT, REPO_ROOT
 from app.routers import admin, health, raw, recon, satellite, storms, tdr
-from app.services import stats
+from app.services import self_update, stats
+
+# How often the background task below checks GitHub for new commits. This
+# only ever updates the cached "is an update available" status the console
+# reads (app/routers/admin.py's /self-update/status) — it never pulls or
+# restarts by itself; that's exclusively triggered by an operator hitting
+# "Update now" in the console (see app/services/self_update.py).
+SELF_UPDATE_CHECK_INTERVAL_SECONDS = 1800
 
 configure_logging()
 access_log = logging.getLogger("noaa_recon_api.access")
@@ -82,6 +90,19 @@ app.include_router(raw.router, prefix="/v1")
 app.include_router(storms.router, prefix="/v1")
 app.include_router(recon.router, prefix="/v1")
 app.include_router(admin.router, prefix="/v1")
+
+
+@app.on_event("startup")
+async def _start_self_update_checker():
+    async def _loop():
+        while True:
+            try:
+                result = await asyncio.to_thread(self_update.check_for_update)
+                self_update.set_cached_check(result, error=None)
+            except Exception as e:  # noqa: BLE001 - keep the loop alive; console surfaces the error
+                self_update.set_cached_check(None, error=str(e))
+            await asyncio.sleep(SELF_UPDATE_CHECK_INTERVAL_SECONDS)
+    asyncio.create_task(_loop())
 
 
 @app.get("/llms.txt", response_class=PlainTextResponse, tags=["docs"])

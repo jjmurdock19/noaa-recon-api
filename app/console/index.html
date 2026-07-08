@@ -4,33 +4,150 @@
 <meta charset="utf-8">
 <title>noaa-recon-api — admin console</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script>
+// Runs before the stylesheet paints so an explicit light/dark choice
+// (persisted from a prior visit) applies immediately instead of flashing
+// the OS-default theme for a frame. "auto" leaves no attribute set, so the
+// prefers-color-scheme media queries in <style> decide instead.
+(function () {
+    try {
+        var t = localStorage.getItem('nra-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+})();
+</script>
 <style>
+  /* Theme system: CSS variables define the palette once per theme. "Auto"
+     mode has no data-theme attribute set, so it falls through to the
+     prefers-color-scheme media queries below and follows the OS. Explicit
+     light/dark (set via the toggle button, persisted in localStorage, and
+     applied by the inline head script before first paint) sets
+     data-theme="light|dark" on <html>, which overrides the OS preference. */
   :root {
     color-scheme: dark;
     --font-primary: "Helvetica Neue", Helvetica, Arial, sans-serif;
     --font-code: "Ubuntu Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+    /* Neutral (non-blue) grayscale — dark palette, default/auto-dark */
+    --bg: #141414;
+    --bg-panel: #1c1c1c;
+    --bg-input: #232323;
+    --bg-hover: #272727;
+    --border: #3a3a3a;
+    --border-strong: #4d4d4d;
+    --text: #e8e8e8;
+    --text-muted: #a0a0a0;
+    --text-faint: #707070;
+    --text-heading: #f5f5f5;
+
+    /* Single muted steel-blue accent — used sparingly (buttons, links,
+       focus rings, active states), never on headings. */
+    --accent: #6b8caf;
+    --accent-strong: #4f6f93;
+    --accent-strong-hover: #3d5873;
+    --accent-soft-bg: #23313c;
+    --accent-soft-border: #3d5873;
+
+    --success: #4ade80;
+    --warning: #fbbf24;
+    --error: #f87171;
+    --error-soft-bg: #3a1414;
+    --error-soft-border: #5c2323;
+    --warning-soft-bg: #3a2a10;
+    --warning-soft-border: #5c4419;
+
+    --btn-neutral-bg: #2e2e2e;
+    --btn-neutral-border: #474747;
+    --btn-neutral-hover: #3c3c3c;
+    --btn-neutral-text: #d4d4d4;
+
+    /* Log terminal stays a fixed dark pane regardless of theme, like any
+       terminal emulator — not overridden by the light-mode block below. */
+    --terminal-bg: #000;
+    --terminal-border: var(--border);
   }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f5f5f5;
+      --bg-panel: #ffffff;
+      --bg-input: #f0f0f0;
+      --bg-hover: #ececec;
+      --border: #d9d9d9;
+      --border-strong: #bdbdbd;
+      --text: #262626;
+      --text-muted: #6b6b6b;
+      --text-faint: #999999;
+      --text-heading: #141414;
+
+      --accent: #3d5873;
+      --accent-soft-bg: #e3ebf2;
+      --accent-soft-border: #b7c9d8;
+
+      --success: #16a34a;
+      --warning: #b45309;
+      --error: #dc2626;
+      --error-soft-bg: #fee2e2;
+      --error-soft-border: #fecaca;
+      --warning-soft-bg: #fef3c7;
+      --warning-soft-border: #fde68a;
+
+      --btn-neutral-bg: #e8e8e8;
+      --btn-neutral-border: #cccccc;
+      --btn-neutral-hover: #d8d8d8;
+      --btn-neutral-text: #333333;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #141414; --bg-panel: #1c1c1c; --bg-input: #232323; --bg-hover: #272727;
+    --border: #3a3a3a; --border-strong: #4d4d4d;
+    --text: #e8e8e8; --text-muted: #a0a0a0; --text-faint: #707070; --text-heading: #f5f5f5;
+    --accent: #6b8caf; --accent-soft-bg: #23313c; --accent-soft-border: #3d5873;
+    --success: #4ade80; --warning: #fbbf24; --error: #f87171;
+    --error-soft-bg: #3a1414; --error-soft-border: #5c2323;
+    --warning-soft-bg: #3a2a10; --warning-soft-border: #5c4419;
+    --btn-neutral-bg: #2e2e2e; --btn-neutral-border: #474747; --btn-neutral-hover: #3c3c3c; --btn-neutral-text: #d4d4d4;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f5f5f5; --bg-panel: #ffffff; --bg-input: #f0f0f0; --bg-hover: #ececec;
+    --border: #d9d9d9; --border-strong: #bdbdbd;
+    --text: #262626; --text-muted: #6b6b6b; --text-faint: #999999; --text-heading: #141414;
+    --accent: #3d5873; --accent-soft-bg: #e3ebf2; --accent-soft-border: #b7c9d8;
+    --success: #16a34a; --warning: #b45309; --error: #dc2626;
+    --error-soft-bg: #fee2e2; --error-soft-border: #fecaca;
+    --warning-soft-bg: #fef3c7; --warning-soft-border: #fde68a;
+    --btn-neutral-bg: #e8e8e8; --btn-neutral-border: #cccccc; --btn-neutral-hover: #d8d8d8; --btn-neutral-text: #333333;
+  }
+
   * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; background: #0f172a; color: #e2e8f0;
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
     font-family: var(--font-primary); font-size: 13px;
   }
   /* Filenames, cache keys, IDs, and other machine-generated/technical text —
      kept monospace even though the rest of the console is now sans-serif. */
-  .code, .meta-table, #log-terminal, .nc-var-table {
+  .code, .meta-table, #log-terminal, .nc-var-name, .nc-kv-list {
     font-family: var(--font-code);
   }
   header {
     display: flex; justify-content: space-between; align-items: center;
-    padding: 14px 24px; border-bottom: 1px solid #334155; background: #111827;
+    padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--bg-panel);
   }
-  header h1 { font-size: 15px; margin: 0; color: #7dd3fc; }
-  header .sub { color: #64748b; font-size: 11px; }
-  #logout-btn {
-    background: #374151; border: 1px solid #4b5563; color: #d1d5db;
+  header h1 { font-size: 15px; margin: 0; color: var(--text-heading); }
+  header .sub { color: var(--text-faint); font-size: 11px; }
+  header .header-actions { display: flex; align-items: center; gap: 10px; }
+  .theme-toggle-btn {
+    background: var(--btn-neutral-bg); border: 1px solid var(--btn-neutral-border); color: var(--btn-neutral-text);
     padding: 5px 12px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 12px;
   }
-  #logout-btn:hover { background: #4b5563; }
+  .theme-toggle-btn:hover { background: var(--btn-neutral-hover); }
+  #logout-btn {
+    background: var(--btn-neutral-bg); border: 1px solid var(--btn-neutral-border); color: var(--btn-neutral-text);
+    padding: 5px 12px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  #logout-btn:hover { background: var(--btn-neutral-hover); }
 
   main { max-width: 1900px; width: 96%; margin: 0 auto; padding: 24px; display: none; }
   main.shown { display: block; }
@@ -40,49 +157,49 @@
     min-height: 80vh; gap: 22px;
   }
   #public-stats-box {
-    background: #111827; border: 1px solid #334155; border-radius: 0;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 0;
     padding: 20px 24px; width: 320px;
   }
   #public-stats-box h2 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7dd3fc;
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-heading);
     margin: 0 0 12px;
   }
   #public-stats-box .stat-row { display: flex; gap: 10px; flex-wrap: wrap; }
   #public-stats-box .stat-card { flex: 1 1 120px; min-width: 90px; padding: 8px 10px; }
   #public-stats-box .status-text { font-size: 11px; }
   #login-box {
-    background: #111827; border: 1px solid #334155; border-radius: 0;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 0;
     padding: 28px 32px; width: 320px;
   }
-  #login-box h2 { margin: 0 0 16px; font-size: 14px; color: #7dd3fc; }
-  #login-box label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+  #login-box h2 { margin: 0 0 16px; font-size: 14px; color: var(--text-heading); }
+  #login-box label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
   #login-box input {
-    width: 100%; background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
+    width: 100%; background: var(--bg-input); border: 1px solid var(--border-strong); color: var(--text);
     padding: 7px 9px; border-radius: 0; font-family: inherit; font-size: 13px; margin-bottom: 12px;
   }
-  #login-box input:focus { outline: 1px solid #38bdf8; }
+  #login-box input:focus { outline: 1px solid var(--accent); }
   #login-box button {
-    width: 100%; background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
+    width: 100%; background: var(--accent-strong); border: 1px solid var(--accent); color: #fff;
     padding: 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 13px;
   }
-  #login-box button:hover { background: #2563eb; }
-  #login-error { color: #f87171; font-size: 11px; margin-top: 10px; min-height: 14px; }
+  #login-box button:hover { background: var(--accent-strong-hover); }
+  #login-error { color: var(--error); font-size: 11px; margin-top: 10px; min-height: 14px; }
 
   section {
-    background: #111827; border: 1px solid #334155; border-radius: 0;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 0;
     padding: 16px 20px; margin-bottom: 18px;
   }
   section h2 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7dd3fc;
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-heading);
     margin: 0 0 12px; display: flex; align-items: center; gap: 8px; justify-content: space-between;
   }
   .stat-row { display: flex; gap: 14px; flex-wrap: wrap; }
   .stat-card {
-    background: #1e293b; border: 1px solid #334155; border-radius: 0;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 0;
     padding: 10px 16px; min-width: 140px;
   }
-  .stat-card .label { font-size: 10px; color: #94a3b8; text-transform: uppercase; }
-  .stat-card .value { font-size: 20px; color: #e2e8f0; margin-top: 2px; }
+  .stat-card .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+  .stat-card .value { font-size: 20px; color: var(--text-heading); margin-top: 2px; }
 
   /* Three-column post-login layout: preview pane (left) / archive (middle) / add-to-cache (right).
      min-width: 0 on every column overrides the flex default of min-width: auto
@@ -91,7 +208,7 @@
      past its flex-allocated space, visually overlapping the neighboring
      column instead of scrolling its own content (see .table-scroll below). */
   .console-columns { display: flex; align-items: flex-start; gap: 18px; }
-  .col-preview { display: none; flex: 1 1 320px; max-width: 540px; min-width: 0; position: sticky; top: 16px; }
+  .col-preview { display: none; flex: 1 1 320px; max-width: 540px; min-width: 0; position: sticky; top: 16px; overflow-x: hidden; }
   .col-preview.active { display: block; }
   .col-archive { flex: 2 1 480px; min-width: 0; }
   .col-add { flex: 1 1 340px; max-width: 420px; min-width: 0; }
@@ -105,85 +222,112 @@
      place instead of forcing the column (and its siblings) to overflow. */
   .table-scroll { max-height: 320px; overflow: auto; }
   .table-scroll table { width: 100%; }
-  .table-scroll thead th { position: sticky; top: 0; background: #111827; z-index: 1; }
+  .table-scroll thead th { position: sticky; top: 0; background: var(--bg-panel); z-index: 1; }
 
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1e293b; }
-  th { color: #94a3b8; font-weight: normal; text-transform: uppercase; font-size: 10px; }
-  tr:hover { background: #1e293b; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-muted); font-weight: normal; text-transform: uppercase; font-size: 10px; }
+  tr:hover { background: var(--bg-hover); }
   /* Keep row-action buttons on one line — a narrowed column shrinks the
      table (or scrolls, see .table-scroll) rather than wrapping the buttons
      themselves onto a second line. */
   .actions-cell { white-space: nowrap; }
   .del-btn {
-    background: #7f1d1d; border: 1px solid #991b1b; color: #fca5a5;
+    background: var(--error-soft-bg); border: 1px solid var(--error-soft-border); color: var(--error);
     padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px;
   }
-  .del-btn:hover { background: #991b1b; }
+  .del-btn:hover { background: var(--error-soft-border); }
   .error-btn {
-    background: #78350f; border: 1px solid #92400e; color: #fdba74;
+    background: var(--warning-soft-bg); border: 1px solid var(--warning-soft-border); color: var(--warning);
     padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
   }
-  .error-btn:hover { background: #92400e; }
+  .error-btn:hover { background: var(--warning-soft-border); }
   .clear-btn {
-    background: #374151; border: 1px solid #4b5563; color: #fca5a5;
+    background: var(--btn-neutral-bg); border: 1px solid var(--btn-neutral-border); color: var(--error);
     padding: 4px 10px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 11px;
   }
-  .clear-btn:hover { background: #4b5563; }
-  .empty-row td { color: #475569; text-align: center; padding: 16px; }
+  .clear-btn:hover { background: var(--btn-neutral-hover); }
+  .empty-row td { color: var(--text-faint); text-align: center; padding: 16px; }
 
   .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
   .field-group { display: flex; flex-direction: column; gap: 3px; }
-  .field-label { font-size: 10px; color: #94a3b8; }
+  .field-label { font-size: 10px; color: var(--text-muted); }
   input, select {
-    background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
+    background: var(--bg-input); border: 1px solid var(--border-strong); color: var(--text);
     padding: 5px 8px; border-radius: 0; font-family: inherit; font-size: 12px;
   }
-  input:focus, select:focus { outline: 1px solid #38bdf8; }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
   .primary-btn {
-    background: #1d4ed8; border: 1px solid #3b82f6; color: #fff;
+    background: var(--accent-strong); border: 1px solid var(--accent); color: #fff;
     padding: 7px 16px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 12px;
   }
-  .primary-btn:hover { background: #2563eb; }
-  .primary-btn:disabled { background: #475569; border-color: #475569; cursor: not-allowed; }
-  .status-text { color: #94a3b8; font-size: 11px; flex: 1; min-width: 200px; }
-  .status-text.ok { color: #4ade80; }
-  .status-text.err { color: #f87171; }
-  .status-text.working { color: #fbbf24; }
-  #query-result img { max-width: 100%; border-radius: 0; margin-top: 10px; border: 1px solid #334155; }
+  .primary-btn:hover { background: var(--accent-strong-hover); }
+  .primary-btn:disabled { background: var(--border-strong); border-color: var(--border-strong); cursor: not-allowed; }
+  .status-text { color: var(--text-muted); font-size: 11px; flex: 1; min-width: 200px; }
+  .status-text.ok { color: var(--success); }
+  .status-text.err { color: var(--error); }
+  .status-text.working { color: var(--warning); }
+  .fg-success { color: var(--success); }
+  .fg-warning { color: var(--warning); }
+  .fg-error { color: var(--error); }
+  #query-result img { max-width: 100%; border-radius: 0; margin-top: 10px; border: 1px solid var(--border); }
   .view-btn {
-    background: #1e3a5f; border: 1px solid #1d4ed8; color: #93c5fd;
+    background: var(--accent-soft-bg); border: 1px solid var(--accent-soft-border); color: var(--accent);
     padding: 3px 8px; border-radius: 0; cursor: pointer; font-family: inherit; font-size: 10px; margin-right: 4px;
   }
-  .view-btn:hover { background: #1d4ed8; color: #fff; }
+  .view-btn:hover { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
   .preview-flex { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
-  .preview-flex img { max-width: 100%; max-height: 480px; border-radius: 0; border: 1px solid #334155; }
-  .meta-table { border-collapse: collapse; font-size: 11px; min-width: 280px; }
-  .meta-table td { padding: 4px 10px 4px 0; border-bottom: 1px solid #1e293b; vertical-align: top; }
-  .meta-table td:first-child { color: #94a3b8; white-space: nowrap; }
-  .nc-section-title { color: #7dd3fc; font-size: 11px; text-transform: uppercase; margin: 14px 0 6px; }
+  .preview-flex img { max-width: 100%; max-height: 480px; border-radius: 0; border: 1px solid var(--border); }
+  .meta-table { border-collapse: collapse; font-size: 11px; min-width: 280px; width: 100%; table-layout: fixed; }
+  .meta-table td { padding: 4px 10px 4px 0; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+  .meta-table td:first-child { color: var(--text-muted); white-space: nowrap; width: 34%; }
+
+  /* Compact netCDF preview: headings (.nc-section-title) with subheadings
+     beneath, instead of wide multi-column tables — the preview pane is only
+     ~320-540px, and a 6-column table there forces long variable names/units/
+     descriptions to overflow past the column edge and visually bleed into
+     the middle (archive/cache) column next to it. Every value below wraps
+     via overflow-wrap instead of growing the box outward. */
+  .nc-section-title { color: var(--text-heading); font-size: 11px; text-transform: uppercase; margin: 14px 0 6px; }
+  .nc-kv-list { display: flex; flex-direction: column; }
+  .nc-kv-row { display: flex; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
+  .nc-kv-row .k { color: var(--text-muted); flex: 0 0 34%; overflow-wrap: anywhere; }
+  .nc-kv-row .v { color: var(--text); flex: 1 1 auto; overflow-wrap: anywhere; min-width: 0; }
+  .nc-var-block { padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .nc-var-name { color: var(--text-heading); font-size: 11.5px; overflow-wrap: anywhere; }
+  .nc-var-name .dtype { color: var(--text-faint); margin-left: 6px; }
+  .nc-var-sub, .nc-var-desc { color: var(--text-muted); font-size: 10.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .nc-var-desc { color: var(--text); }
 
   #log-terminal {
-    background: #000; border: 1px solid #334155;
+    background: var(--terminal-bg); border: 1px solid var(--terminal-border);
     height: 260px; overflow-y: auto; padding: 8px 10px;
     font-size: 11px; line-height: 1.5;
   }
   .log-line { color: #86efac; white-space: pre-wrap; word-break: break-all; }
   .log-line.log-warning { color: #fbbf24; }
   .log-line.log-error { color: #f87171; }
-  #log-terminal:empty::before { content: "Waiting for log output…"; color: #475569; }
+  #log-terminal:empty::before { content: "Waiting for log output…"; color: var(--text-faint); }
 
   #prefetch-progress {
     margin-top: 10px; display: none;
   }
-  .progress-bar-track { background: #1e293b; border-radius: 0; height: 10px; overflow: hidden; }
-  .progress-bar-fill { background: #38bdf8; height: 100%; width: 0%; transition: width 0.3s; }
-  .error-list { max-height: 120px; overflow-y: auto; font-size: 10px; color: #f87171; margin-top: 8px; }
+  .progress-bar-track { background: var(--bg-input); border-radius: 0; height: 10px; overflow: hidden; }
+  .progress-bar-fill { background: var(--accent-strong); height: 100%; width: 0%; transition: width 0.3s; }
+  .error-list { max-height: 120px; overflow-y: auto; font-size: 10px; color: var(--error); margin-top: 8px; }
+
+  .error-box {
+    background: var(--error-soft-bg); border: 1px solid var(--error-soft-border);
+    border-radius: 0; padding: 12px 16px; margin-bottom: 14px;
+  }
+  .error-box-title { color: var(--error); font-weight: bold; margin-bottom: 6px; }
+  .error-box-msg { color: var(--text); font-size: 12px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
 <div id="login-wrap">
+  <button class="theme-toggle-btn" title="Cycle theme: auto / light / dark">Theme: Auto</button>
   <div id="public-stats-box">
     <h2>API status</h2>
     <div class="stat-row" id="public-stat-cards">
@@ -206,7 +350,10 @@
     <h1>noaa-recon-api — admin console</h1>
     <span class="sub">cache management, queries, and bulk prefetch</span>
   </div>
-  <button id="logout-btn">Log out</button>
+  <div class="header-actions">
+    <button class="theme-toggle-btn" title="Cycle theme: auto / light / dark">Theme: Auto</button>
+    <button id="logout-btn">Log out</button>
+  </div>
 </header>
 
 <main id="app-main">
@@ -224,6 +371,18 @@
       <section>
         <h2>Status</h2>
         <div class="stat-row" id="status-cards"></div>
+      </section>
+
+      <section>
+        <h2>API update</h2>
+        <div class="row">
+          <span class="status-text" id="self-update-status">Checking…</span>
+        </div>
+        <div class="row">
+          <button class="primary-btn" id="self-update-check-btn">Check for updates</button>
+          <button class="primary-btn" id="self-update-apply-btn" disabled>Update &amp; restart</button>
+        </div>
+        <div class="error-list" id="self-update-log" style="display:none; color: var(--text-muted);"></div>
       </section>
 
       <section>
@@ -250,7 +409,7 @@
           <span class="status-text" id="reconmet-update-status"></span>
         </div>
 
-        <div class="row" style="margin-top:16px; border-top:1px solid #334155; padding-top:14px;">
+        <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
             <span class="field-label">Database</span>
             <select id="db-view-type">
@@ -424,6 +583,31 @@ const API_BASE = window.location.pathname.replace(/\/$/, '');
 const $ = (id) => document.getElementById(id);
 let prefetchPollTimer = null;
 
+// ── Theme toggle — cycles auto -> light -> dark -> auto. "auto" removes the
+// data-theme attribute so the prefers-color-scheme rules in <style> take
+// over and the console follows the OS; light/dark force an explicit choice
+// and persist it, applied pre-paint by the inline <head> script.
+const THEME_KEY = 'nra-theme';
+function applyTheme(mode) {
+    if (mode === 'light' || mode === 'dark') {
+        document.documentElement.setAttribute('data-theme', mode);
+    } else {
+        mode = 'auto';
+        document.documentElement.removeAttribute('data-theme');
+    }
+    localStorage.setItem(THEME_KEY, mode);
+    document.querySelectorAll('.theme-toggle-btn').forEach((btn) => {
+        btn.textContent = 'Theme: ' + mode[0].toUpperCase() + mode.slice(1);
+    });
+}
+document.querySelectorAll('.theme-toggle-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const current = localStorage.getItem(THEME_KEY) || 'auto';
+        applyTheme(current === 'auto' ? 'light' : current === 'light' ? 'dark' : 'auto');
+    });
+});
+applyTheme(localStorage.getItem(THEME_KEY) || 'auto');
+
 function fmtBytes(n) {
     if (n == null) return '—';
     const units = ['B', 'KB', 'MB', 'GB'];
@@ -501,7 +685,7 @@ async function loadPublicStats() {
         const res = await fetch(API_BASE + '/v1/admin/public-stats');
         const data = await res.json();
         const cards = [
-            ['Health', data.healthy ? '<span style="color:#4ade80;">OK</span>' : '<span style="color:#f87171;">Down</span>'],
+            ['Health', data.healthy ? '<span class="fg-success">OK</span>' : '<span class="fg-error">Down</span>'],
             ['Calls (last hr)', data.calls_last_hour],
             ['Uptime', fmtUptime(data.uptime_seconds)],
         ];
@@ -587,7 +771,7 @@ async function refreshSatelliteCache() {
     body.innerHTML = data.entries.map(e => `
         <tr>
             <td class="code" title="${e.key}">${e.key.slice(0, 40)}${e.key.length > 40 ? '…' : ''}</td>
-            <td style="color:${e.status === 'error' ? '#f87171' : e.status === 'ready' ? '#4ade80' : '#fbbf24'};">${e.status || ''}</td>
+            <td class="${e.status === 'error' ? 'fg-error' : e.status === 'ready' ? 'fg-success' : 'fg-warning'}">${e.status || ''}</td>
             <td>${e.band ?? ''}</td>
             <td>${e.cmap ?? ''}</td>
             <td>${e.satellite ?? ''}</td>
@@ -736,9 +920,9 @@ function previewSatelliteError(key) {
     const e = _satelliteEntries.find(x => x.key === key);
     if (!e) return;
     showPreview(`
-        <div style="background:#450a0a;border:1px solid #7f1d1d;border-radius: 0;padding:12px 16px;margin-bottom:14px;">
-            <div style="color:#fca5a5;font-weight:bold;margin-bottom:6px;">Error rendering ${key}</div>
-            <div style="color:#fecaca;font-size:12px;white-space:pre-wrap;">${e.message || 'No error message recorded.'}</div>
+        <div class="error-box">
+            <div class="error-box-title">Error rendering ${key}</div>
+            <div class="error-box-msg">${e.message || 'No error message recorded.'}</div>
         </div>
         <button class="view-btn" id="preview-error-full-btn">Show full metadata</button>
     `);
@@ -755,28 +939,24 @@ async function previewGoesNcEntry(filename) {
             return;
         }
         const info = await res.json();
-        const dimRows = Object.entries(info.dimensions).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
-        const varRows = info.variables.map(v => `
-            <tr>
-                <td>${v.name}</td>
-                <td>${v.dimensions.join(', ')}</td>
-                <td>${v.shape.join(' x ')}</td>
-                <td>${v.dtype}</td>
-                <td>${v.units || ''}</td>
-                <td>${v.long_name || ''}</td>
-            </tr>`).join('');
-        const attrRows = Object.entries(info.global_attrs).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+        const dimRows = Object.entries(info.dimensions).map(([k, v]) => `
+            <div class="nc-kv-row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+        const varBlocks = info.variables.map(v => `
+            <div class="nc-var-block">
+                <div class="nc-var-name">${v.name}<span class="dtype">${v.dtype}</span></div>
+                <div class="nc-var-sub">${v.dimensions.join(', ') || '—'} · ${v.shape.join(' x ') || '—'}${v.units ? ` · ${v.units}` : ''}</div>
+                ${v.long_name ? `<div class="nc-var-desc">${v.long_name}</div>` : ''}
+            </div>`).join('');
+        const attrRows = Object.entries(info.global_attrs).map(([k, v]) => `
+            <div class="nc-kv-row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
         showPreview(`
             <div class="status-text">${filename} — ${fmtBytes(info.size_bytes)}</div>
             <div class="nc-section-title">Dimensions</div>
-            <table class="meta-table">${dimRows}</table>
-            <div class="nc-section-title">Variables</div>
-            <table class="nc-var-table">
-                <thead><tr><th>Name</th><th>Dims</th><th>Shape</th><th>Dtype</th><th>Units</th><th>Long name</th></tr></thead>
-                <tbody>${varRows}</tbody>
-            </table>
+            <div class="nc-kv-list">${dimRows}</div>
+            <div class="nc-section-title">Variables (${info.variables.length})</div>
+            <div class="table-scroll"><div class="nc-var-list">${varBlocks}</div></div>
             <div class="nc-section-title">Global attributes</div>
-            <table class="meta-table">${attrRows}</table>
+            <div class="table-scroll"><div class="nc-kv-list">${attrRows}</div></div>
         `);
     } catch (e) {
         showPreview(`<div class="status-text err">Network error: ${e.message}</div>`);
@@ -794,12 +974,141 @@ document.getElementById('clear-goesnc-btn').addEventListener('click', async () =
     refreshGoesNcCache(); refreshStatus();
 });
 
+// ── Self-update ──────────────────────────────────────────────────────────
+// See app/services/self_update.py — "Check for updates" hits GitHub via
+// /self-update/check; "Update & restart" pulls (fast-forward only, clean
+// tree only) and deliberately exits so systemd relaunches uvicorn on the
+// new code. Both progress through /self-update/status, polled the same
+// way as the prefetch/archive-update jobs above.
+const SELF_UPDATE_IN_PROGRESS = ['checking', 'pulling', 'installing_dependencies', 'restarting'];
+let selfUpdatePollTimer = null;
+let restartWaitTimer = null;
+
+function waitForRestart() {
+    if (restartWaitTimer) return;
+    const statusEl = document.getElementById('self-update-status');
+    restartWaitTimer = setInterval(async () => {
+        try {
+            const res = await fetch(API_BASE + '/v1/admin/whoami', { credentials: 'same-origin' });
+            if (!res.ok) return;
+            clearInterval(restartWaitTimer);
+            restartWaitTimer = null;
+            statusEl.textContent = 'Back online — reloading…';
+            statusEl.className = 'status-text ok';
+            setTimeout(() => window.location.reload(), 500);
+        } catch (e) {
+            // Still restarting — connection refused/reset is expected here.
+        }
+    }, 2000);
+}
+
+function renderSelfUpdate(data) {
+    const statusEl = document.getElementById('self-update-status');
+    const checkBtn = document.getElementById('self-update-check-btn');
+    const applyBtn = document.getElementById('self-update-apply-btn');
+    const logEl = document.getElementById('self-update-log');
+    const { check, job } = data;
+    const inProgress = SELF_UPDATE_IN_PROGRESS.includes(job.status);
+    checkBtn.disabled = inProgress;
+
+    if (job.status === 'restarting') {
+        statusEl.textContent = job.result || 'Restarting…';
+        statusEl.className = 'status-text working';
+        applyBtn.disabled = true;
+        logEl.style.display = 'none';
+        waitForRestart();
+        return;
+    }
+    if (inProgress) {
+        statusEl.textContent = {
+            checking: 'Checking…', pulling: 'Pulling latest code…', installing_dependencies: 'Installing dependencies…',
+        }[job.status];
+        statusEl.className = 'status-text working';
+        applyBtn.disabled = true;
+        return;
+    }
+
+    if (job.status === 'error') {
+        statusEl.textContent = 'Update failed: ' + job.error;
+        statusEl.className = 'status-text err';
+    } else if (job.status === 'up_to_date' && job.finished_at) {
+        statusEl.textContent = job.result || 'Already up to date.';
+        statusEl.className = 'status-text ok';
+    } else if (check.error) {
+        statusEl.textContent = 'Check failed: ' + check.error;
+        statusEl.className = 'status-text err';
+    } else if (!check.result) {
+        statusEl.textContent = 'Not checked yet.';
+        statusEl.className = 'status-text';
+    } else if (check.result.up_to_date) {
+        statusEl.textContent = `Up to date (${check.result.local_commit.slice(0, 8)})`;
+        statusEl.className = 'status-text ok';
+    } else {
+        statusEl.textContent = `Update available — ${check.result.commits_behind} commit(s) behind`;
+        statusEl.className = 'status-text working';
+    }
+
+    const updateAvailable = !!(check.result && !check.result.up_to_date);
+    applyBtn.disabled = !updateAvailable;
+    if (updateAvailable && check.result.log.length) {
+        logEl.style.display = 'block';
+        logEl.innerHTML = check.result.log.map((l) => `<div>${l}</div>`).join('');
+    } else {
+        logEl.style.display = 'none';
+    }
+}
+
+async function refreshSelfUpdateStatus() {
+    try {
+        const res = await api('/v1/admin/self-update/status');
+        renderSelfUpdate(await res.json());
+    } catch (e) {
+        // Transient — next live-refresh tick (or the restart-recovery poll
+        // above) will pick it back up.
+    }
+}
+
+function pollSelfUpdateJob() {
+    if (selfUpdatePollTimer) clearInterval(selfUpdatePollTimer);
+    selfUpdatePollTimer = setInterval(async () => {
+        try {
+            const res = await api('/v1/admin/self-update/status');
+            const data = await res.json();
+            renderSelfUpdate(data);
+            if (!SELF_UPDATE_IN_PROGRESS.includes(data.job.status)) {
+                clearInterval(selfUpdatePollTimer);
+            }
+        } catch (e) {
+            clearInterval(selfUpdatePollTimer); // likely mid-restart; waitForRestart takes over
+        }
+    }, 1500);
+}
+
+document.getElementById('self-update-check-btn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('self-update-status');
+    statusEl.textContent = 'Checking…';
+    statusEl.className = 'status-text working';
+    try {
+        await api('/v1/admin/self-update/check', { method: 'POST' });
+    } catch (e) {}
+    refreshSelfUpdateStatus();
+});
+
+document.getElementById('self-update-apply-btn').addEventListener('click', async () => {
+    if (!confirm('Pull the latest code from GitHub and restart the API now? This causes a few seconds of downtime.')) return;
+    try {
+        await api('/v1/admin/self-update/apply', { method: 'POST' });
+    } catch (e) {}
+    pollSelfUpdateJob();
+});
+
 // The subset that's safe to re-run on a recurring timer without disturbing
 // anything the operator is mid-interaction with (see startLiveRefresh above).
 function refreshLive() {
     refreshStatus();
     refreshSatelliteCache();
     refreshGoesNcCache();
+    refreshSelfUpdateStatus();
 }
 
 function refreshAll() {
