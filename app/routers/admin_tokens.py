@@ -97,7 +97,9 @@ async def edit_token(token_id: int, request: Request):
 
 
 @router.delete("/tokens/{token_id}", dependencies=[Depends(auth.require_superuser)])
-async def delete_token(token_id: int):
+async def delete_token(token_id: int, request: Request):
+    if token_id == request.session.get("token_id"):
+        raise HTTPException(400, "You can't delete the account you're currently logged in as")
     conn = tokens.get_connection()
     try:
         if not tokens.delete_token(conn, token_id):
@@ -130,6 +132,15 @@ async def login_log(limit: int = Query(200, ge=1, le=1000)):
         conn.close()
 
 
+@router.delete("/login-log", dependencies=[Depends(auth.require_superuser)])
+async def clear_login_log():
+    conn = tokens.get_connection()
+    try:
+        return {"cleared": tokens.clear_login_log(conn)}
+    finally:
+        conn.close()
+
+
 # ── Usage log (superuser + moderator — "view data"/"logs", not permissions) ──
 @router.get("/usage-log", dependencies=[Depends(auth.require_login)])
 async def usage_log(token_id: Optional[int] = None, limit: int = Query(200, ge=1, le=1000)):
@@ -137,6 +148,19 @@ async def usage_log(token_id: Optional[int] = None, limit: int = Query(200, ge=1
     try:
         rows = tokens.list_usage_log(conn, token_id=token_id, limit=limit)
         return {"entries": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@router.delete("/usage-log", dependencies=[Depends(auth.require_login)])
+async def clear_usage_log():
+    """Same access level as viewing it (superuser + moderator) — clearing
+    the usage log is no more sensitive than clearing the rendered-tile or
+    netCDF caches, which moderators can already do (see app/routers/
+    admin.py); it's operational log data, not a permissions surface."""
+    conn = tokens.get_connection()
+    try:
+        return {"cleared": tokens.clear_usage_log(conn)}
     finally:
         conn.close()
 

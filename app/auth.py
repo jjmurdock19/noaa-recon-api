@@ -94,11 +94,21 @@ def require_api_token(request: Request):
     """FastAPI dependency for the public data routers (satellite, storms,
     recon, tdr, raw — NOT health, which always stays open). A no-op when
     auth is disabled (the default), preserving today's open-access
-    behavior. When enabled, requires `Authorization: Bearer <token>` and
-    returns the matching tokens row (any role). Stashes the row on
-    request.state so app/main.py's logging middleware can record accurate
-    per-call usage (including the eventual response status code, not
-    available yet at dependency-resolution time)."""
+    behavior. When enabled, requires EITHER:
+
+      - a valid `Authorization: Bearer <token>` header (any role's token),
+        for programmatic API consumers; or
+      - a logged-in admin console session (superuser/moderator), so an
+        operator using the console's own DB viewer / query tools doesn't
+        need to also carry a separate bearer token. Without this, every
+        console call to a data endpoint (e.g. /v1/storms/years for the
+        database browser) would 401 once auth is enabled, and the console's
+        generic 401-means-session-expired handler would bounce the operator
+        straight back to the login screen right after logging in.
+
+    Stashes the resolved token row (or None for a session-authorized admin)
+    on request.state so app/main.py's logging middleware can record
+    accurate per-call usage with the eventual response status code."""
     request.state.token_row = None
     if not is_auth_enabled():
         return None
@@ -106,17 +116,22 @@ def require_api_token(request: Request):
     from app.services import tokens  # local import: avoids a module-load-order cycle
 
     authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "Missing or malformed Authorization header — expected 'Bearer <token>'")
-    raw_token = authorization[7:].strip()
+    if authorization.lower().startswith("bearer "):
+        raw_token = authorization[7:].strip()
+        conn = tokens.get_connection()
+        try:
+            row = tokens.verify_api_token(conn, raw_token)
+        finally:
+            conn.close()
+        if row is None:
+            raise HTTPException(401, "Invalid or revoked API token")
+        request.state.token_row = row
+        return row
 
-    conn = tokens.get_connection()
-    try:
-        row = tokens.verify_api_token(conn, raw_token)
-    finally:
-        conn.close()
-    if row is None:
-        raise HTTPException(401, "Invalid or revoked API token")
+    # No bearer token — fall back to an authenticated console session. A
+    # logged-in operator is already authorized; their session doubles as
+    # data-endpoint access so the console works with auth enabled.
+    if is_authenticated(request):
+        return None
 
-    request.state.token_row = row
-    return row
+    raise HTTPException(401, "Missing or malformed Authorization header — expected 'Bearer <token>'")

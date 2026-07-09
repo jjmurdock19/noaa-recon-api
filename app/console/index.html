@@ -363,6 +363,7 @@
     <h1>noaa-recon-api — admin console</h1>
   </div>
   <div class="header-actions">
+    <span id="logged-in-as" class="status-text" style="flex:none;"></span>
     <button class="theme-toggle-btn" title="Cycle theme: auto / light / dark">Theme: Auto</button>
     <button id="logout-btn">Log out</button>
   </div>
@@ -661,7 +662,10 @@
       <section id="login-log-section" style="display:none;">
         <h2>
           Login log
-          <button class="clear-btn" id="login-log-refresh-btn">Refresh</button>
+          <span>
+            <button class="clear-btn" id="login-log-refresh-btn">Refresh</button>
+            <button class="clear-btn" id="login-log-clear-btn">Clear</button>
+          </span>
         </h2>
         <div class="table-scroll">
           <table>
@@ -674,7 +678,10 @@
       <section id="usage-log-section" style="display:none;">
         <h2>
           Usage log
-          <button class="clear-btn" id="usage-log-refresh-btn">Refresh</button>
+          <span>
+            <button class="clear-btn" id="usage-log-refresh-btn">Refresh</button>
+            <button class="clear-btn" id="usage-log-clear-btn">Clear</button>
+          </span>
         </h2>
         <div class="table-scroll">
           <table>
@@ -755,6 +762,8 @@ function showApp() {
     applyRoleVisibility();
     refreshAll();
     pollLogs();
+    refreshUsageLog();
+    if (currentRole === 'superuser') refreshLoginLog();
     startLiveRefresh();
 }
 
@@ -763,6 +772,8 @@ function showApp() {
 // just keeps a moderator's console from showing sections that would only
 // ever error out for them.
 let currentRole = null;
+let currentUsername = null;
+let currentTokenId = null;
 function applyRoleVisibility() {
     const superuserOnly = ['auth-toggle-section', 'tokens-section', 'login-log-section'];
     const isSuperuser = currentRole === 'superuser';
@@ -770,6 +781,9 @@ function applyRoleVisibility() {
         document.getElementById(id).style.display = isSuperuser ? '' : 'none';
     });
     document.getElementById('usage-log-section').style.display = '';
+    document.getElementById('logged-in-as').textContent = currentUsername
+        ? `Logged in as ${currentUsername} (${currentRole})`
+        : '';
 }
 
 // ── Live refresh — polls status/cache tables so entries update as jobs
@@ -790,8 +804,14 @@ function startLiveRefresh() {
     liveRefreshTimer = setInterval(() => {
         if (document.visibilityState === 'visible') refreshLive();
     }, 5000);
+    // Same 3s cadence as the app log terminal (pollLogs) — login/usage log
+    // are also "logs", not data tables, so they get the faster tick.
     logsPollTimer = setInterval(() => {
-        if (document.visibilityState === 'visible') pollLogs();
+        if (document.visibilityState === 'visible') {
+            pollLogs();
+            refreshUsageLog();
+            if (currentRole === 'superuser') refreshLoginLog();
+        }
     }, 3000);
 }
 function stopLiveRefresh() {
@@ -803,6 +823,8 @@ async function checkAuth() {
     const res = await fetch(API_BASE + '/v1/admin/whoami', { credentials: 'same-origin' });
     const data = await res.json();
     currentRole = data.role || null;
+    currentUsername = data.username || null;
+    currentTokenId = data.token_id || null;
     if (data.authenticated) showApp(); else showLogin();
 }
 
@@ -848,6 +870,8 @@ document.getElementById('login-btn').addEventListener('click', async () => {
         if (!res.ok) { errEl.textContent = 'Invalid username or password.'; return; }
         const data = await res.json();
         currentRole = data.role || null;
+        currentUsername = data.username || null;
+        currentTokenId = data.token_id || null;
         showApp();
     } catch (e) {
         errEl.textContent = 'Network error: ' + e.message;
@@ -1281,9 +1305,11 @@ async function refreshTokens() {
     try {
         const res = await api('/v1/admin/tokens');
         const data = await res.json();
-        document.getElementById('tokens-body').innerHTML = data.tokens.map((t) => `
+        document.getElementById('tokens-body').innerHTML = data.tokens.map((t) => {
+            const isSelf = t.id === currentTokenId;
+            return `
             <tr class="${t.revoked ? 'revoked-row' : ''}">
-                <td>${roleBadge(t.role)}</td>
+                <td>${roleBadge(t.role)}${isSelf ? ' <span class="status-text">(you)</span>' : ''}</td>
                 <td>${t.owner_name}${t.owner_email ? `<br><span class="status-text">${t.owner_email}</span>` : ''}</td>
                 <td>${t.username || '—'}</td>
                 <td>${fmtTs(t.created_at)}</td>
@@ -1291,9 +1317,10 @@ async function refreshTokens() {
                 <td><input type="checkbox" data-tok-revoke="${t.id}" ${t.revoked ? 'checked' : ''} /></td>
                 <td>
                     <button class="clear-btn" data-tok-regen="${t.id}">Regenerate</button>
-                    <button class="clear-btn" data-tok-delete="${t.id}">Delete</button>
+                    <button class="clear-btn" data-tok-delete="${t.id}" ${isSelf ? 'disabled title="You can\'t delete the account you\'re logged in as"' : ''}>Delete</button>
                 </td>
-            </tr>`).join('');
+            </tr>`;
+        }).join('');
     } catch (e) {}
 }
 
@@ -1401,6 +1428,12 @@ async function refreshLoginLog() {
 
 document.getElementById('login-log-refresh-btn').addEventListener('click', refreshLoginLog);
 
+document.getElementById('login-log-clear-btn').addEventListener('click', async () => {
+    if (!confirm('Delete ALL login log entries? This cannot be undone.')) return;
+    await api('/v1/admin/login-log', { method: 'DELETE' });
+    refreshLoginLog();
+});
+
 async function refreshUsageLog() {
     try {
         const res = await api('/v1/admin/usage-log');
@@ -1419,6 +1452,12 @@ async function refreshUsageLog() {
 
 document.getElementById('usage-log-refresh-btn').addEventListener('click', refreshUsageLog);
 
+document.getElementById('usage-log-clear-btn').addEventListener('click', async () => {
+    if (!confirm('Delete ALL usage log entries? This cannot be undone.')) return;
+    await api('/v1/admin/usage-log', { method: 'DELETE' });
+    refreshUsageLog();
+});
+
 // The subset that's safe to re-run on a recurring timer without disturbing
 // anything the operator is mid-interaction with (see startLiveRefresh above).
 function refreshLive() {
@@ -1426,11 +1465,9 @@ function refreshLive() {
     refreshSatelliteCache();
     refreshGoesNcCache();
     refreshSelfUpdateStatus();
-    refreshUsageLog();
     if (currentRole === 'superuser') {
         refreshAuthToggle();
         refreshTokens();
-        refreshLoginLog();
     }
 }
 

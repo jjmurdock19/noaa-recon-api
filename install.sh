@@ -470,6 +470,13 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/.venv/bin/uvicorn app.main:app --host ${bindhost} --port ${PORT} ${rootpath_flag}
 Restart=on-failure
 RestartSec=5
+# Memory guardrail: the API idles around ~100MB, but a pathological render
+# (e.g. a Band 2 full-disk request, or several overlapping composites) can
+# transiently balloon multi-GB. On a small host that can OOM the whole box;
+# capping it here means systemd kills+restarts just this service instead.
+# MemoryHigh throttles/reclaims first (soft); MemoryMax is the hard ceiling.
+MemoryHigh=2G
+MemoryMax=3G
 
 [Install]
 WantedBy=multi-user.target

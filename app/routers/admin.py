@@ -70,7 +70,7 @@ async def login(request: Request):
     request.session["token_id"] = row["id"]
     request.session["role"] = row["role"]
     request.session["username"] = row["username"]
-    return {"status": "ok", "role": row["role"], "username": row["username"]}
+    return {"status": "ok", "role": row["role"], "username": row["username"], "token_id": row["id"]}
 
 
 @router.post("/logout")
@@ -87,6 +87,7 @@ async def whoami(request: Request):
         "authenticated": True,
         "role": request.session.get("role"),
         "username": request.session.get("username"),
+        "token_id": request.session.get("token_id"),
     }
 
 

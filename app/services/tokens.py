@@ -267,6 +267,18 @@ def list_login_log(conn: sqlite3.Connection, limit: int = 200) -> list[sqlite3.R
     return conn.execute("SELECT * FROM login_log ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
 
 
+def clear_usage_log(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("DELETE FROM usage_log")
+    conn.commit()
+    return cur.rowcount
+
+
+def clear_login_log(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("DELETE FROM login_log")
+    conn.commit()
+    return cur.rowcount
+
+
 # ── Legacy migration ─────────────────────────────────────────────────────
 def migrate_legacy_admin_credentials(conn: sqlite3.Connection) -> int:
     """One-time-idempotent fixup: if no tokens exist yet and the old
