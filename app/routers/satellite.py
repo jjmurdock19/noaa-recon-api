@@ -14,11 +14,12 @@ _cache = ResultCache(CACHE_ROOT / "satellite")
 _nc_cache_dir = CACHE_ROOT / "goes_nc"
 
 VALID_CMAPS = set(goes.LUTS.keys()) | set(goes.STOPS_BY_CMAP.keys()) | goes.REFLECTANCE_CMAPS | {"default"}
-VALID_BANDS = {3, 5, 7, 9, 13}  # Band 2 standalone / TDR remain follow-up phases
+VALID_BANDS = {2, 3, 5, 7, 9, 13}  # TDR remains a follow-up phase
 VALID_PRODUCTS = {"sandwich", "geocolor"}
 NM_PER_KM = 1.0 / 1.852
 
 BAND_NAMES = {
+    2: "Red (Visible), 0.64µm",
     3: "Veggie (Vegetation/NIR), 0.86µm",
     5: "Near-IR (Snow/Ice), 1.6µm",
     7: "Shortwave IR (\"Fire Temperature\"), 3.9µm",
@@ -52,6 +53,12 @@ CMAP_DESCRIPTIONS = {
         "name": "Band 5 (Near-IR Snow/Ice) Reflectance Ramp",
         "description": "Not a temperature colortable — reports reflectance factor (~0-1), rendered as a "
         "gamma-stretched 0-100% grayscale.",
+    },
+    "abi2": {
+        "name": "Band 2 (Red/Visible) Reflectance Ramp",
+        "description": "Same treatment as abi5/abi3 — reflectance, not temperature, rendered as a "
+        "gamma-stretched grayscale. The sharpest band this API renders (0.5km native) — daylight-only, no "
+        "signal at night.",
     },
     "abi3": {
         "name": "Band 3 (Veggie / Vegetation-NIR) Reflectance Ramp",
@@ -117,10 +124,10 @@ def _parse_center(center: str) -> tuple[float, float]:
 async def get_tile(
     background_tasks: BackgroundTasks,
     time: datetime.datetime = Query(..., description="UTC timestamp, e.g. 2024-09-28T12:00:00Z"),
-    band: int = Query(13, description="13 = Clean IR, 9 = Water Vapor, 7 = Shortwave IR, 5 = Near-IR Snow/Ice, 3 = Veggie (Vegetation/NIR). Ignored if `product` is given."),
+    band: int = Query(13, description="13 = Clean IR, 9 = Water Vapor, 7 = Shortwave IR, 5 = Near-IR Snow/Ice, 3 = Veggie (Vegetation/NIR), 2 = Red/Visible. Ignored if `product` is given."),
     cmap: str = Query(
         "default",
-        description="default | abi13 | abi9 | abi7 | abi5 | abi3 | bd | ir4 | enhanced | nrl | grayscale. "
+        description="default | abi13 | abi9 | abi7 | abi5 | abi3 | abi2 | bd | ir4 | enhanced | nrl | grayscale. "
         "'default' resolves to the correct per-band standard enhancement — bands are different physical "
         "quantities (temperature vs. reflectance) and aren't interchangeable. Ignored if `product` is given.",
     ),
@@ -146,7 +153,8 @@ async def get_tile(
     resolution_km: Optional[float] = Query(
         None,
         description="km per output pixel for a bbox request. Omit for the sensor's native resolution "
-        "(highest detail — ~2km for most bands, 1km for bands 3/5). Increase to render faster / smaller files.",
+        "(highest detail — ~2km for most bands, 1km for bands 3/5, 0.5km for band 2). Increase to render "
+        "faster / smaller files.",
     ),
 ):
     if satellite not in ("goes-east", "goes-west"):

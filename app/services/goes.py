@@ -269,8 +269,8 @@ LUTS = {
 
 # Bands 1-6 report reflectance factor (~0-1.2, unitless), not brightness
 # temperature — they need a different colorization path (see _colorize)
-# since there's no "temperature" to map through a thermal LUT. Only band 5
-# is exposed as a standalone single-band product today; 1/2/3 are used
+# since there's no "temperature" to map through a thermal LUT. Bands 2/5
+# are exposed as standalone single-band products; 1/2/3 are also used
 # internally by the sandwich/geocolor composites (see render_sandwich_to_png
 # / render_geocolor_to_png).
 REFLECTANCE_BANDS = {1, 2, 3, 4, 5, 6}
@@ -278,8 +278,9 @@ REFLECTANCE_BANDS = {1, 2, 3, 4, 5, 6}
 # cmap="default" resolves to one of these based on the requested band, since
 # each band is a genuinely different physical quantity/enhancement
 # convention — there's no single "default" independent of which band.
-# "abi5"/"abi3" are sentinels, not temperature colortables — see REFLECTANCE_BANDS.
-DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9", 7: "abi7", 5: "abi5", 3: "abi3"}
+# "abi5"/"abi3"/"abi2" are sentinels, not temperature colortables — see
+# REFLECTANCE_BANDS.
+DEFAULT_CMAP_BY_BAND = {13: "abi13", 9: "abi9", 7: "abi7", 5: "abi5", 3: "abi3", 2: "abi2"}
 
 # Colortables evaluated exactly (vectorized, full float precision) rather
 # than through the shared quantized LUT — see comment above LUTS.
@@ -290,7 +291,7 @@ STOPS_BY_CMAP = {"abi13": _ABI13_STOPS, "abi9": _ABI9_STOPS, "abi7": _ABI7_STOPS
 # into STOPS_BY_CMAP/LUTS) so callers can tell "no temperature semantics
 # apply here" apart from "this is a LUT/stops cmap that happens not to
 # match the requested band".
-REFLECTANCE_CMAPS = {"abi5", "abi3"}
+REFLECTANCE_CMAPS = {"abi5", "abi3", "abi2"}
 
 
 # ── ABI Fixed Grid → geographic lat/lon (PUG Volume 5, Section 4.2) ─────────
@@ -645,38 +646,22 @@ def _colorize(output: np.ndarray, cmap_name: str, out_png: Path, band_kind: str 
     log.info("Saved PNG: %s", out_png)
 
 
-def _read_source(nc_path: Path):
-    import netCDF4 as nc4
+def _read_source_downsampled(nc_path: Path, max_dim: int = 2160, step: int | None = None):
+    """Reads a strided view directly from the netCDF variable instead of
+    materializing the full-resolution array first — used by every full-disk
+    render path (render_to_png, the composite renderers below). Band 2 at
+    its native 0.5km resolution is a ~21700x21700 full-disk array (multiple
+    GB as float64/masked) even though a full-disk render only ever produces
+    a ~2160px preview; reading `[:]` and downsampling in numpy afterward
+    needlessly held that entire array in memory and was reproducible as an
+    OOM kill on this project's ~4GB deployment host. render_bbox_to_png
+    uses the separate _read_source_cropped instead, since a bbox request
+    needs to locate a small region first rather than downsample the whole
+    disk.
 
-    log.info("Reading %s", nc_path)
-    with NC_LOCK:
-        ds = nc4.Dataset(str(nc_path), "r")
-        try:
-            cmi_raw = ds.variables["CMI"][:]
-            x_rad = ds.variables["x"][:]
-            y_rad = ds.variables["y"][:]
-            proj = ds.variables["goes_imager_projection"]
-            sat_lon = float(proj.longitude_of_projection_origin)
-            h = float(proj.perspective_point_height)
-            r_eq = float(proj.semi_major_axis)
-            r_pol = float(proj.semi_minor_axis)
-        finally:
-            ds.close()
-    return cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol
-
-
-def _read_source_downsampled(nc_path: Path, max_dim: int = 2160):
-    """Like _read_source, but reads a strided view directly from the
-    netCDF variable instead of materializing the full-resolution array
-    first. Matters a lot for the composite products below: Band 2 at its
-    native 0.5km resolution is a ~21700x21700 full-disk array (multiple
-    GB as float64/masked) even though every composite only ever renders a
-    ~2160px preview — reading `[:]` then downsampling in numpy (what
-    _read_source does, fine for the 2km bands 9/13 render path, which
-    render_bbox_to_png also needs at full resolution for accurate
-    cropping) needlessly held that entire array in memory and was
-    reproducible as an OOM kill on this project's ~4GB deployment host
-    when two composite renders overlapped."""
+    `step` overrides the auto-computed stride (from `max_dim`) — passed
+    through by render_to_png callers that ask for a specific
+    downsample_step instead of a target output size."""
     import netCDF4 as nc4
 
     log.info("Reading (downsampled) %s", nc_path)
@@ -685,7 +670,8 @@ def _read_source_downsampled(nc_path: Path, max_dim: int = 2160):
         try:
             cmi_var = ds.variables["CMI"]
             ny, nx = cmi_var.shape
-            step = max(1, max(ny, nx) // max_dim)
+            if step is None:
+                step = max(1, max(ny, nx) // max_dim)
             cmi_raw = cmi_var[::step, ::step]
             x_rad = ds.variables["x"][::step]
             y_rad = ds.variables["y"][::step]
@@ -700,16 +686,17 @@ def _read_source_downsampled(nc_path: Path, max_dim: int = 2160):
 
 
 def _read_source_cropped(nc_path: Path, lat_S: float, lat_N: float, lon_W: float, lon_E: float, fine_step: int = 1):
-    """Like _read_source, but locates the requested lat/lon box first (a
-    cheap sparse pass using only the 1-D x/y coordinate arrays, never
-    touching the 2-D CMI data) and then reads only that crop directly from
-    the netCDF variable at a stride. Never materializes the full-resolution
-    array — needed for the composite products' bbox path, since Band 2 at
-    its native 0.5km resolution is large enough (~21700x21700, multi-GB as
-    a masked float array) that reading it whole first (fine for the
-    single-band bbox path, whose bands are all >=1km) risks an OOM on this
-    project's ~4GB deployment host — see _read_source_downsampled's
-    docstring for the same concern applied to the full-disk composite path.
+    """Locates the requested lat/lon box first (a cheap sparse pass using
+    only the 1-D x/y coordinate arrays, never touching the 2-D CMI data)
+    and then reads only that crop directly from the netCDF variable at a
+    stride. Never materializes the full-resolution array — matters most
+    for Band 2 at its native 0.5km resolution (~21700x21700, multi-GB as a
+    masked float array, the largest/finest band this project ever reads),
+    used by both the composite products' bbox path and Band 2's own
+    single-band bbox requests, but applied to every band's bbox request
+    for consistency. See _read_source_downsampled's docstring for the same
+    full-array-materialization concern applied to full-disk (non-bbox)
+    renders.
 
     Returns (x_crop, y_crop, cmi_crop, sat_lon, h, r_eq, r_pol), or None if
     the box doesn't intersect this file's visible disk — callers should
@@ -773,21 +760,21 @@ def render_to_png(
     band: int = 13,
 ) -> dict:
     """Read GOES ABI L2 CMI NetCDF, reproject the full disk to EPSG:4326,
-    apply the color LUT, save a georeferenced RGBA PNG. Returns bounds/metadata."""
-    cmi_raw, x_rad, y_rad, sat_lon, h, r_eq, r_pol = _read_source(nc_path)
+    apply the color LUT, save a georeferenced RGBA PNG. Returns bounds/metadata.
 
-    ny, nx = cmi_raw.shape
-    if downsample_step is None:
-        downsample_step = max(1, max(ny, nx) // 2160)
-    step = downsample_step
-    log.info("Source %dx%d, downsample step=%d -> %dx%d", ny, nx, step, ny // step, nx // step)
+    Reads via _read_source_downsampled — this path renders every band
+    including Band 2, whose full-resolution (0.5km) full-disk array is
+    multi-GB and OOMs on this project's ~4GB deployment host if
+    materialized first; see that function's docstring."""
+    cmi_ds_raw, x_ds, y_ds, sat_lon, h, r_eq, r_pol = _read_source_downsampled(nc_path, step=downsample_step)
 
-    x_ds = x_rad[::step]
-    y_ds = y_rad[::step]
-    if isinstance(cmi_raw, np.ma.MaskedArray):
-        cmi_ds = cmi_raw[::step, ::step].filled(np.nan).astype(np.float32)
+    ny_ds, nx_ds = cmi_ds_raw.shape
+    log.info("Downsampled source -> %dx%d (step=%s)", ny_ds, nx_ds, downsample_step or "auto")
+
+    if isinstance(cmi_ds_raw, np.ma.MaskedArray):
+        cmi_ds = cmi_ds_raw.filled(np.nan).astype(np.float32)
     else:
-        cmi_ds = cmi_raw[::step, ::step].astype(np.float32)
+        cmi_ds = cmi_ds_raw.astype(np.float32)
 
     XX, YY = np.meshgrid(x_ds, y_ds)
     LON, LAT = abi_to_latlon(XX, YY, sat_lon, h, r_eq, r_pol)

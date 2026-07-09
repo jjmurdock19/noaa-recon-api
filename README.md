@@ -39,9 +39,10 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
 - **The correct color table for the band you asked for.** `cmap=default`
   resolves to the right per-band standard enhancement — `abi13` (Clean
   IR), `abi9` (water vapor), `abi7` (shortwave IR / "fire temperature"),
-  `abi5` (near-IR reflectance), or `abi3` (Veggie/vegetation reflectance)
-  — built from exact temperature→color stops (or a reflectance ramp for
-  bands 3/5), not a generic approximation. See ["How the imagery is
+  `abi5` (near-IR reflectance), `abi3` (Veggie/vegetation reflectance), or
+  `abi2` (red/visible reflectance) — built from exact temperature→color
+  stops (or a reflectance ramp for bands 2/3/5), not a generic
+  approximation. See ["How the imagery is
   processed"](#how-the-imagery-is-processed) below for exactly how each
   one is computed, and [the live color legend tool](#color-legend) for
   rendering one client-side.
@@ -782,31 +783,28 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    0.5km (~21700×21700px full disk) — enough to reproduce an OOM kill on
    this project's ~4GB deployment host with two composites running at
    once. Fixed by reading a strided (already-downsampled) view straight
-   from the netCDF variable (`_read_source_downsampled()`) for the
-   full-disk composite path instead of materializing the full array first.
-   The same concern applies to the composites' bbox path (`center`/`dims`)
-   — `_read_source_cropped()` locates the requested box first (a cheap
-   sparse pass over just the 1-D coordinate arrays) and then reads only
-   that crop directly from the file at a stride, so a bbox request never
-   pays Band 2's full-disk-materialization cost either. If you add another
-   product that reads Band 1/2/3/4/6 at anything near full resolution, use
-   one of these two, not `_read_source()`.
+   from the netCDF variable (`_read_source_downsampled()`) for every
+   full-disk render path — the composites and `render_to_png`'s
+   single-band full-disk path both use it now — instead of materializing
+   the full array first. The same concern applies to any bbox
+   (`center`/`dims`) request — `_read_source_cropped()` locates the
+   requested box first (a cheap sparse pass over just the 1-D coordinate
+   arrays) and then reads only that crop directly from the file at a
+   stride, so a bbox request never pays Band 2's full-disk-materialization
+   cost either. If you add another product that reads Band 1/2/3/4/6 at
+   anything near full resolution, use one of these two rather than reading
+   `ds.variables["CMI"][:]` directly.
 
 ### Roadmap (not yet implemented)
 
-1. **Standalone Band 2 (visible) as its own product** — bands 3/5/7/9/13
-   are all exposed standalone today; Band 2 isn't yet, mainly because at
-   native 0.5km it needs the same crop-read treatment `render_bbox_to_png`
-   uses for other bands rather than the full-disk downsample path bands
-   3/5 use today (see the `_read_source_cropped()` note above).
-2. **A closer-to-official GeoColor** — today's `product=geocolor` is a
+1. **A closer-to-official GeoColor** — today's `product=geocolor` is a
    documented approximation (synthetic true color + colorized IR, blended
    by solar zenith angle; see `GET /v1/satellite/products`). No city-lights
    layer, no atmospheric/Rayleigh correction. Closing that gap means
    sourcing (or building) a city-lights raster and implementing real
    atmospheric correction — a substantially bigger lift than the rest of
    this project's rendering pipeline.
-3. **TDR**: see `app/services/tdr.py` docstring. In short: crawl
+2. **TDR**: see `app/services/tdr.py` docstring. In short: crawl
    `https://seb.omao.noaa.gov/pub/acdata/{year}/` for `YYYYMMDD[N|I|H]#/`
    mission directories (no manifest exists — build a local index, e.g.
    SQLite), download/extract the `.tar.gz` bundles in each mission's
@@ -815,20 +813,20 @@ llms.txt                      Terse agent-discovery summary (llmstxt.org convent
    same storm-relative grid + Plotly-colorscale shape the hurricanes site's
    `js/tdr-archive.js` already consumes from TC-Atlas (match that response
    shape so the client needs minimal changes when migrated onto this API).
-4. **Raw netCDF passthrough** (`app/routers/raw.py`): for the GOES side this
+3. **Raw netCDF passthrough** (`app/routers/raw.py`): for the GOES side this
    can subset directly from the same file `goes.py` already downloads (no new
    data source) — implement as a `netCDF4` variable slice by
    center/dimensions, streamed back with `Content-Type: application/x-netcdf`.
    The recon MET side already has this — see `GET /v1/recon/mission/{id}/download`.
-   The TDR side depends on (3) above.
-5. **Migrate the hurricanes site's `goes-archive.js`/`tdr-archive.js`** onto
+   The TDR side depends on (2) above.
+4. **Migrate the hurricanes site's `goes-archive.js`/`tdr-archive.js`** onto
    this API instead of the local `goes_tile.py` subprocess / TC-Atlas proxy
    — not done in the MVP since those already work in production; this is a
    deliberate follow-up, not an oversight. (`recon-archive.js` and the storm
    track archive have already been migrated onto this API.)
-6. Move off this host into its own container — `Dockerfile`/
+5. Move off this host into its own container — `Dockerfile`/
    `docker-compose.yml` already exist for this.
-7. **Extend historical satellite coverage** — see the note in API.md /
+6. **Extend historical satellite coverage** — see the note in API.md /
    the project's GOES satellite history research; pre-2017 storms (e.g.
    Katrina, 2005) predate the ABI instrument entirely and need a
    different data source and file-format parser, not just another S3

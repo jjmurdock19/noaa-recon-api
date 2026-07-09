@@ -57,6 +57,62 @@ TAILNUM_MAP = {
     "n67": "NOAA G-IV",
 }
 
+# Bucket name for flights that either never got a real storm name (training,
+# calibration, instrument-test missions) or had one stripped by
+# reconcile_mismatched_storm_names() below because their flown track never
+# actually came near the storm they were labeled with. "Unknown / Training"
+# was the name used before this rename; LEGACY_TRAINING_BUCKET_NAMES lets
+# rename_legacy_training_bucket() fold pre-rename archives forward onto the
+# current name instead of splitting into two buckets.
+TRAINING_BUCKET_NAME = "Training Flights / Research"
+LEGACY_TRAINING_BUCKET_NAMES = ("Unknown / Training",)
+
+# Known-bad mission_id -> storm_name corrections that reconcile_mismatched_
+# storm_names() can't safely catch on its own. That check confirms a named
+# mission by distance-to-track alone, which can't distinguish "this P-3
+# flight legitimately never penetrated the storm" (true of plenty of real
+# missions — periphery dropsonde work, IFEX research legs, aborted/weather-
+# diverted attempts) from "this P-3 flight's own NOAA paperwork was simply
+# coded wrong". Tightening the distance threshold to catch the latter was
+# evaluated and rejected: simulated against the archive, it flagged ~114
+# other P-3 missions sitting in the same 150-500km band as this one, the
+# large majority almost certainly legitimate (see PR discussion) — false
+# positives at that scale are worse than leaving a handful of known bad
+# cases to be listed here individually as they're confirmed.
+#
+# 20260616H1 (Kermit/N42, Arthur 2026): confirmed by operator review — the
+# flight's closest approach to Arthur's track was ~377km, well inside
+# reconcile_mismatched_storm_names' 500km tolerance (a real G-IV standoff
+# distance, but Kermit is a penetrating P-3, not a G-IV surveillance
+# aircraft), and the mission's own PDF/NetCDF metadata was miscoded with
+# Arthur's storm_id despite the aircraft never actually flying the storm.
+# The companion mission (20260617I1, Miss Piggy/N43) is the real Arthur
+# flight and is untouched.
+MANUAL_STORM_NAME_CORRECTIONS: Dict[str, str] = {
+    "20260616H1": TRAINING_BUCKET_NAME,
+}
+
+
+def apply_manual_storm_name_corrections(conn: sqlite3.Connection) -> int:
+    """One-time-idempotent fixup: applies MANUAL_STORM_NAME_CORRECTIONS.
+    Clears storm_id along with storm_name so reconcile_junk_storm_buckets'
+    tier-1 storm_id trust doesn't just reassign the same wrong storm right
+    back on the next ingest. Runs before every other reconciliation pass so
+    a manually-corrected mission is never re-derived from the same bad
+    source data it was corrected because of."""
+    fixed = 0
+    for mission_id, storm_name in MANUAL_STORM_NAME_CORRECTIONS.items():
+        cur = conn.execute(
+            "UPDATE missions SET storm_name = ?, storm_id = NULL "
+            "WHERE mission_id = ? AND storm_name != ?",
+            (storm_name, mission_id, storm_name),
+        )
+        fixed += cur.rowcount
+    if fixed:
+        conn.commit()
+    return fixed
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS missions (
     mission_id  TEXT PRIMARY KEY,
@@ -393,7 +449,7 @@ def harvest_mission(client: httpx.Client, conn: sqlite3.Connection, year: int, m
         if not storm_name:
             storm_name = extract_storm_from_nc_attrs(tmp_path)
         if not storm_name:
-            storm_name = "Unknown / Training"
+            storm_name = TRAINING_BUCKET_NAME
 
         result = process_nc_file(tmp_path, mission_id)
         if result is None:
@@ -481,19 +537,37 @@ def clean_null_island_observations(conn: sqlite3.Connection) -> int:
 
 def migrate_unknown_storm_names(conn: sqlite3.Connection) -> int:
     """One-time-idempotent fixup: any mission whose storm_name is literally
-    its own raw mission ID (from old harvests, before the 'Unknown /
-    Training' fallback existed) gets renamed so the archive groups them
-    together instead of one bucket per flight. Safe to call after every
-    harvest — a no-op once the fixup has already applied."""
+    its own raw mission ID (from old harvests, before the TRAINING_BUCKET_NAME
+    fallback existed) gets renamed so the archive groups them together
+    instead of one bucket per flight. Safe to call after every harvest — a
+    no-op once the fixup has already applied."""
     rows = conn.execute("SELECT mission_id, storm_name FROM missions").fetchall()
     to_update = [r["mission_id"] for r in rows if r["storm_name"] and re.match(r'^\d{8}[A-Z]\d+$', r["storm_name"])]
     if to_update:
         conn.executemany(
-            "UPDATE missions SET storm_name = 'Unknown / Training' WHERE mission_id = ?",
-            [(mid,) for mid in to_update],
+            "UPDATE missions SET storm_name = ? WHERE mission_id = ?",
+            [(TRAINING_BUCKET_NAME, mid) for mid in to_update],
         )
         conn.commit()
     return len(to_update)
+
+
+def rename_legacy_training_bucket(conn: sqlite3.Connection) -> int:
+    """One-time-idempotent fixup: renames missions still carrying a
+    pre-rename training-bucket name (see LEGACY_TRAINING_BUCKET_NAMES)
+    forward to TRAINING_BUCKET_NAME, so archives harvested before the rename
+    don't end up split across two differently-named buckets. Safe to call
+    after every harvest — a no-op once applied."""
+    renamed = 0
+    for legacy_name in LEGACY_TRAINING_BUCKET_NAMES:
+        cur = conn.execute(
+            "UPDATE missions SET storm_name = ? WHERE storm_name = ?",
+            (TRAINING_BUCKET_NAME, legacy_name),
+        )
+        renamed += cur.rowcount
+    if renamed:
+        conn.commit()
+    return renamed
 
 
 def reconcile_storm_ids(conn: sqlite3.Connection) -> int:
@@ -502,7 +576,7 @@ def reconcile_storm_ids(conn: sqlite3.Connection) -> int:
     though another flight with the *same* storm_id got named fine (e.g.
     that mission's PDF had a clean "Storm: DORIAN" line and a sibling
     flight's didn't). When a storm_id has exactly one distinct real name
-    attached anywhere, every 'Unknown / Training' mission sharing that
+    attached anywhere, every TRAINING_BUCKET_NAME mission sharing that
     storm_id gets relabeled to match — the named flight's data effectively
     absorbs the unnamed one's.
 
@@ -513,19 +587,19 @@ def reconcile_storm_ids(conn: sqlite3.Connection) -> int:
     manual review rather than guessed at."""
     groups = conn.execute("""
         SELECT storm_id,
-               COUNT(DISTINCT CASE WHEN storm_name != 'Unknown / Training' THEN storm_name END) AS real_name_count,
-               MAX(CASE WHEN storm_name != 'Unknown / Training' THEN storm_name END) AS real_name
+               COUNT(DISTINCT CASE WHEN storm_name != ? THEN storm_name END) AS real_name_count,
+               MAX(CASE WHEN storm_name != ? THEN storm_name END) AS real_name
         FROM missions
         WHERE storm_id IS NOT NULL AND storm_id != ''
         GROUP BY storm_id
-        HAVING real_name_count = 1 AND SUM(CASE WHEN storm_name = 'Unknown / Training' THEN 1 ELSE 0 END) > 0
-    """).fetchall()
+        HAVING real_name_count = 1 AND SUM(CASE WHEN storm_name = ? THEN 1 ELSE 0 END) > 0
+    """, (TRAINING_BUCKET_NAME, TRAINING_BUCKET_NAME, TRAINING_BUCKET_NAME)).fetchall()
 
     fixed = 0
     for g in groups:
         cur = conn.execute(
-            "UPDATE missions SET storm_name = ? WHERE storm_id = ? AND storm_name = 'Unknown / Training'",
-            (g["real_name"], g["storm_id"]),
+            "UPDATE missions SET storm_name = ? WHERE storm_id = ? AND storm_name = ?",
+            (g["real_name"], g["storm_id"], TRAINING_BUCKET_NAME),
         )
         fixed += cur.rowcount
     if fixed:
@@ -540,11 +614,11 @@ def reconcile_storm_ids(conn: sqlite3.Connection) -> int:
 # leaking into the storm-name field) carrying Helene's/Debby's real
 # storm_id, "Cyclone" (a generic label, seen on G-IV synoptic-surveillance
 # flights) carrying Hone's real storm_id, and both "Invest" and a big chunk
-# of "Unknown / Training" carrying a stale storm_id (AL072012 — a *real*
-# 2012 storm, itself also coincidentally named Helene, most likely a
-# leaked PDF-template example the "(i.e., ...)" strip in extract_from_pdf()
+# of the TRAINING_BUCKET_NAME bucket carrying a stale storm_id (AL072012 —
+# a *real* 2012 storm, itself also coincidentally named Helene, most likely
+# a leaked PDF-template example the "(i.e., ...)" strip in extract_from_pdf()
 # didn't catch) that has nothing to do with the actual 2024 flight.
-JUNK_STORM_NAMES = {"CYCLONE", "TDR", "SURV", "SURVEY", "RECON", "INVEST", "UNKNOWN / TRAINING"}
+JUNK_STORM_NAMES = {"CYCLONE", "TDR", "SURV", "SURVEY", "RECON", "INVEST", TRAINING_BUCKET_NAME.upper()}
 
 # Recon flights (especially G-IV synoptic-surveillance legs) can operate a
 # few hundred km from a storm's center; ATCF/HURDAT2 track points land every
@@ -594,6 +668,29 @@ def _mission_min_distance_km(points: List[Tuple[float, float]], lat: float, lon:
     return min(_haversine_km(la, lo, lat, lon) for la, lo in points)
 
 
+def _storm_track_distance_km(storms_conn: sqlite3.Connection, points: List[Tuple[float, float]],
+                              storm_row_id: int, mid_unix: float) -> Optional[float]:
+    """Closest approach (km) of `points` (a mission's flown track) to the
+    given storm's own track point nearest in time to `mid_unix`, or None if
+    that storm has no track point within MAX_STORM_MATCH_TIME_HOURS — shared
+    by both _find_matching_storm (searching every storm for the best match)
+    and reconcile_mismatched_storm_names (checking one specific, already-
+    assigned storm)."""
+    mid_dt = datetime.datetime.fromtimestamp(mid_unix, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    point = storms_conn.execute(
+        "SELECT datetime_utc, lat, lon FROM track_points WHERE storm_id = ? "
+        "ORDER BY ABS(julianday(datetime_utc) - julianday(?)) LIMIT 1",
+        (storm_row_id, mid_dt),
+    ).fetchone()
+    if point is None:
+        return None
+    point_dt = datetime.datetime.strptime(point["datetime_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    hours_off = abs(point_dt.timestamp() - mid_unix) / 3600
+    if hours_off > MAX_STORM_MATCH_TIME_HOURS:
+        return None
+    return _mission_min_distance_km(points, point["lat"], point["lon"])
+
+
 def _find_matching_storm(storms_conn: sqlite3.Connection, recon_conn: sqlite3.Connection,
                           mission_id: str, year: int, mid_unix: float) -> Optional[sqlite3.Row]:
     """Among storms active around `year` (+/- 1, in case a mission lands
@@ -607,7 +704,6 @@ def _find_matching_storm(storms_conn: sqlite3.Connection, recon_conn: sqlite3.Co
     if not points:
         return None
 
-    mid_dt = datetime.datetime.fromtimestamp(mid_unix, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     candidates = storms_conn.execute(
         "SELECT id, atcf_id, basin, year, name FROM storms WHERE year IN (?, ?, ?)",
         (year - 1, year, year + 1),
@@ -615,19 +711,7 @@ def _find_matching_storm(storms_conn: sqlite3.Connection, recon_conn: sqlite3.Co
 
     best_storm, best_distance = None, None
     for s in candidates:
-        point = storms_conn.execute(
-            "SELECT datetime_utc, lat, lon FROM track_points WHERE storm_id = ? "
-            "ORDER BY ABS(julianday(datetime_utc) - julianday(?)) LIMIT 1",
-            (s["id"], mid_dt),
-        ).fetchone()
-        if point is None:
-            continue
-        point_dt = datetime.datetime.strptime(point["datetime_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-        hours_off = abs(point_dt.timestamp() - mid_unix) / 3600
-        if hours_off > MAX_STORM_MATCH_TIME_HOURS:
-            continue
-
-        dist_km = _mission_min_distance_km(points, point["lat"], point["lon"])
+        dist_km = _storm_track_distance_km(storms_conn, points, s["id"], mid_unix)
         if dist_km is None or dist_km > MAX_STORM_MATCH_DISTANCE_KM:
             continue
         if best_distance is None or dist_km < best_distance:
@@ -645,7 +729,7 @@ def reconcile_junk_storm_buckets(conn: sqlite3.Connection) -> int:
        storms archive. Resolves "Tdr"/"Surv"/"Survey"/"Cyclone" cases, which
        carry a correct storm_id despite the wrong name.
     2. Otherwise (no storm_id, or a stale one from a different year — e.g.
-       "Invest"/"Unknown / Training" missions carrying a leaked 2012
+       "Invest"/TRAINING_BUCKET_NAME missions carrying a leaked 2012
        example id on a 2024 flight), fall back to matching the mission's own
        flown position against every storm's track around that time (see
        _find_matching_storm). A flight with no real storm nearby (e.g. a
@@ -655,15 +739,27 @@ def reconcile_junk_storm_buckets(conn: sqlite3.Connection) -> int:
 
     Safe to call after every harvest — a no-op for missions already
     correctly named, and for genuine non-tropical training/survey flights
-    that will never match tier 1 or 2."""
+    that will never match tier 1 or 2.
+
+    Skips every mission_id in MANUAL_STORM_NAME_CORRECTIONS: tier 2 matches
+    purely by position, the same signal that produced the wrong name in
+    the first place for a manually-corrected mission (e.g. 20260616H1 —
+    the flight really was within tier 2's own distance/time tolerance of
+    the storm it was wrongly coded for), so leaving those in scope would
+    silently re-derive the bad name right back on the very next ingest."""
     from app.services import storms as storms_svc  # local import: avoids a module-load-order dependency
 
-    placeholders = ",".join("?" * len(JUNK_STORM_NAMES))
-    junk_rows = conn.execute(
+    name_placeholders = ",".join("?" * len(JUNK_STORM_NAMES))
+    query = (
         f"SELECT mission_id, year, storm_id, start_unix, end_unix FROM missions "
-        f"WHERE UPPER(storm_name) IN ({placeholders})",
-        tuple(JUNK_STORM_NAMES),
-    ).fetchall()
+        f"WHERE UPPER(storm_name) IN ({name_placeholders})"
+    )
+    params = list(JUNK_STORM_NAMES)
+    if MANUAL_STORM_NAME_CORRECTIONS:
+        id_placeholders = ",".join("?" * len(MANUAL_STORM_NAME_CORRECTIONS))
+        query += f" AND mission_id NOT IN ({id_placeholders})"
+        params += list(MANUAL_STORM_NAME_CORRECTIONS.keys())
+    junk_rows = conn.execute(query, params).fetchall()
     if not junk_rows:
         return 0
 
@@ -694,6 +790,92 @@ def reconcile_junk_storm_buckets(conn: sqlite3.Connection) -> int:
         if fixed:
             conn.commit()
         return fixed
+    finally:
+        storms_conn.close()
+
+
+# ── Named-storm mismatch reconciliation ─────────────────────────────────
+# extract_from_pdf()/extract_storm_from_nc_attrs() take whatever storm name
+# NOAA's own mission documents say at face value — but a document can name
+# a storm that has nothing to do with where the aircraft actually flew
+# (e.g. a Houston AIRMAPS instrument-calibration exercise whose paperwork
+# happens to reference a storm by name without the flight ever going near
+# it). Trusting the document name alone mislabels flights like that as real
+# storm missions. This section demotes any such mismatch back into
+# TRAINING_BUCKET_NAME so the position-based tier of
+# reconcile_junk_storm_buckets() above gets a chance to find (or rule out)
+# the flight's real storm from where it actually flew — the same
+# "chronological + lat/lon" fallback that bucket already uses for flights
+# with no document name at all.
+def reconcile_mismatched_storm_names(conn: sqlite3.Connection) -> int:
+    """One-time-idempotent fixup: for every mission NOT already in a junk
+    bucket (see JUNK_STORM_NAMES) — i.e. one carrying a real-looking,
+    document-derived storm name — confirms the mission's own flown track
+    actually came within MAX_STORM_MATCH_DISTANCE_KM of that *named* storm's
+    track within MAX_STORM_MATCH_TIME_HOURS of the mission's midpoint (the
+    same signal reconcile_junk_storm_buckets uses to find a storm from
+    position alone, just checked against the one specific storm this
+    mission already claims rather than searched for). A mission whose name
+    doesn't correspond to any storm active within a year of its own, or
+    whose track never came close to the storm it's named for, gets
+    demoted to TRAINING_BUCKET_NAME with its storm_id cleared — clearing
+    storm_id matters because reconcile_junk_storm_buckets' tier 1 trusts
+    any internally-consistent storm_id on sight, and would otherwise just
+    reassign the same wrong storm right back on the very next ingest.
+
+    Skips missions with no stored observations to check a track against —
+    left alone rather than guessed at, same as reconcile_junk_storm_buckets'
+    own tier 2. Safe to call after every harvest — idempotent (a no-op
+    *outcome* for missions already confirmed or already sitting in a junk
+    bucket this function doesn't touch) but not cheap: unlike this file's
+    other reconcile_* fixups, which only ever scan the small JUNK_STORM_NAMES
+    subset, this one re-walks every named mission's full observation track
+    on every call regardless of outcome (confirmed live: ~90s over ~650
+    named missions) — a per-ingest cost that grows with the archive, not
+    a one-time convergence cost. Acceptable for a nightly cron cadence;
+    revisit (e.g. a "verified" flag/timestamp column so already-confirmed
+    missions are skipped) if the archive grows enough for that to change."""
+    from app.services import storms as storms_svc  # local import: avoids a module-load-order dependency
+
+    placeholders = ",".join("?" * len(JUNK_STORM_NAMES))
+    named_rows = conn.execute(
+        f"SELECT mission_id, year, storm_name, start_unix, end_unix FROM missions "
+        f"WHERE UPPER(storm_name) NOT IN ({placeholders})",
+        tuple(JUNK_STORM_NAMES),
+    ).fetchall()
+    if not named_rows:
+        return 0
+
+    storms_conn = storms_svc.get_connection()
+    try:
+        demoted = 0
+        for row in named_rows:
+            points = _mission_track_points(conn, row["mission_id"])
+            if not points:
+                continue
+
+            candidates = storms_conn.execute(
+                "SELECT id FROM storms WHERE name = ? COLLATE NOCASE AND year IN (?, ?, ?)",
+                (row["storm_name"], row["year"] - 1, row["year"], row["year"] + 1),
+            ).fetchall()
+
+            mid_unix = (row["start_unix"] + row["end_unix"]) / 2
+            confirmed = False
+            for c in candidates:
+                dist_km = _storm_track_distance_km(storms_conn, points, c["id"], mid_unix)
+                if dist_km is not None and dist_km <= MAX_STORM_MATCH_DISTANCE_KM:
+                    confirmed = True
+                    break
+
+            if not confirmed:
+                conn.execute(
+                    "UPDATE missions SET storm_name = ?, storm_id = NULL WHERE mission_id = ?",
+                    (TRAINING_BUCKET_NAME, row["mission_id"]),
+                )
+                demoted += 1
+        if demoted:
+            conn.commit()
+        return demoted
     finally:
         storms_conn.close()
 
@@ -766,12 +948,21 @@ def run_ingest(years: Optional[list[int]] = None, force: bool = False) -> dict:
     cleaned = clean_null_island_observations(conn)
     if cleaned:
         summary["null_island_obs_removed"] = cleaned
+    corrected = apply_manual_storm_name_corrections(conn)
+    if corrected:
+        summary["manual_corrections_applied"] = corrected
     fixed = migrate_unknown_storm_names(conn)
     if fixed:
         summary["legacy_names_fixed"] = fixed
+    renamed = rename_legacy_training_bucket(conn)
+    if renamed:
+        summary["legacy_bucket_renamed"] = renamed
     reconciled = reconcile_storm_ids(conn)
     if reconciled:
         summary["storm_ids_reconciled"] = reconciled
+    mismatched = reconcile_mismatched_storm_names(conn)
+    if mismatched:
+        summary["mismatched_names_demoted"] = mismatched
     junk_fixed = reconcile_junk_storm_buckets(conn)
     if junk_fixed:
         summary["junk_buckets_reconciled"] = junk_fixed
