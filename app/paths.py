@@ -8,3 +8,4 @@ DATA_ROOT = REPO_ROOT / "data"
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 STORMS_DB_PATH = DATA_ROOT / "storms.sqlite"
 RECON_MET_DB_PATH = DATA_ROOT / "recon_met.sqlite"
+AUTH_DB_PATH = DATA_ROOT / "auth.sqlite"

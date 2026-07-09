@@ -2,13 +2,27 @@
 
 > Open-source HTTP API serving archival GOES satellite imagery and NOAA Tail
 > Doppler Radar (TDR) data as georeferenced map tiles, plus a raw-netCDF
-> passthrough for client-side rendering. CORS-open, no auth, free to call
-> from any web app.
+> passthrough for client-side rendering. CORS-open, free to call from any
+> web app. Token auth is opt-in per deployment (off by default) — see
+> "Authentication" below.
 
 Live base URL: https://joshmurdock.net/api
 Local dev base URL: http://127.0.0.1:8000
 OpenAPI schema (machine-readable, authoritative): {base}/openapi.json
 Interactive docs: {base}/docs
+
+## Authentication
+
+Off by default — check whether the specific instance you're calling has
+opted in (ask the operator, or just try an unauthenticated call: a 401
+means it's required). When enabled: every endpoint below except
+GET /v1/health needs `Authorization: Bearer <token>` (401 without one);
+get a token from the operator (admin console → API management), there's
+no self-service signup. Cached tile URLs under /cache/... are NEVER
+gated even when auth is on (the JSON endpoint that renders them is the
+gated one) since they're meant to be dropped straight into an <img>/
+Leaflet layer that can't send a header. Full reference: API.md
+"Authentication".
 
 ## Live endpoints
 
@@ -28,7 +42,7 @@ Interactive docs: {base}/docs
 - GET /v1/recon/mission/{mission_id}: Full decimated track for one mission (mission_id alone is enough, unique across all years/storms) — obs is an array of [unix_time, lat, lon, wind_kt, wind_dir, sfmr_kt, alt_m] tuples (~7 fields), plus source_url pointing at NOAA's original full-resolution NetCDF file (600+ variables).
 - GET /v1/recon/mission/{mission_id}/download: Streams (not redirects) NOAA's original full-resolution NetCDF file for this mission — use this for anything beyond position/wind/SFMR/altitude (attitude, airspeed, raw sensor channels, etc.), since /mission/{id}'s JSON only exposes the ~7 decimated fields.
 - GET /demo/netcdf-three/: Static demo page rendering netCDF data client-side via Three.js/WebGL (netcdf-three library). Currently loads sample data only.
-- GET / and /v1/admin/*: Login-gated admin console (cache stats/browsing/deletion, one-off queries, bulk timeframe prefetch). Not for general agent use — requires session login (POST /v1/admin/login). See API.md "Admin console" section if you're operating this deployment, not just consuming it.
+- GET / and /v1/admin/*: Login-gated admin console (cache stats/browsing/deletion, one-off queries, bulk timeframe prefetch, token/account management, login/usage logs, the auth on/off toggle). Not for general agent use — requires session login (POST /v1/admin/login) as a superuser or moderator account; token/account management and self-update are superuser-only. See API.md "Admin console"/"API management" sections if you're operating this deployment, not just consuming it.
 
 ## Planned endpoints (return 501 today, shape documented for forward compatibility)
 
@@ -50,7 +64,7 @@ const data = await fetch('https://joshmurdock.net/api/v1/satellite/tile?time=' +
 
 ## Notes
 
-- No auth, no API key, no enforced rate limit. Avoid polling status faster than every 3s.
+- No enforced rate limit even when token auth is on. Avoid polling status faster than every 3s.
 - Identical requests (same band/cmap/satellite/resolved-scan-time, plus center/width_km/resolution_km for a bbox request) hit a server-side cache — cheap to repeat.
 - Prefer center+dims over full-disk when you know roughly where you need imagery: measured ~11x faster processing (1.3s vs 14s for a 500km box) and ~130x smaller PNG. The initial ~25MB NOAA S3 download per scan is unaffected by bbox vs full-disk (not yet optimized).
 - resolution_km can't go finer than sensor native (2km for bands 7/9/13, 1km for bands 3/5, 0.5km for band 2) — finer requests are silently clamped up, not rejected.

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,8 +11,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import auth
 from app.logging_config import configure_logging
 from app.paths import CACHE_ROOT, REPO_ROOT
-from app.routers import admin, health, raw, recon, satellite, storms, tdr
-from app.services import self_update, stats
+from app.routers import admin, admin_tokens, health, raw, recon, satellite, storms, tdr
+from app.services import self_update, stats, tokens
 
 # How often the background task below checks GitHub for new commits. This
 # only ever updates the cached "is an update available" status the console
@@ -52,6 +52,24 @@ app.add_middleware(
 app.add_middleware(SessionMiddleware, secret_key=auth.get_secret_key())
 
 
+def _record_token_usage(request: Request, status_code: int) -> None:
+    """If app/auth.py's require_api_token dependency authenticated this
+    request (stashed on request.state.token_row), record it in the
+    per-token usage log with the now-known response status. A no-op for
+    every route that doesn't use that dependency (request.state has no
+    token_row attribute at all) or when auth is disabled (dependency sets
+    token_row = None)."""
+    token_row = getattr(request.state, "token_row", None)
+    if token_row is None:
+        return
+    conn = tokens.get_connection()
+    try:
+        client = request.client.host if request.client else None
+        tokens.record_usage(conn, token_row, request.url.path, request.method, status_code, client)
+    finally:
+        conn.close()
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """One log line per request (method, path, status, duration, client) to
@@ -66,6 +84,7 @@ async def log_requests(request: Request, call_next):
         client = request.client.host if request.client else "-"
         access_log.exception("%s %s -> EXCEPTION (%.1fms) client=%s", request.method, request.url.path, duration_ms, client)
         stats.record_request()
+        _record_token_usage(request, 500)
         raise
     duration_ms = (time.monotonic() - start) * 1000
     client = request.client.host if request.client else "-"
@@ -74,6 +93,7 @@ async def log_requests(request: Request, call_next):
         request.method, request.url.path, response.status_code, duration_ms, client,
     )
     stats.record_request()
+    _record_token_usage(request, response.status_code)
     return response
 
 app.mount("/cache", StaticFiles(directory=str(CACHE_ROOT)), name="cache")
@@ -83,13 +103,32 @@ app.mount(
     name="netcdf-three-demo",
 )
 
+# health stays fully open (monitoring); admin has its own session-cookie
+# auth. Every other public data router requires a valid API token IF
+# auth.is_auth_enabled() (off by default) — see app/auth.py's
+# require_api_token for the disabled-by-default short-circuit.
+_api_token_gate = [Depends(auth.require_api_token)]
 app.include_router(health.router, prefix="/v1")
-app.include_router(satellite.router, prefix="/v1")
-app.include_router(tdr.router, prefix="/v1")
-app.include_router(raw.router, prefix="/v1")
-app.include_router(storms.router, prefix="/v1")
-app.include_router(recon.router, prefix="/v1")
+app.include_router(satellite.router, prefix="/v1", dependencies=_api_token_gate)
+app.include_router(tdr.router, prefix="/v1", dependencies=_api_token_gate)
+app.include_router(raw.router, prefix="/v1", dependencies=_api_token_gate)
+app.include_router(storms.router, prefix="/v1", dependencies=_api_token_gate)
+app.include_router(recon.router, prefix="/v1", dependencies=_api_token_gate)
 app.include_router(admin.router, prefix="/v1")
+app.include_router(admin_tokens.router, prefix="/v1")
+
+
+@app.on_event("startup")
+async def _migrate_legacy_admin():
+    """One-time: if the tokens table is empty and the old single-shared-
+    admin admin_credentials.json exists, migrate it into the first
+    superuser account. No-op on every startup after the first — see
+    app/services/tokens.py's migrate_legacy_admin_credentials()."""
+    conn = tokens.get_connection()
+    try:
+        tokens.migrate_legacy_admin_credentials(conn)
+    finally:
+        conn.close()
 
 
 @app.on_event("startup")

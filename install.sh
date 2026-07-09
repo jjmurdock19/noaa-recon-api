@@ -51,6 +51,7 @@ WEBSERVER="none"        # none | nginx | apache
 HTTPS_ENABLED=""
 ADMIN_USER=""
 ADMIN_PASS=""
+AUTH_ENABLED="n"   # y | n — require API tokens for the public /v1/* data endpoints
 
 # ---------------------------------------------------------------------------
 # UI helpers — everything here writes prompts/decoration to stderr so that
@@ -278,6 +279,7 @@ API_PATH="${API_PATH}"
 DOMAIN_MODE="${DOMAIN_MODE}"
 WEBSERVER="${WEBSERVER}"
 HTTPS_ENABLED="${HTTPS_ENABLED}"
+AUTH_ENABLED="${AUTH_ENABLED}"
 CONF_EOF
     # 644, not 600: this file only holds paths/port/domain — no secrets
     # (the admin password is never persisted here) — and the CLI wrapper's
@@ -416,6 +418,38 @@ os.chmod(path, 0o600)
 PYEOF
     ADMIN_USER="$user"; ADMIN_PASS="$pass"
     log_ok "admin console credentials set (username: ${user})"
+    # This account becomes the first superuser automatically the first time
+    # the app starts (app/main.py's startup migration, see
+    # app/services/tokens.py's migrate_legacy_admin_credentials) — nothing
+    # more to do here beyond collecting the username/password above.
+}
+
+configure_auth() {
+    local auth_file="${INSTALL_DIR}/auth_config.json"
+    if [[ -f "$auth_file" ]]; then
+        log_ok "auth_config.json already exists — leaving it alone"
+        return
+    fi
+    log_step "Public API access"
+    if ask_yesno "Require an API token for the public data endpoints (satellite/storms/recon/tdr/raw)?" n; then
+        AUTH_ENABLED="y"
+    else
+        AUTH_ENABLED="n"
+    fi
+    local enabled_json="false"
+    [[ "$AUTH_ENABLED" == "y" ]] && enabled_json="true"
+    run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" - "$auth_file" "$enabled_json" <<'PYEOF'
+import json, sys
+path, enabled_json = sys.argv[1:3]
+with open(path, "w") as f:
+    json.dump({"enabled": json.loads(enabled_json)}, f, indent=2)
+    f.write("\n")
+PYEOF
+    if [[ "$AUTH_ENABLED" == "y" ]]; then
+        log_ok "API tokens required — issue accounts/keys from the admin console's API management pane after setup"
+    else
+        log_ok "public API left open (default) — you can require tokens later from the admin console"
+    fi
 }
 
 write_systemd_service() {
@@ -720,6 +754,7 @@ run_wizard() {
     clone_or_update_repo
     setup_python_env
     configure_admin_credentials
+    configure_auth
     write_systemd_service
     configure_webserver
     configure_https

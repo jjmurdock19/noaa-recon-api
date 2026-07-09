@@ -212,10 +212,23 @@
   .col-preview.active { display: block; }
   .col-archive { flex: 2 1 480px; min-width: 0; }
   .col-add { flex: 1 1 340px; max-width: 420px; min-width: 0; }
+  .col-api { flex: 1 1 340px; max-width: 420px; min-width: 0; }
+  @media (max-width: 1400px) {
+    .col-api { max-width: none; width: 100%; }
+  }
   @media (max-width: 1050px) {
     .console-columns { flex-direction: column; }
-    .col-preview, .col-archive, .col-add { max-width: none; width: 100%; position: static; }
+    .col-preview, .col-archive, .col-add, .col-api { max-width: none; width: 100%; position: static; }
   }
+
+  /* Role badges (tokens table, login/usage log) — same palette as the
+     existing status-text ok/err/working classes, just as pill-shaped
+     spans since a role is a fixed label, not a transient state. */
+  .role-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .role-badge.superuser { background: var(--error); color: #fff; }
+  .role-badge.moderator { background: var(--warning); color: #000; }
+  .role-badge.regular { background: var(--btn-neutral-hover); color: var(--text); }
+  .revoked-row { opacity: 0.5; }
 
   /* Scrolling frames for cache tables so a large cache doesn't blow up the page.
      overflow-x here is what lets a table wider than its column scroll in
@@ -566,6 +579,112 @@
       </section>
     </div>
 
+    <div class="col-api" id="col-api">
+      <section id="auth-toggle-section" style="display:none;">
+        <h2>Public API authentication</h2>
+        <div class="row">
+          <span class="status-text" id="auth-toggle-status">Loading…</span>
+        </div>
+        <div class="row">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+            <input type="checkbox" id="auth-enabled-checkbox" />
+            Require an API token for public /v1/* calls
+          </label>
+        </div>
+        <div class="status-text" style="margin-top:6px;">
+          /v1/health and the admin console stay reachable either way. Cached
+          tile URLs under /cache/ are never gated (see API.md).
+        </div>
+      </section>
+
+      <section id="tokens-section" style="display:none;">
+        <h2>
+          Tokens
+          <button class="clear-btn" id="tokens-refresh-btn">Refresh</button>
+        </h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr>
+              <th>Role</th><th>Owner</th><th>Username</th><th>Created</th>
+              <th>Last used</th><th>Revoked</th><th></th>
+            </tr></thead>
+            <tbody id="tokens-body"></tbody>
+          </table>
+        </div>
+
+        <div class="row" style="margin-top:14px; border-top:1px solid var(--border); padding-top:14px;">
+          <div class="field-group">
+            <span class="field-label">Role</span>
+            <select id="tok-role">
+              <option value="regular">regular (API key only)</option>
+              <option value="moderator">moderator</option>
+              <option value="superuser">superuser</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Owner name</span>
+            <input type="text" id="tok-owner-name" placeholder="Jane Doe" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Owner email (optional)</span>
+            <input type="text" id="tok-owner-email" placeholder="jane@example.com" />
+          </div>
+        </div>
+        <div class="row" id="tok-login-fields" style="display:none;">
+          <div class="field-group">
+            <span class="field-label">Console username</span>
+            <input type="text" id="tok-username" />
+          </div>
+          <div class="field-group">
+            <span class="field-label">Console password</span>
+            <input type="password" id="tok-password" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="field-group" style="flex:1 1 100%;">
+            <span class="field-label">Notes (optional)</span>
+            <input type="text" id="tok-notes" style="width:100%;" />
+          </div>
+        </div>
+        <div class="row">
+          <button class="primary-btn" id="tok-create-btn">Create token</button>
+          <span class="status-text" id="tok-create-status"></span>
+        </div>
+        <div id="tok-new-secret" style="display:none; margin-top:8px;">
+          <div class="status-text err">
+            Copy this now — it's shown once and can't be retrieved again:
+          </div>
+          <code id="tok-new-secret-value" style="display:block; word-break:break-all; padding:8px; background:var(--bg-input); border-radius:4px; margin-top:4px;"></code>
+        </div>
+      </section>
+
+      <section id="login-log-section" style="display:none;">
+        <h2>
+          Login log
+          <button class="clear-btn" id="login-log-refresh-btn">Refresh</button>
+        </h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>When</th><th>Username</th><th>Role</th><th>Result</th><th>IP</th></tr></thead>
+            <tbody id="login-log-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="usage-log-section" style="display:none;">
+        <h2>
+          Usage log
+          <button class="clear-btn" id="usage-log-refresh-btn">Refresh</button>
+        </h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>When</th><th>Owner</th><th>Role</th><th>Method</th><th>Endpoint</th><th>Status</th></tr></thead>
+            <tbody id="usage-log-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
   </div>
 
 </main>
@@ -633,9 +752,24 @@ function showApp() {
     document.getElementById('login-wrap').style.display = 'none';
     document.getElementById('app-header').style.display = 'flex';
     document.getElementById('app-main').classList.add('shown');
+    applyRoleVisibility();
     refreshAll();
     pollLogs();
     startLiveRefresh();
+}
+
+// ── Role-based visibility — the backend enforces all of this for real
+// (a moderator hitting /v1/admin/tokens directly still gets a 403); this
+// just keeps a moderator's console from showing sections that would only
+// ever error out for them.
+let currentRole = null;
+function applyRoleVisibility() {
+    const superuserOnly = ['auth-toggle-section', 'tokens-section', 'login-log-section'];
+    const isSuperuser = currentRole === 'superuser';
+    superuserOnly.forEach((id) => {
+        document.getElementById(id).style.display = isSuperuser ? '' : 'none';
+    });
+    document.getElementById('usage-log-section').style.display = '';
 }
 
 // ── Live refresh — polls status/cache tables so entries update as jobs
@@ -668,6 +802,7 @@ function stopLiveRefresh() {
 async function checkAuth() {
     const res = await fetch(API_BASE + '/v1/admin/whoami', { credentials: 'same-origin' });
     const data = await res.json();
+    currentRole = data.role || null;
     if (data.authenticated) showApp(); else showLogin();
 }
 
@@ -711,6 +846,8 @@ document.getElementById('login-btn').addEventListener('click', async () => {
             body: JSON.stringify({ username, password }),
         });
         if (!res.ok) { errEl.textContent = 'Invalid username or password.'; return; }
+        const data = await res.json();
+        currentRole = data.role || null;
         showApp();
     } catch (e) {
         errEl.textContent = 'Network error: ' + e.message;
@@ -1101,6 +1238,187 @@ document.getElementById('self-update-apply-btn').addEventListener('click', async
     pollSelfUpdateJob();
 });
 
+// ── API management: auth toggle, tokens, login log, usage log ──────────
+// All superuser-only except usage log — see applyRoleVisibility above,
+// which is UI-only; the backend (app/routers/admin_tokens.py) enforces
+// this for real regardless of what the console shows.
+function fmtTs(unixSeconds) {
+    if (!unixSeconds) return '—';
+    return new Date(unixSeconds * 1000).toLocaleString();
+}
+
+async function refreshAuthToggle() {
+    try {
+        const res = await api('/v1/admin/auth-config');
+        const data = await res.json();
+        document.getElementById('auth-enabled-checkbox').checked = data.enabled;
+        document.getElementById('auth-toggle-status').textContent = data.enabled
+            ? 'Enabled — public /v1/* calls require a valid token.'
+            : 'Disabled — public /v1/* calls are open (today\'s default).';
+    } catch (e) {}
+}
+
+document.getElementById('auth-enabled-checkbox').addEventListener('change', async (ev) => {
+    const enabling = ev.target.checked;
+    if (enabling && !confirm('Every unauthenticated API caller will start getting 401s immediately. Continue?')) {
+        ev.target.checked = false;
+        return;
+    }
+    try {
+        await api('/v1/admin/auth-config', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: enabling }),
+        });
+    } catch (e) {}
+    refreshAuthToggle();
+});
+
+function roleBadge(role) {
+    return `<span class="role-badge ${role}">${role}</span>`;
+}
+
+async function refreshTokens() {
+    try {
+        const res = await api('/v1/admin/tokens');
+        const data = await res.json();
+        document.getElementById('tokens-body').innerHTML = data.tokens.map((t) => `
+            <tr class="${t.revoked ? 'revoked-row' : ''}">
+                <td>${roleBadge(t.role)}</td>
+                <td>${t.owner_name}${t.owner_email ? `<br><span class="status-text">${t.owner_email}</span>` : ''}</td>
+                <td>${t.username || '—'}</td>
+                <td>${fmtTs(t.created_at)}</td>
+                <td>${fmtTs(t.last_used_at)}</td>
+                <td><input type="checkbox" data-tok-revoke="${t.id}" ${t.revoked ? 'checked' : ''} /></td>
+                <td>
+                    <button class="clear-btn" data-tok-regen="${t.id}">Regenerate</button>
+                    <button class="clear-btn" data-tok-delete="${t.id}">Delete</button>
+                </td>
+            </tr>`).join('');
+    } catch (e) {}
+}
+
+document.getElementById('tokens-refresh-btn').addEventListener('click', refreshTokens);
+
+document.getElementById('tokens-body').addEventListener('change', async (ev) => {
+    const id = ev.target.getAttribute('data-tok-revoke');
+    if (id == null) return;
+    await api(`/v1/admin/tokens/${id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ revoked: ev.target.checked }),
+    });
+    refreshTokens();
+});
+
+document.getElementById('tokens-body').addEventListener('click', async (ev) => {
+    const regenId = ev.target.getAttribute('data-tok-regen');
+    const delId = ev.target.getAttribute('data-tok-delete');
+    if (regenId != null) {
+        if (!confirm('Issue a new secret for this token? The old one stops working immediately.')) return;
+        const res = await api(`/v1/admin/tokens/${regenId}/regenerate`, { method: 'POST' });
+        const data = await res.json();
+        showNewTokenSecret(data.token);
+        refreshTokens();
+    } else if (delId != null) {
+        if (!confirm('Permanently delete this token? Usage/login history is kept, but the token stops working immediately.')) return;
+        await api(`/v1/admin/tokens/${delId}`, { method: 'DELETE' });
+        refreshTokens();
+    }
+});
+
+document.getElementById('tok-role').addEventListener('change', (ev) => {
+    const needsLogin = ev.target.value !== 'regular';
+    document.getElementById('tok-login-fields').style.display = needsLogin ? '' : 'none';
+});
+
+function showNewTokenSecret(rawToken) {
+    document.getElementById('tok-new-secret').style.display = 'block';
+    document.getElementById('tok-new-secret-value').textContent = rawToken;
+}
+
+document.getElementById('tok-create-btn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('tok-create-status');
+    const role = document.getElementById('tok-role').value;
+    const owner_name = document.getElementById('tok-owner-name').value.trim();
+    if (!owner_name) { statusEl.textContent = 'Owner name is required.'; statusEl.className = 'status-text err'; return; }
+
+    const body = {
+        role, owner_name,
+        owner_email: document.getElementById('tok-owner-email').value.trim() || null,
+        notes: document.getElementById('tok-notes').value.trim() || null,
+    };
+    if (role !== 'regular') {
+        body.username = document.getElementById('tok-username').value.trim();
+        body.password = document.getElementById('tok-password').value;
+        if (!body.username || !body.password) {
+            statusEl.textContent = `${role} tokens need a console username and password.`;
+            statusEl.className = 'status-text err';
+            return;
+        }
+    }
+
+    statusEl.textContent = 'Creating…';
+    statusEl.className = 'status-text working';
+    try {
+        const res = await api('/v1/admin/tokens', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            statusEl.textContent = 'Error: ' + (err.detail || 'request failed');
+            statusEl.className = 'status-text err';
+            return;
+        }
+        const data = await res.json();
+        statusEl.textContent = 'Created.';
+        statusEl.className = 'status-text ok';
+        showNewTokenSecret(data.token);
+        document.getElementById('tok-owner-name').value = '';
+        document.getElementById('tok-owner-email').value = '';
+        document.getElementById('tok-notes').value = '';
+        document.getElementById('tok-username').value = '';
+        document.getElementById('tok-password').value = '';
+        refreshTokens();
+    } catch (e) {
+        statusEl.textContent = 'Network error: ' + e.message;
+        statusEl.className = 'status-text err';
+    }
+});
+
+async function refreshLoginLog() {
+    try {
+        const res = await api('/v1/admin/login-log');
+        const data = await res.json();
+        document.getElementById('login-log-body').innerHTML = data.entries.map((e) => `
+            <tr>
+                <td>${fmtTs(e.timestamp)}</td>
+                <td>${e.username}</td>
+                <td>${e.role ? roleBadge(e.role) : '—'}</td>
+                <td class="${e.success ? 'fg-success' : 'fg-error'}">${e.success ? 'success' : 'failed'}</td>
+                <td>${e.ip || '—'}</td>
+            </tr>`).join('');
+    } catch (e) {}
+}
+
+document.getElementById('login-log-refresh-btn').addEventListener('click', refreshLoginLog);
+
+async function refreshUsageLog() {
+    try {
+        const res = await api('/v1/admin/usage-log');
+        const data = await res.json();
+        document.getElementById('usage-log-body').innerHTML = data.entries.map((e) => `
+            <tr>
+                <td>${fmtTs(e.timestamp)}</td>
+                <td>${e.owner_name}</td>
+                <td>${roleBadge(e.role)}</td>
+                <td>${e.method}</td>
+                <td>${e.endpoint}</td>
+                <td class="${e.status_code >= 400 ? 'fg-error' : 'fg-success'}">${e.status_code ?? '—'}</td>
+            </tr>`).join('');
+    } catch (e) {}
+}
+
+document.getElementById('usage-log-refresh-btn').addEventListener('click', refreshUsageLog);
+
 // The subset that's safe to re-run on a recurring timer without disturbing
 // anything the operator is mid-interaction with (see startLiveRefresh above).
 function refreshLive() {
@@ -1108,6 +1426,12 @@ function refreshLive() {
     refreshSatelliteCache();
     refreshGoesNcCache();
     refreshSelfUpdateStatus();
+    refreshUsageLog();
+    if (currentRole === 'superuser') {
+        refreshAuthToggle();
+        refreshTokens();
+        refreshLoginLog();
+    }
 }
 
 function refreshAll() {

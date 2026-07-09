@@ -66,6 +66,44 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 
 ---
 
+## Authentication
+
+Off by default — every endpoint below behaves exactly as documented, no
+setup required. A deployer can opt into requiring an API token for the
+public data endpoints (e.g. to track or restrict usage on their own
+instance); check `GET /v1/health` or ask the operator if you're not sure
+whether the instance you're calling has it turned on.
+
+When enabled:
+
+- **Every `/v1/*` data endpoint** (satellite, storms, recon, tdr, raw)
+  requires `Authorization: Bearer <token>`. An expired/missing/revoked
+  token gets a `401`.
+- **`GET /v1/health`** and the admin console's own login screen stay
+  reachable without a token either way — health checks and "is this API
+  up" monitoring shouldn't depend on having a key.
+- **Cached tile URLs stay unauthenticated by design.** A satellite tile
+  request returns a `png_url` under `/cache/...` once rendered (see
+  `GET /v1/satellite/status/{key}`) — that URL gets embedded directly in
+  an `<img>` tag or a Leaflet `imageOverlay`, neither of which can send a
+  custom header. The token gate only applies to the JSON endpoint that
+  *starts* a render; its resulting cache key isn't guessable without
+  already having called that gated endpoint.
+- Any token works regardless of role — a superuser/moderator's own token
+  (the same one that doubles as part of their console login) is just as
+  valid an `Authorization: Bearer` value as a plain API key issued to a
+  third party.
+
+Get a token from whoever runs the instance (admin console → API
+management → Tokens). There is no self-service signup.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://joshmurdock.net/api/v1/satellite/tile?time=2024-09-28T12:00:00Z&band=13"
+```
+
+---
+
 ## `GET /v1/health`
 
 ```bash
@@ -575,22 +613,35 @@ archive size/record counts, a browsable viewer (year -> storm -> track
 points/missions) over both, and a "force update" button per archive to
 run the nightly ingest on demand instead of waiting for the timer. Static
 page at `app/console/index.html`, calling the `/v1/admin/*` JSON endpoints
-below. See the README's "Admin console" section for the credentials file
-(`admin_credentials.json`, gitignored, default `admin`/`password` —
-change it before exposing this publicly).
+below.
+
+Every console user has their own account (username + password) with one
+of two roles — see "API management" below for how accounts/tokens are
+created:
+
+- **superuser** — everything, including the API management pane (tokens,
+  login log, the public-auth toggle) and triggering self-update.
+- **moderator** — everything *except* API management and self-update
+  (cache, logs, databases, archive-rebuild triggers, usage log).
+
+The very first account is bootstrapped automatically from the legacy
+single-shared-admin credentials file (`admin_credentials.json`, gitignored,
+default `admin`/`password` — change it before exposing this publicly) the
+first time the app starts after upgrading to token auth; see the README's
+"Admin console" section.
 
 ```
 https://joshmurdock.net/api/
 ```
 
-### `/v1/admin/*` endpoints (all require a logged-in session except login/whoami)
+### `/v1/admin/*` endpoints (all require a logged-in session except login/whoami/public-stats)
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/v1/admin/public-stats` | GET | **No login required.** Shown on the console's login screen so anyone can see basic health before authenticating: `{healthy, uptime_seconds, calls_last_hour, total_calls}`. Deliberately excludes cache/storage figures — those stay behind login in `/status` below. In-memory counters, reset on process restart. |
-| `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie or `401`. |
+| `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie and returns `{status, role, username}`, or `401`. Every attempt (success or failure) is recorded to the login log. |
 | `/v1/admin/logout` | POST | Clears the session. |
-| `/v1/admin/whoami` | GET | `{authenticated: bool}` — no login required, used by the console to decide whether to show the login form. |
+| `/v1/admin/whoami` | GET | `{authenticated: bool, role, username}` — no login required, used by the console to decide whether to show the login form and which sections a given role should see. |
 | `/v1/admin/status` | GET | Cache stats (`satellite`/`goes_nc` file count + bytes + total) **and** database stats: `databases.storms` (`bytes`, `storm_count`), `databases.recon_met` (`bytes`, `mission_count`), a `databases.total_bytes`, and a `grand_total_bytes` across everything. |
 | `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry — **every field the render pipeline wrote** (key, status, band, cmap, satellite, sat_lon, scan_start, bounds, center, width_km, resolution_km, png_url, size, modified), not a curated subset, so the console's preview pane has everything without a second round-trip. |
 | `/v1/admin/cache/satellite/{key}` | DELETE | Delete one entry's `.png`/`.json`/`.lock` files. |
@@ -604,6 +655,24 @@ https://joshmurdock.net/api/
 | `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
 | `/v1/admin/archive-update/{archive}` | POST | Force-run the storms or recon MET nightly ingest immediately — `archive` is `storms` or `recon_met`. Same code path as the systemd timer (`storms.run_ingest()` / `recon_met.run_ingest()`), just triggered on demand for data that hasn't been picked up yet. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). |
 | `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done, started_at, finished_at, summary, error}`. |
+| `/v1/admin/self-update/status` | GET | Cached "is an update available" check plus any in-progress apply job. |
+| `/v1/admin/self-update/check` | POST | **Superuser only.** Force an immediate GitHub check, bypassing the periodic timer. |
+| `/v1/admin/self-update/apply` | POST | **Superuser only.** Pull the latest code and restart the process. |
+| `/v1/admin/self-update/apply` | GET | Poll the in-progress apply job (same as `/self-update/status`'s `job` field). |
+
+### API management (superuser only, except usage log)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/v1/admin/tokens` | GET | List every token/account (role, owner, username, timestamps, revoked) — never the raw secret or password. |
+| `/v1/admin/tokens` | POST | Create a token. `{role, owner_name, owner_email?, notes?, username?, password?}` — `username`/`password` required unless `role` is `regular`. Returns the raw token **once**; it can't be retrieved again (only regenerated, invalidating the old one). |
+| `/v1/admin/tokens/{id}` | PATCH | Edit `owner_name`/`owner_email`/`notes`/`revoked`/`username`/`password`. |
+| `/v1/admin/tokens/{id}` | DELETE | Permanently delete. Usage/login log entries keep their own snapshot of owner/role/username, so history isn't lost. |
+| `/v1/admin/tokens/{id}/regenerate` | POST | Issue a new secret for an existing token, invalidating the old one. Same one-time-reveal behavior as create. |
+| `/v1/admin/login-log` | GET | `?limit=` (default 200, max 1000) most recent console login attempts — username, role, success/failure, IP, user agent, timestamp. Superuser-only since it reveals other admins' usernames/IPs. |
+| `/v1/admin/usage-log` | GET | `?token_id=&limit=` (default 200, max 1000) most recent public-API calls — owner, role, endpoint, method, status code, IP, timestamp. Visible to moderators too (it's usage data, not a permissions surface). Empty unless auth is enabled and at least one token has been used. |
+| `/v1/admin/auth-config` | GET | `{enabled: bool}` — whether the public API currently requires a token. |
+| `/v1/admin/auth-config` | POST | `{enabled: bool}` — flip it. Takes effect immediately, no restart. |
 
 ### Bulk prefetch
 

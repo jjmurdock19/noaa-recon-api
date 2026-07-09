@@ -18,7 +18,7 @@ from app import auth
 from app.logging_config import LOG_FILE
 from app.paths import CACHE_ROOT, RECON_MET_DB_PATH, STORMS_DB_PATH
 from app.routers.satellite import VALID_BANDS, VALID_CMAPS, _cache, _nc_cache_dir, _parse_center
-from app.services import goes, recon_met, self_update, stats, storms
+from app.services import goes, recon_met, self_update, stats, storms, tokens
 from app.services.netcdf_lock import NC_LOCK
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -46,13 +46,31 @@ async def public_stats():
 # ── Auth ─────────────────────────────────────────────────────────────────
 @router.post("/login")
 async def login(request: Request):
+    """Checks username/password against a superuser/moderator account in
+    the tokens table (app/services/tokens.py) — the single shared
+    admin/password login is gone; every console user is now their own
+    account. Every attempt (success or failure) is recorded to login_log
+    for audit, with the raw attempted username kept even on failure."""
     body = await request.json()
     username = str(body.get("username", ""))
     password = str(body.get("password", ""))
-    if not auth.verify_credentials(username, password):
+    client = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    conn = tokens.get_connection()
+    try:
+        row = tokens.verify_admin_login(conn, username, password)
+        tokens.record_login(conn, username, row, success=row is not None, ip=client, user_agent=user_agent)
+    finally:
+        conn.close()
+
+    if row is None:
         raise HTTPException(401, "Invalid username or password")
     request.session["authenticated"] = True
-    return {"status": "ok"}
+    request.session["token_id"] = row["id"]
+    request.session["role"] = row["role"]
+    request.session["username"] = row["username"]
+    return {"status": "ok", "role": row["role"], "username": row["username"]}
 
 
 @router.post("/logout")
@@ -63,7 +81,13 @@ async def logout(request: Request):
 
 @router.get("/whoami")
 async def whoami(request: Request):
-    return {"authenticated": auth.is_authenticated(request)}
+    if not auth.is_authenticated(request):
+        return {"authenticated": False}
+    return {
+        "authenticated": True,
+        "role": request.session.get("role"),
+        "username": request.session.get("username"),
+    }
 
 
 # ── Status / cache stats ────────────────────────────────────────────────
@@ -437,7 +461,7 @@ async def get_self_update_status():
     return {"check": self_update.get_cached_check(), "job": _self_update_job}
 
 
-@router.post("/self-update/check", dependencies=[Depends(auth.require_login)])
+@router.post("/self-update/check", dependencies=[Depends(auth.require_superuser)])
 async def force_self_update_check():
     """'Check now' button — bypasses the periodic timer for an immediate fetch."""
     try:
@@ -453,7 +477,7 @@ def _run_self_update():
     self_update.apply_update(_self_update_job)
 
 
-@router.post("/self-update/apply", dependencies=[Depends(auth.require_login)])
+@router.post("/self-update/apply", dependencies=[Depends(auth.require_superuser)])
 async def start_self_update(background_tasks: BackgroundTasks):
     if _self_update_job["status"] in _SELF_UPDATE_IN_PROGRESS_STATUSES:
         raise HTTPException(409, "An update is already in progress")

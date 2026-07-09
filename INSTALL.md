@@ -122,7 +122,19 @@ The API ships with a small web dashboard (cache stats, database browser,
 force-refresh buttons) gated behind a login. The installer generates a
 random password for you by default — **it's shown once, at the very
 end, so save it somewhere** (a password manager, a sticky note, whatever
-you'd trust with any other admin password).
+you'd trust with any other admin password). This account becomes your
+first **superuser** — from the console's API management pane you can
+create additional superuser/moderator accounts (their own username/
+password) or plain API-key tokens for other people, each tracked in the
+login/usage logs.
+
+**"Require an API token for the public data endpoints?"**
+Off by default — the satellite/storms/recon/tdr/raw endpoints stay open
+exactly like today, so anyone can drop this API straight into a Leaflet
+map with no setup. Say yes if you'd rather track/restrict who calls your
+instance; `/v1/health` and the admin console always stay reachable
+without a token either way. This can be flipped later from the admin
+console without reinstalling.
 
 **"Build the storm-track and recon MET archives now?"**
 These are the actual databases the API serves data from. The storm-track
