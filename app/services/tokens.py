@@ -187,8 +187,15 @@ def edit_token(
 def delete_token(conn: sqlite3.Connection, token_id: int) -> bool:
     """Hard delete. login_log/usage_log rows keep their own denormalized
     owner_name/role/username snapshot (see module docstring), so deleting
-    a token doesn't erase its history — only conn.execute's FK is a plain
-    reference, not ON DELETE CASCADE."""
+    a token doesn't erase its history.
+
+    tokens.created_by is a real FK (REFERENCES tokens(id), enforced via
+    PRAGMA foreign_keys = ON), with no ON DELETE clause — so deleting a
+    token that itself created other tokens used to fail with "FOREIGN KEY
+    constraint failed" (an unhandled 500) instead of deleting. Null out
+    those references first; the accounts that were created stay intact,
+    they just lose the "created by" attribution."""
+    conn.execute("UPDATE tokens SET created_by = NULL WHERE created_by = ?", (token_id,))
     cur = conn.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
     conn.commit()
     return cur.rowcount > 0

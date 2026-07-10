@@ -427,6 +427,7 @@
             <select id="db-view-storm" disabled><option value="">Storm...</option></select>
           </div>
           <button class="primary-btn" id="db-view-load-btn" disabled>Load</button>
+          <button class="view-btn" id="db-view-preview-btn" style="display:none;">Preview track</button>
           <span class="status-text" id="db-view-status"></span>
         </div>
         <div class="table-scroll" style="margin-top:10px;">
@@ -1121,6 +1122,103 @@ async function previewGoesNcEntry(filename) {
     }
 }
 
+// ── Track preview (storm best-track / recon flight path) ────────────────
+// No mapping library is loaded (the console is a single self-contained
+// file, same as everything else here) — a plain equirectangular-projected
+// SVG polyline is enough to eyeball a track's shape/coverage, which is all
+// this preview is for.
+function renderTrackSvg(latLonPairs) {
+    const width = 460, height = 300, pad = 24;
+    const lats = latLonPairs.map((p) => p[0]);
+    const lons = latLonPairs.map((p) => p[1]);
+    const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+    const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+    const latSpan = Math.max(maxLat - minLat, 0.05);
+    const lonSpan = Math.max(maxLon - minLon, 0.05);
+    const w = width - pad * 2, h = height - pad * 2;
+    const project = ([lat, lon]) => [
+        pad + ((lon - minLon) / lonSpan) * w,
+        pad + (1 - (lat - minLat) / latSpan) * h,
+    ];
+    const pts = latLonPairs.map(project);
+    const d = pts.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+    const [sx, sy] = pts[0];
+    const [ex, ey] = pts[pts.length - 1];
+    return `
+        <svg viewBox="0 0 ${width} ${height}" width="100%" style="background:var(--bg-panel); border:1px solid var(--border);">
+            <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+            <circle cx="${sx}" cy="${sy}" r="4" fill="var(--success)" />
+            <circle cx="${ex}" cy="${ey}" r="4" fill="var(--error)" />
+        </svg>
+        <div class="status-text" style="margin-top:4px;">
+            <span class="fg-success">●</span> start &nbsp; <span class="fg-error">●</span> end
+        </div>
+    `;
+}
+
+function previewStormTrack() {
+    if (!_lastStormTrack) return;
+    const points = (_lastStormTrack.points || []).filter((p) => p.lat != null && p.lon != null);
+    if (points.length < 2) {
+        showPreview('<div class="status-text err">Not enough track points to plot.</div>');
+        return;
+    }
+    const rows = [
+        ['Storm', `${_lastStormTrack.name} (${_lastStormTrack.basin})`],
+        ['Year', _lastStormTrack.year],
+        ['ATCF ID', _lastStormTrack.atcf_id],
+        ['Track points', points.length],
+        ['First fix', `${points[0].datetime_utc} — ${points[0].status}`],
+        ['Last fix', `${points[points.length - 1].datetime_utc} — ${points[points.length - 1].status}`],
+        ['Peak wind', `${Math.max(...points.map((p) => p.wind_kt || 0))} kt`],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+    showPreview(`
+        <div class="preview-flex">
+            ${renderTrackSvg(points.map((p) => [p.lat, p.lon]))}
+            <table class="meta-table">${rows}</table>
+        </div>
+    `);
+}
+document.getElementById('db-view-preview-btn').addEventListener('click', previewStormTrack);
+
+async function previewReconMission(missionId) {
+    showPreview('<div class="status-text">Loading…</div>');
+    try {
+        const res = await api(`/v1/recon/mission/${encodeURIComponent(missionId)}`);
+        if (!res.ok) {
+            const err = await res.json();
+            showPreview(`<div class="status-text err">Error: ${err.detail || 'failed to load mission'}</div>`);
+            return;
+        }
+        const m = await res.json();
+        // obs rows: [unix_time, lat, lon, wind_kt, wind_dir, sfmr_kt, alt_m] — see app/routers/recon.py
+        const points = (m.obs || []).filter((o) => o[1] != null && o[2] != null);
+        if (points.length < 2) {
+            showPreview('<div class="status-text err">Not enough observations to plot a track.</div>');
+            return;
+        }
+        const maxWind = Math.max(...points.map((o) => o[3] || 0));
+        const rows = [
+            ['Mission ID', m.mission_id],
+            ['Storm', `${m.storm_name || 'Training / Research'} (${m.year})`],
+            ['Aircraft', `${m.aircraft ?? '—'} (${m.tail_num ?? '—'})`],
+            ['Flight date', m.flight_date ?? '—'],
+            ['Start (UTC)', new Date(m.start_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')],
+            ['End (UTC)', new Date(m.end_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')],
+            ['Observations', m.obs_count],
+            ['Peak wind', `${maxWind} kt`],
+        ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+        showPreview(`
+            <div class="preview-flex">
+                ${renderTrackSvg(points.map((o) => [o[1], o[2]]))}
+                <table class="meta-table">${rows}</table>
+            </div>
+        `);
+    } catch (e) {
+        showPreview(`<div class="status-text err">Network error: ${e.message}</div>`);
+    }
+}
+
 document.getElementById('clear-satellite-btn').addEventListener('click', async () => {
     if (!confirm('Delete ALL rendered tile cache entries?')) return;
     await api('/v1/admin/cache/satellite', { method: 'DELETE' });
@@ -1550,6 +1648,8 @@ async function refreshDbViewYears() {
     stormSel.innerHTML = '<option value="">Storm...</option>';
     stormSel.disabled = true;
     document.getElementById('db-view-load-btn').disabled = true;
+    document.getElementById('db-view-preview-btn').style.display = 'none';
+    _lastStormTrack = null;
     document.getElementById('db-view-thead').innerHTML = '';
     document.getElementById('db-view-body').innerHTML = '';
 
@@ -1620,11 +1720,19 @@ function renderDbViewTable(type, data) {
                 <td>${new Date(m.start_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
                 <td>${new Date(m.end_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td>
                 <td>${m.obs_count}</td>
-                <td class="actions-cell"><a class="view-btn" href="${API_BASE}/v1/recon/mission/${m.mission_id}/download" target="_blank" rel="noopener">Download</a></td>
+                <td class="actions-cell">
+                    <button class="view-btn preview-mission-btn" data-mission-id="${m.mission_id}">Preview</button>
+                    <a class="view-btn" href="${API_BASE}/v1/recon/mission/${m.mission_id}/download" target="_blank" rel="noopener">Download</a>
+                </td>
             </tr>`).join('') : '<tr class="empty-row"><td colspan="8">No missions.</td></tr>';
         setDbViewStatus(`${missions.length} missions — ${data.storm_name} ${data.year}`, 'ok');
+        tbody.querySelectorAll('.preview-mission-btn').forEach((btn) => {
+            btn.addEventListener('click', () => previewReconMission(btn.dataset.missionId));
+        });
     }
 }
+
+let _lastStormTrack = null;
 
 document.getElementById('db-view-load-btn').addEventListener('click', async () => {
     const type = document.getElementById('db-view-type').value;
@@ -1633,6 +1741,8 @@ document.getElementById('db-view-load-btn').addEventListener('click', async () =
     if (!year || !stormVal) return;
 
     setDbViewStatus('Loading…', 'working');
+    document.getElementById('db-view-preview-btn').style.display = 'none';
+    _lastStormTrack = null;
     let path;
     if (type === 'storms') {
         const [name, basin] = stormVal.split('|');
@@ -1647,7 +1757,12 @@ document.getElementById('db-view-load-btn').addEventListener('click', async () =
             setDbViewStatus('Error: ' + (err.detail || 'failed to load'), 'err');
             return;
         }
-        renderDbViewTable(type, await res.json());
+        const data = await res.json();
+        renderDbViewTable(type, data);
+        if (type === 'storms' && (data.points || []).length > 1) {
+            _lastStormTrack = data;
+            document.getElementById('db-view-preview-btn').style.display = '';
+        }
     } catch (e) {
         setDbViewStatus('Network error: ' + e.message, 'err');
     }
