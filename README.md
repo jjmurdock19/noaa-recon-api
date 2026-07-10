@@ -148,8 +148,8 @@ framework or package to fetch beyond the script itself:
    a domain deployment, and can request a free **Let's Encrypt** HTTPS
    certificate via `certbot`.
 6. Builds the storm-track and recon MET archives (SQLite databases under
-   `data/`) and installs two nightly **systemd timers** to keep them current
-   going forward.
+   `data/`) and installs three nightly **systemd timers**: two to keep them
+   current going forward, plus one to clear out stale cached netCDF files.
 7. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
    `update`/`uninstall`) for living with the install afterward.
 
@@ -546,6 +546,32 @@ hurricanes site's already-harvested `met_archive.sqlite` (same underlying
 data, this project just now owns the feature) rather than re-crawling
 years of identical data over the network — not needed on a fresh
 deployment with no pre-existing archive, hence `--full` above instead.
+
+### GOES netCDF cache cleanup
+
+`cache/goes_nc/` holds the raw netCDF scans downloaded from S3 before
+rendering (see `ensure_downloaded()` in `app/services/goes.py`) — they're
+re-fetched on demand, so nothing is lost by deleting old ones. Run the
+cleanup manually any time:
+
+```bash
+.venv/bin/python3 scripts/clear_nc_cache.py                    # delete files older than 24h
+.venv/bin/python3 scripts/clear_nc_cache.py --max-age-hours 48 # different cutoff
+.venv/bin/python3 scripts/clear_nc_cache.py --dry-run          # preview only, deletes nothing
+```
+
+Install the nightly timer to keep the cache trimmed automatically:
+
+```bash
+sudo cp deploy/goes-nc-cache-cleanup.service deploy/goes-nc-cache-cleanup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now goes-nc-cache-cleanup.timer
+```
+
+Fires nightly at 04:15 (after both archive-update timers), deleting any
+cached netCDF file older than 1 day. `Persistent=true` for the same
+missed-run-catches-up-on-boot behavior as the other timers. Also visible
+in Cockpit's Services page (search "goes-nc-cache-cleanup").
 
 ### Admin console
 

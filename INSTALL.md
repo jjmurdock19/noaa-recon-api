@@ -64,7 +64,8 @@ Under the hood, `install.sh`:
    Apache to forward traffic to it, and can request a free HTTPS
    certificate for you (via Let's Encrypt / certbot).
 6. Downloads the storm-track and hurricane-recon-flight archives the API
-   serves, and installs two nightly timers that keep them current forever
+   serves, and installs three nightly timers: two that keep them current
+   forever, plus one that clears out stale cached netCDF files, all
    without you doing anything.
 7. Installs a `noaa-recon-api` command so you can check on it later
    (see "Living with it" below).

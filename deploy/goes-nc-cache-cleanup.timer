@@ -1,0 +1,17 @@
+# See goes-nc-cache-cleanup.service for install instructions — install both
+# files together, then enable/start only the .timer (it pulls in the
+# .service each time it fires).
+#
+# Fires nightly at 04:15, after storm-archive-update (03:15) and
+# recon-met-update (03:45), so cache cleanup runs once that night's
+# archive ingests (which download their own netCDF files into the same
+# cache) have already finished.
+[Unit]
+Description=Nightly trigger for goes-nc-cache-cleanup.service
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -662,15 +662,16 @@ build_archives() {
 }
 
 install_timers() {
-    log_step "Installing nightly archive-update timers"
+    log_step "Installing nightly archive-update and cache-cleanup timers"
     local svc
-    for svc in storm-archive-update recon-met-update; do
-        local script="ingest_storms.py"; local desc="storm track archive (HURDAT2 + ATCF)"
-        [[ "$svc" == "recon-met-update" ]] && script="ingest_recon_met.py" && desc="recon MET archive"
+    for svc in storm-archive-update recon-met-update goes-nc-cache-cleanup; do
+        local script="ingest_storms.py"; local desc="storm track archive (HURDAT2 + ATCF) update"; local after="After=network.target"
+        [[ "$svc" == "recon-met-update" ]] && script="ingest_recon_met.py" && desc="recon MET archive update"
+        [[ "$svc" == "goes-nc-cache-cleanup" ]] && script="clear_nc_cache.py" && desc="cleanup of GOES netCDF cache files older than 1 day" && after=""
         $SUDO tee "/etc/systemd/system/${svc}.service" >/dev/null <<TIMER_SVC_EOF
 [Unit]
-Description=Nightly NOAA ${desc} update
-After=network.target
+Description=Nightly ${desc}
+${after}
 
 [Service]
 Type=oneshot
@@ -683,10 +684,10 @@ Group=${RUN_USER}
 WantedBy=multi-user.target
 TIMER_SVC_EOF
     done
-    $SUDO cp "${INSTALL_DIR}/deploy/storm-archive-update.timer" "${INSTALL_DIR}/deploy/recon-met-update.timer" /etc/systemd/system/
+    $SUDO cp "${INSTALL_DIR}/deploy/storm-archive-update.timer" "${INSTALL_DIR}/deploy/recon-met-update.timer" "${INSTALL_DIR}/deploy/goes-nc-cache-cleanup.timer" /etc/systemd/system/
     $SUDO systemctl daemon-reload
-    $SUDO systemctl enable --now storm-archive-update.timer recon-met-update.timer >&2
-    log_ok "nightly timers enabled (03:15 and 03:45 server time)"
+    $SUDO systemctl enable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer >&2
+    log_ok "nightly timers enabled (03:15, 03:45, and 04:15 server time)"
 }
 
 install_cli_wrapper() {
@@ -814,10 +815,11 @@ cmd_uninstall() {
     ask_yesno "Continue?" n || { echo "Cancelled." >&2; exit 0; }
 
     $SUDO systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
-    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer 2>/dev/null || true
+    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer 2>/dev/null || true
     $SUDO rm -f "/etc/systemd/system/${SERVICE_NAME}.service" \
                 /etc/systemd/system/storm-archive-update.service /etc/systemd/system/storm-archive-update.timer \
-                /etc/systemd/system/recon-met-update.service /etc/systemd/system/recon-met-update.timer
+                /etc/systemd/system/recon-met-update.service /etc/systemd/system/recon-met-update.timer \
+                /etc/systemd/system/goes-nc-cache-cleanup.service /etc/systemd/system/goes-nc-cache-cleanup.timer
     $SUDO systemctl daemon-reload
 
     $SUDO rm -f "/etc/nginx/conf.d/${SERVICE_NAME}.conf" "/etc/nginx/snippets/${SERVICE_NAME}.conf"
