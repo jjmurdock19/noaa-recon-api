@@ -1,0 +1,21 @@
+[package]
+name = "noaa-recon-core"
+description = "WASM-safe compute core for the NOAA recon API: shared models, colormaps, projection, and GOES rendering. No filesystem, no networking, no C deps — so it can compile to both native and wasm32."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# rlib for the native server; cdylib so the future wasm crate (or this crate
+# directly) can produce a .wasm. Keep this crate free of tokio/reqwest/rusqlite
+# and any C-linked dependency (that's what keeps the wasm target buildable).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ndarray + image are pulled in as the render pipeline lands; both are pure Rust
+# and compile to wasm32 cleanly.
+# ndarray = { workspace = true }
+# image = { workspace = true }

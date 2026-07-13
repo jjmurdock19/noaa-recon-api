@@ -1,16 +1,12 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-*.egg-info/
-build/
-dist/
+# Rust
+/target/
+**/*.rs.bk
+
+# Runtime state (installer/server-managed, not source)
 cache/
 logs/
 data/
 *.log
 .DS_Store
-.pytest_cache/
-core
 admin_credentials.json
 auth_config.json

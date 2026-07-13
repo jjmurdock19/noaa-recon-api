@@ -11,6 +11,19 @@ Doppler Radar data, storm tracks, and aircraft reconaissance data.**
 **[llms.txt](llms.txt)** — terse agent-discovery summary, also served
 live at `{base}/llms.txt`
 
+> **This is the `rust` branch.** The API server and all data ingest are a
+> ground-up Rust rewrite (axum + a WASM-safe compute core) of the original
+> Python/FastAPI implementation on `main` — same HTTP API surface, native
+> binary instead of a Python process. Two gaps versus `main` today:
+> reflectance-band imagery (bands 2/3/5) and the `sandwich`/`geocolor`
+> composites are blocked on an HDF5 compression-filter limitation in the
+> static build, and a few admin-console jobs (bulk prefetch, on-demand
+> archive-update, self-update) aren't ported yet. Everything else —
+> including all data ingest, which now runs as native subcommands with
+> zero Python anywhere in this tree — works and is verified against live
+> NOAA data. Full port status, build recipe, and known-issue details:
+> **[RUST.md](RUST.md)**.
+
 
 
 Output from `GET /v1/satellite/tile` — GOES-19, Band 13 (Clean
@@ -42,7 +55,8 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   `abi5` (near-IR reflectance), `abi3` (Veggie/vegetation reflectance), or
   `abi2` (red/visible reflectance) — built from exact temperature→color
   stops (or a reflectance ramp for bands 2/3/5), not a generic
-  approximation. See ["How the imagery is
+  approximation. *On this branch, bands 2/3/5 (reflectance) currently
+  `501` — see the callout above.* See ["How the imagery is
   processed"](#how-the-imagery-is-processed) below for exactly how each
   one is computed, and [the live color legend tool](#color-legend) for
   rendering one client-side.
@@ -52,7 +66,8 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   ["How the imagery is processed"](#how-the-imagery-is-processed) below
   for the exact blend formulas, or `GET /v1/satellite/products` for a
   machine-readable summary). Both support `center`/`dims` bbox cropping
-  the same as a single-band tile.
+  the same as a single-band tile. *Not yet ported to Rust on this branch
+  — currently `501`.*
 - **`GET /v1/satellite/products`** — discovery endpoint listing every band/
   product this API can render and the exact UTC date range each satellite
   covers, so a client can build a picker without hardcoding any of that.
@@ -114,59 +129,74 @@ Service or login-autostart. See **[INSTALL.md](INSTALL.md#windows-local-testing)
 
 ### Requirements
 
+The installer asks which version to install — **Rust** (this branch) or
+**Python** (the `main` branch) — and installs only what that variant needs.
+
 **Linux** — Fedora/RHEL/Rocky/CentOS, Debian/Ubuntu, or a distribution with the Nix
 package manager (anything with `dnf`, `apt`, or `nix` on `PATH`), plus `sudo`
 access so the installer can install packages and write system files (it does
-not need to be run as `root`). Everything else — git, Python 3.9+, a C
-compiler (needed to build `netCDF4`'s C extensions), and optionally nginx/
-Apache + certbot for HTTPS — is detected and installed automatically if
-missing; you don't need to pre-install any of it.
+not need to be run as `root`). Everything else is detected and installed
+automatically if missing:
 
-**Windows** — git and Python 3.9+ (installed via `winget` if missing and you
-approve it; PowerShell is built in). Local-testing scope only — no reverse
-proxy, domain, or HTTPS, see above.
+- **Rust variant** (this branch): git, a C compiler + `make`, `cmake`, and
+  `curl` (to fetch `rustup`) — no Python at all. First build compiles
+  netCDF-C + HDF5 from source (a few minutes); the installer handles the
+  compiler-flag workaround newer GCC needs for that (see
+  [RUST.md](RUST.md)).
+- **Python variant** (`main` branch): git, Python 3.9+, and a C compiler
+  (needed to build `netCDF4`'s C extensions).
+- Either variant: optionally nginx/Apache + certbot for HTTPS.
 
-**Python dependencies** (installed into an isolated virtualenv the installer
-creates — never your system Python): FastAPI, Uvicorn, netCDF4, NumPy,
-Pillow, httpx, itsdangerous, pypdf. Exact pinned versions are in
-[`pyproject.toml`](pyproject.toml).
+**Windows** — git (installed via `winget` if missing and you approve it;
+PowerShell is built in) plus, for the Rust variant, `rustup`+`cmake` the same
+way. Local-testing scope only — no reverse proxy, domain, or HTTPS, see above.
 
 ### What the installer does
 
 `install.sh` is a single self-contained Bash script — no external installer
 framework or package to fetch beyond the script itself:
 
-1. Detects your package manager (`dnf`/`apt`/`nix`) and installs git, Python
-   3, and a C compiler if any are missing.
-2. Clones this repo to an install directory of your choice
-   (`/opt/noaa-recon-api` by default).
-3. Creates a Python virtualenv inside that directory and installs the API's
+1. Asks which variant to install (Rust or Python) — or pass `--variant rust`/
+   `--variant python` non-interactively.
+2. Detects your package manager (`dnf`/`apt`/`nix`) and installs that
+   variant's dependencies if any are missing.
+3. Clones this repo (the `rust` or `main` branch, matching your variant) to an
+   install directory of your choice (`/opt/noaa-recon-api` by default).
+4. **Rust variant:** installs `rustup` and runs `cargo build --release` —
+   the compiled binary is what the systemd service runs, no venv involved.
+   **Python variant:** creates a virtualenv and installs the API's
    dependencies into it — isolated from system Python.
-4. Writes and enables a **systemd service** so the API starts on boot and
+5. Writes and enables a **systemd service** so the API starts on boot and
    restarts itself if it crashes.
-5. Optionally installs/configures **nginx or Apache** as a reverse proxy for
+6. Optionally installs/configures **nginx or Apache** as a reverse proxy for
    a domain deployment, and can request a free **Let's Encrypt** HTTPS
    certificate via `certbot`.
-6. Builds the storm-track and recon MET archives (SQLite databases under
+7. Builds the storm-track and recon MET archives (SQLite databases under
    `data/`) and installs three nightly **systemd timers**: two to keep them
    current going forward, plus one to clear out stale cached netCDF files.
-7. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
+   (Rust variant: these run the compiled binary's `ingest-storms`/
+   `ingest-recon`/`clean-nc-cache` subcommands directly.)
+8. Installs a `noaa-recon-api` CLI command (`start`/`stop`/`status`/`logs`/
    `update`/`uninstall`) for living with the install afterward.
 
 Re-running the same one-liner on a machine that already has it installed
-offers **Update** (pull latest `main`, restart) or **Reconfigure** (re-run
+offers **Update** (pull latest, rebuild, restart) or **Reconfigure** (re-run
 the wizard with your previous answers pre-filled as defaults) instead of
 installing a second copy. See [INSTALL.md](INSTALL.md) for a plain-language
-walkthrough of every prompt the wizard asks.
+walkthrough of every prompt the wizard asks (written against the Python
+variant's prompts; the Rust variant asks the same questions minus the
+Python-specific ones).
 
 ---
 
 # Data Information
 
 
-**Status:** Undergoing active development. Satellite tiles, storm tracks, and the recon archive
-are fully implemented and verified against live NOAA data. TDR data is still in the works (`501 Not
-Implemented`) — see "Roadmap" below.
+**Status:** Undergoing active development. Storm tracks, the recon archive
+(read *and* ingest), and single-band IR satellite tiles (bands 7/9/13) are
+fully implemented and verified against live NOAA data on this branch.
+Reflectance-band tiles (2/3/5), the composite products, and TDR data are
+still in the works (`501 Not Implemented`) — see "Roadmap" below.
 
 ## Sources
 
@@ -179,9 +209,9 @@ unauthenticated public S3 buckets. This API reads the `ABI-L2-CMIPF`
 - East: [`noaa-goes16`](https://noaa-goes16.s3.amazonaws.com/) (2017-12-18 – 2025-01-14), [`noaa-goes19`](https://noaa-goes19.s3.amazonaws.com/) (2025-01-14 – present)
 - West: [`noaa-goes17`](https://noaa-goes17.s3.amazonaws.com/) (2019-02-12 – 2023-01-10), [`noaa-goes18`](https://noaa-goes18.s3.amazonaws.com/) (2023-01-10 – present)
 - Object path: `ABI-L2-CMIPF/{year}/{day-of-year}/{hour}/` within each bucket
-  (see `_get_satellite_bucket()` in `app/services/goes.py` for the exact
-  cutover-date logic, and "Satellite coverage" in API.md for what's out of
-  reach — pre-ABI storms like Katrina 2005 aren't in these buckets at all).
+  (see `get_satellite_bucket()` in `crates/server/src/services/goes.rs` for
+  the exact cutover-date logic, and "Satellite coverage" in API.md for what's
+  out of reach — pre-ABI storms like Katrina 2005 aren't in these buckets at all).
 
 **Storm tracks** — [NHC (National Hurricane Center)](https://www.nhc.noaa.gov/):
 - [HURDAT2](https://www.nhc.noaa.gov/data/#hurdat), the reconciled historical best-track database:
@@ -205,37 +235,46 @@ archive.
 **TDR (planned, not yet implemented)** — same host as the recon archive,
 [`seb.omao.noaa.gov/pub/acdata`](https://seb.omao.noaa.gov/pub/acdata/), but
 targeting the per-instrument Tail Doppler Radar `.tar.gz` bundles in each
-mission directory rather than the MET NetCDF file. See `app/routers/tdr.py`'s
-docstring for exactly what's missing (there's no manifest, so it needs a
-crawler over the mission-directory listing).
+mission directory rather than the MET NetCDF file. See
+`crates/server/src/routers/tdr.rs` for the current stub and the Roadmap
+below for what's missing (there's no manifest, so it needs a crawler over
+the mission-directory listing).
 
 ## Imagery Processing
 
-Every tile goes through the same four stages — `app/services/goes.py` is
-the whole pipeline, no external image-processing service involved:
+> On this branch, only single-band **IR** tiles (bands 7/9/13) are
+> currently renderable — reflectance bands (2/3/5) and both composite
+> products are blocked on a build limitation (see RUST.md) and return
+> `501`. This section documents the full pipeline, including the parts not
+> yet reachable in the Rust build; where a piece exists only in the (still
+> current, still deployed) Python implementation on `main`, it's called out.
 
-1. **Fetch.** `resolve_nearest()` picks the closest actual ABI scan to the
-   requested `time` (~10-minute cadence), then `ensure_downloaded()` pulls
-   that scan's raw `ABI-L2-CMIPF` netCDF (~25MB per band) straight from
-   NOAA's public S3 bucket — see "Data sources" above. Composites
-   (`sandwich`, `geocolor`) fetch every companion band from that *same*
-   scan cycle, since ABI captures all bands simultaneously and there's no
-   time-misalignment to correct for.
-2. **Reproject.** Raw ABI data is on a satellite-fixed scan grid (radians
-   from the sub-satellite point), not lat/lon. `abi_to_latlon()` converts
-   it per the GOES-R Product User Guide's Volume 5 Section 4.2 formula,
-   then each output row is spaced linearly in **Web Mercator Y**
-   (`_mercator_y()`), not linearly by latitude — because that's what
-   `L.imageOverlay` and every standard web map actually assume when they
-   stretch an image between two corner coordinates. Getting this wrong
-   visibly mispositions the image (see bug #4 below); it's easy to get
-   wrong because a plain equirectangular projection *looks* almost right
-   at low latitudes and only clearly breaks near the poles or on a large
-   box. Where multiple source pixels land on the same output cell (common
-   — several hundred collisions on a typical crop), `_paint_coldest()`
-   deterministically keeps the coldest value, since that's the
-   meteorologically significant one for cloud-top imagery, not whichever
-   pixel numpy happened to process last.
+Every tile goes through the same four stages, split across the WASM-safe
+core and the native server (see "Repo shape" above) — no external
+image-processing service involved:
+
+1. **Fetch.** `resolve_nearest()` (`services/goes.rs`) picks the closest
+   actual ABI scan to the requested `time` (~10-minute cadence), then
+   downloads that scan's raw `ABI-L2-CMIPF` netCDF (~25MB per band)
+   straight from NOAA's public S3 bucket — see "Data sources" above.
+   Composites (`sandwich`, `geocolor`) fetch every companion band from that
+   *same* scan cycle, since ABI captures all bands simultaneously and
+   there's no time-misalignment to correct for.
+2. **Reproject** (`crates/core/src/project.rs` + `render.rs`). Raw ABI data
+   is on a satellite-fixed scan grid (radians from the sub-satellite
+   point), not lat/lon. `abi_to_latlon()` converts it per the GOES-R
+   Product User Guide's Volume 5 Section 4.2 formula, then each output row
+   is spaced linearly in **Web Mercator Y** (`mercator_y()`), not linearly
+   by latitude — because that's what `L.imageOverlay` and every standard
+   web map actually assume when they stretch an image between two corner
+   coordinates. Getting this wrong visibly mispositions the image (see bug
+   #4 above); it's easy to get wrong because a plain equirectangular
+   projection *looks* almost right at low latitudes and only clearly breaks
+   near the poles or on a large box. Where multiple source pixels land on
+   the same output cell (common — several hundred collisions on a typical
+   crop), `paint_project()` deterministically keeps the coldest value,
+   since that's the meteorologically significant one for cloud-top
+   imagery, not whichever pixel got processed last.
 3. **Colorize** — see the next section for exactly how each band/cmap gets
    its color.
 4. **Encode.** The colorized array becomes an RGBA PNG: pixels with actual
@@ -247,40 +286,50 @@ the whole pipeline, no external image-processing service involved:
 
 ### Color grading
 
-`_colorize()` picks one of three strategies depending on the band/cmap,
-and which one matters for accuracy:
+`crates/core/src/render.rs`'s `colorize()` picks one of three strategies
+depending on the band/cmap, and which one matters for accuracy:
 
-- **Reflectance bands (3, 5)** have no "temperature" — `_reflectance_gray()`
-  gamma-stretches the 0–1 reflectance factor (`refl ** (1/1.5) * 255`)
-  to a 0–100% grayscale ramp. Linear reflectance reads unnaturally
-  dark/flat to the eye, so VIS/near-IR imagery is conventionally displayed
-  gamma-stretched — the same idea (not a tuned match) as satpy's default
-  reflectance enhancement.
-- **`abi13`/`abi9`/`abi7`** (the recommended per-band default enhancements)
-  are evaluated **exactly**, per-pixel, via `_apply_stops_exact()`
-  (vectorized `np.interp` over the literal temperature→color stops in
-  `_ABI13_STOPS`/`_ABI9_STOPS`/`_ABI7_STOPS`) rather than through a
-  quantized lookup table. This is deliberate, not an optimization detail:
-  `abi13`'s source palette has a genuinely sharp 1°C-wide cut (cyan@-32°C
-  → light grey@-31°C, marking the severe-convection threshold), and
-  quantizing that into ~0.6°C buckets smears it into a muddy blended color
-  that isn't in the source palette at all — see bug #2 below for the
+- **Reflectance bands (2, 3, 5)** have no "temperature" — `reflectance_gray()`
+  (`colormap.rs`) gamma-stretches the 0–1 reflectance factor (`refl **
+  (1/1.5) * 255`) to a 0–100% grayscale ramp. Linear reflectance reads
+  unnaturally dark/flat to the eye, so VIS/near-IR imagery is conventionally
+  displayed gamma-stretched — the same idea (not a tuned match) as satpy's
+  default reflectance enhancement. This code is ported and unit-tested, but
+  unreachable via `/tile` today since band=2/3/5 requests are blocked
+  upstream (see the callout above) — `/colortable`'s reflectance-ramp
+  legend still works, since it doesn't need a real render.
+- **`abi13`/`abi9`/`abi7`** (the recommended per-band default enhancements,
+  and the only ones currently renderable) are evaluated **exactly**,
+  per-pixel, via `interp_stops()` over the literal temperature→color stops
+  (`ABI13_STOPS`/`ABI9_STOPS`/`ABI7_STOPS` in `colormap.rs`) rather than
+  through a quantized lookup table. This is deliberate, not an optimization
+  detail: `abi13`'s source palette has a genuinely sharp 1°C-wide cut
+  (cyan@-32°C → light grey@-31°C, marking the severe-convection threshold),
+  and quantizing that into ~0.6°C buckets smears it into a muddy blended
+  color that isn't in the source palette at all — see bug #2 above for the
   before/after. **If you add a colortable with a similarly sharp
-  transition or a range outside ~-113..+42°C, add it to `STOPS_BY_CMAP`,
-  not `LUTS`.**
+  transition or a range outside ~-113..+42°C, add it to `stops_by_cmap()`,
+  not `build_lut()`.**
 - **Everything else** (`bd`, `enhanced`, `nrl`, `grayscale`, `ir4`) goes
-  through a shared 256-entry LUT (`_build_lut()`), built once at import
-  time by sampling each palette function every ~0.6°C across a fixed
-  -113..+42°C window. Fine for palettes without a hard cut, cheaper than
-  exact evaluation, but the fixed window means these clip anything warmer
-  than +42°C to the same color — irrelevant for 9/13, but it silently
-  loses Band 7's fire-highlighting range above that, which is exactly why
-  `abi7` (not one of these) is Band 7's default.
+  through a shared 256-entry LUT (`build_lut()`), built once by sampling
+  each palette function every ~0.6°C across a fixed -113..+42°C window.
+  Fine for palettes without a hard cut, cheaper than exact evaluation, but
+  the fixed window means these clip anything warmer than +42°C to the same
+  color — irrelevant for 9/13, but it silently loses Band 7's
+  fire-highlighting range above that, which is exactly why `abi7` (not one
+  of these) is Band 7's default.
 
 `GET /v1/satellite/colortable` (below) reads these same structures
-(`STOPS_BY_CMAP`/`LUTS`) at request time, so a legend built from it is
-guaranteed to match what a render actually produced — not a hand-copied
+(`stops_by_cmap()`/`build_lut()`) at request time, so a legend built from it
+is guaranteed to match what a render actually produced — not a hand-copied
 approximation that can drift out of sync.
+
+> **The composite formulas below are not yet ported to Rust** — `/tile`
+> with `product=sandwich`/`geocolor` returns `501` on this branch. Kept
+> here as the spec for that port (see Roadmap); the algorithm is unchanged
+> from the currently-deployed Python implementation on `main`, described
+> in terms of the functions that exist *there* (`render_sandwich_to_png()`,
+> `_solar_zenith_deg()`, etc.).
 
 **`product=sandwich`** 
 `render_sandwich_to_png()` colorizes Band 13 with the exact `abi13`
@@ -322,7 +371,7 @@ project has no access to). What it does instead:
 
 Both composites crop and read each companion band directly from its
 source file at a stride for a bbox request (`_read_source_cropped()`)
-rather than materializing the full disk first — see bug #7 below for why
+rather than materializing the full disk first — see bug #6 below for why
 that matters (Band 2 at native 0.5km resolution is large enough to OOM a
 small deployment host if read whole).
 
@@ -353,12 +402,13 @@ flowchart LR
         C[netcdf-three demo<br/>browser WebGL]
     end
 
-    subgraph "noaa-recon-api (FastAPI)"
+    subgraph "noaa-recon-api (Rust / axum)"
         D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
         E["/v1/tdr/* (planned)"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
-        H[app/services/goes.py<br/>ABI reprojection + colortables]
+        H["crates/server services/goes.rs<br/>(decode + S3 fetch)"]
+        K["crates/core render.rs/colormap.rs<br/>(WASM-safe: projection + colorize)"]
     end
 
     I[(NOAA S3<br/>noaa-goes16/17/18/19)]
@@ -368,6 +418,7 @@ flowchart LR
     C -.->|planned| F
     D --> G
     G --> H
+    H --> K
     H -->|public bucket, no auth| I
     E -.-> J
 ```
@@ -408,16 +459,17 @@ is the same thing done by hand, step by step, for local dev or anyone
 who wants full manual control.*
 
 ```bash
-git clone --recurse-submodules <this-repo-url>
+git clone --recurse-submodules --branch rust <this-repo-url>
 cd noaa-recon-api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-
-uvicorn app.main:app --reload
-# -> http://127.0.0.1:8000/docs   (Swagger UI, full endpoint surface)
+cargo build --release -p noaa-recon-api
+PORT=8000 ./target/release/noaa-recon-api
 # -> http://127.0.0.1:8000/       (admin console — see below)
 ```
+
+The **first** build compiles netCDF-C + HDF5 from source and needs `cmake`
+plus a compiler-flag workaround on some GCC versions — see
+[RUST.md](RUST.md) for the exact `CFLAGS`/toolchain setup (the installer
+handles this for you; only matters for a from-scratch manual build).
 
 Already cloned without `--recurse-submodules`? Run `git submodule update --init`.
 
@@ -430,11 +482,13 @@ curl "http://127.0.0.1:8000/v1/satellite/status/<key>"
 # -> poll until {"status": "ready", "png_url": "/cache/satellite/<key>.png", "bounds": [[lat,lon],[lat,lon]], ...}
 ```
 
+There's no auto-generated Swagger UI (that was a FastAPI feature) — see
+[API.md](API.md) for the full endpoint reference instead.
+
 ### Tests
 
 ```bash
-pytest                                          # offline unit tests (math, LUTs, parsing)
-NOAA_RECON_API_NETWORK_TESTS=1 pytest           # + a live end-to-end render against NOAA S3
+cargo test --workspace
 ```
 
 ### Docker
@@ -443,21 +497,13 @@ NOAA_RECON_API_NETWORK_TESTS=1 pytest           # + a live end-to-end render aga
 docker compose up --build
 ```
 
-### Deploying on this host (joshmurdock.net)
+Multi-stage build: compiles the release binary (`rust:1-bookworm`, needs
+`cmake` for the netCDF/HDF5 static build), then copies just the binary +
+`app/console/` into a slim `debian:bookworm-slim` runtime image. Ingest is a
+subcommand — run `docker compose run api noaa-recon-api ingest-storms` (etc.)
+against the running container's volumes, or wire it into your own scheduler.
 
-*Already done — this is documented for reference / redeploying after a host
-rebuild. The live API is at `https://joshmurdock.net/api`.*
-
-1. `python3 -m venv .venv && pip install -e .` as above.
-2. Copy `deploy/noaa-recon-api.service` to `/etc/systemd/system/`, then
-   `systemctl daemon-reload && systemctl enable --now noaa-recon-api.service`.
-3. Paste the block from `deploy/nginx-snippet.conf` into the `joshmurdock.net`
-   `server {}` block in `/etc/nginx/nginx.conf`, then `nginx -t && systemctl
-   reload nginx`. This makes the API reachable at `/api/...` on the
-   hurricanes site, same-origin (no CORS needed for that consumer; CORS is
-   still open for other sites hitting the API directly).
-
-### Deploying elsewhere (fresh host, building both archives from scratch)
+### Deploying (fresh host, building both archives from scratch)
 
 *`./install.sh` does everything below automatically, including asking
 whether to build the full recon archive or the fast current-season-only
@@ -465,64 +511,66 @@ version. This section is the manual equivalent, for anyone not using it.*
 
 Both `GET /v1/storms/*` and `GET /v1/recon/*` are backed by local SQLite
 databases under `data/` (gitignored — not part of the repo, built by the
-ingestion scripts below). A brand-new deployment has neither database yet;
+ingest subcommands below). A brand-new deployment has neither database yet;
 build both once, then install the nightly timers so they stay current
 without further attention:
 
 ```bash
 # Storms: always does a full HURDAT2 + ATCF backfill automatically (fast, ~10s)
-.venv/bin/python3 scripts/ingest_storms.py
+./target/release/noaa-recon-api ingest-storms
 
 # Recon MET: --full crawls every year since 2011 from scratch — this is
 # thousands of small requests plus large NetCDF downloads and PDF parses,
 # expect this to take HOURS on a fresh deployment (the nightly default,
 # current + previous year only, is what runs afterward and is quick)
-.venv/bin/python3 scripts/ingest_recon_met.py --full
+./target/release/noaa-recon-api ingest-recon --full
 ```
 
 Then install both nightly timers (details in the two sections below) so
 each archive keeps itself current going forward without manual re-runs.
-The admin console's "Databases" panel also has a **Force update** button
-per archive if you ever want to trigger an update immediately instead of
-waiting for the timer (e.g. right after a storm you care about was flown).
 
 ### Storm archive updates
 
-`data/storms.sqlite` (the `GET /v1/storms/*` backing store) is populated
-by `scripts/ingest_storms.py` — see app/services/storms.py's module
-docstring for the HURDAT2 + ATCF b-deck pipeline. Run it manually any time:
+`data/storms.sqlite` (the `GET /v1/storms/*` backing store) is populated by
+the `ingest-storms` subcommand — see
+[`crates/server/src/services/storms.rs`](crates/server/src/services/storms.rs)
+(the `INGEST` section) for the HURDAT2 + ATCF b-deck pipeline. Run it
+manually any time:
 
 ```bash
-.venv/bin/python3 scripts/ingest_storms.py
+./target/release/noaa-recon-api ingest-storms
 ```
 
 To keep it current automatically (picks up the latest advisory for any
-storm active right now), install the nightly timer:
+storm active right now), install the nightly timer — the *service* unit is
+generated by `install.sh` (or write your own `ExecStart=.../noaa-recon-api
+ingest-storms`); the *timer* schedule ships in the repo:
 
 ```bash
-sudo cp deploy/storm-archive-update.service deploy/storm-archive-update.timer /etc/systemd/system/
+sudo cp deploy/storm-archive-update.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now storm-archive-update.timer
 ```
 
 Fires nightly at 03:15 (server local time); `Persistent=true` means a
 missed run (host was down) fires on next boot instead of waiting a full
-day. Both units show up in Cockpit's Services page like any other systemd
-unit — search "storm-archive-update" to check last-run status or trigger
-a manual run from there instead of the command line.
+day. Visible in Cockpit's Services page like any other systemd unit —
+search "storm-archive-update" to check last-run status.
 
 ### Recon MET archive
 
 `data/recon_met.sqlite` (the `GET /v1/recon/*` backing store) is populated
-by `scripts/ingest_recon_met.py` — see app/services/recon_met.py's module
-docstring for the crawl/decimation pipeline (NOAA's raw 1-second
-flight-level data at `seb.omao.noaa.gov`, stored at 0.2 Hz). Run it
-manually any time:
+by the `ingest-recon` subcommand — see
+[`crates/server/src/services/recon_ingest.rs`](crates/server/src/services/recon_ingest.rs)
+for the crawl/decode/reconciliation pipeline (NOAA's raw 1-second
+flight-level data at `seb.omao.noaa.gov`, decimated and stored at 0.2 Hz).
+Run it manually any time:
 
 ```bash
-.venv/bin/python3 scripts/ingest_recon_met.py               # current + previous year (nightly default)
-.venv/bin/python3 scripts/ingest_recon_met.py --full         # every year since 2011 — see the warning above
-.venv/bin/python3 scripts/ingest_recon_met.py --year 2024    # one year only
+./target/release/noaa-recon-api ingest-recon                    # current + previous year (nightly default)
+./target/release/noaa-recon-api ingest-recon --full              # every year since 2011 — see the warning above
+./target/release/noaa-recon-api ingest-recon --years 2024        # one year only
+./target/release/noaa-recon-api ingest-recon --force              # re-harvest even unchanged missions
 ```
 
 Idempotent: each mission is skipped unless its QC version on the server
@@ -530,7 +578,7 @@ changed, so a nightly re-run only does real work for new/upgraded
 missions. Install the nightly timer the same way:
 
 ```bash
-sudo cp deploy/recon-met-update.service deploy/recon-met-update.timer /etc/systemd/system/
+sudo cp deploy/recon-met-update.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now recon-met-update.timer
 ```
@@ -540,30 +588,21 @@ two crawls don't compete for network/CPU at the same instant);
 `Persistent=true` for the same missed-run-catches-up-on-boot behavior.
 Also visible in Cockpit's Services page (search "recon-met-update").
 
-This deployment's `data/recon_met.sqlite` was seeded via
-`scripts/import_existing_met_archive.py`, a one-time local copy from the
-hurricanes site's already-harvested `met_archive.sqlite` (same underlying
-data, this project just now owns the feature) rather than re-crawling
-years of identical data over the network — not needed on a fresh
-deployment with no pre-existing archive, hence `--full` above instead.
-
 ### GOES netCDF cache cleanup
 
 `cache/goes_nc/` holds the raw netCDF scans downloaded from S3 before
-rendering (see `ensure_downloaded()` in `app/services/goes.py`) — they're
-re-fetched on demand, so nothing is lost by deleting old ones. Run the
-cleanup manually any time:
+rendering — they're re-fetched on demand, so nothing is lost by deleting
+old ones. Run the cleanup manually any time:
 
 ```bash
-.venv/bin/python3 scripts/clear_nc_cache.py                    # delete files older than 24h
-.venv/bin/python3 scripts/clear_nc_cache.py --max-age-hours 48 # different cutoff
-.venv/bin/python3 scripts/clear_nc_cache.py --dry-run          # preview only, deletes nothing
+./target/release/noaa-recon-api clean-nc-cache                       # delete files older than 24h
+./target/release/noaa-recon-api clean-nc-cache --max-age-hours 48    # different cutoff
 ```
 
 Install the nightly timer to keep the cache trimmed automatically:
 
 ```bash
-sudo cp deploy/goes-nc-cache-cleanup.service deploy/goes-nc-cache-cleanup.timer /etc/systemd/system/
+sudo cp deploy/goes-nc-cache-cleanup.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now goes-nc-cache-cleanup.timer
 ```
@@ -573,19 +612,20 @@ cached netCDF file older than 1 day. `Persistent=true` for the same
 missed-run-catches-up-on-boot behavior as the other timers. Also visible
 in Cockpit's Services page (search "goes-nc-cache-cleanup").
 
+`./install.sh` wires all three of the above up automatically (it generates
+the matching `.service` unit for each timer and points `ExecStart` at your
+build's binary) — the commands above are for manual/non-installer setups.
+
 ### Admin console
 
-Visiting the API's root (`/` locally, `https://joshmurdock.net/api` in
-production) serves a login-gated admin console — status/cache stats,
-browsing and deleting cached rendered tiles and raw netCDF downloads,
-submitting a one-off query, and bulk-loading a timeframe into the cache
-(e.g. pre-warm an entire storm's lifecycle in one request instead of
-loading frame-by-frame later). A "Databases" panel covers the storm-track
-and recon MET archives: size/record-count cards folded into the same
-overall totals, a browsable viewer (pick a database, year, and storm to
-see its track points or missions), and a **force update** button per
-archive to run that archive's nightly ingest immediately instead of
-waiting for the timer.
+Visiting the API's root (`/` locally) serves a login-gated admin console —
+status/cache stats, browsing and deleting cached rendered tiles and raw
+netCDF downloads, and a "Databases" panel with size/record-count cards for
+the storm-track and recon MET archives. **Not yet ported on this branch:**
+the bulk-prefetch-a-timeframe job and the per-archive "force update" /
+self-update buttons all still return `501` (the console UI shows them, but
+they don't work yet — see [RUST.md](RUST.md)). Run the ingest subcommands
+above by hand or via the nightly timer instead for now.
 
 Every console user has their own account with one of two roles (see
 "API tokens & accounts" below for how they're created):
@@ -601,18 +641,20 @@ app starts: **`admin_credentials.json`** at the repo root (gitignored,
 created with `admin`/`password` defaults on first run if missing — the
 installer always generates a real password instead, see INSTALL.md)
 becomes the first superuser, with its plaintext password re-hashed into
-the new PBKDF2 scheme (`app/services/tokens.py`'s
+the same PBKDF2 scheme
+([`crates/server/src/services/tokens.rs`](crates/server/src/services/tokens.rs)'s
 `migrate_legacy_admin_credentials()` — a one-time-idempotent fixup, same
-pattern as `recon_met.py`'s `migrate_*`/`reconcile_*` functions). That
-file's `secret_key` is still what signs the session cookie
-(Starlette's `SessionMiddleware` + `itsdangerous`) — it's no longer the
-active credential store once at least one account exists, so editing the
-username/password in it after that point has no effect; manage accounts
-from the console's API management pane (or directly against
-`data/auth.sqlite`) instead.
+pattern as `recon_ingest.rs`'s `migrate_*`/`reconcile_*` functions). That
+file's `secret_key` is still what signs the session cookie (a signed
+cookie via `axum-extra`'s `SignedCookieJar` — same idea as Starlette's
+`SessionMiddleware` on the Python branch, not byte-compatible with it) —
+it's no longer the active credential store once at least one account
+exists, so editing the username/password in it after that point has no
+effect; manage accounts from the console's API management pane (or
+directly against `data/auth.sqlite`) instead.
 
 The console itself is a static page (`app/console/index.html`, no build
-step, matching the rest of this project) that calls the JSON endpoints
+step, unchanged from the Python branch) that calls the JSON endpoints
 under `/v1/admin/*` (see API.md).
 
 ### API tokens & accounts
@@ -624,9 +666,9 @@ or restricting who's calling your instance. Toggle it at install time (the
 installer asks) or later from the console's API management pane
 (superuser only) — takes effect immediately, no restart.
 
-Three roles, one `tokens` table (`data/auth.sqlite`, same schema-in-code-
-string/`get_connection()` pattern as `storms.sqlite`/`recon_met.sqlite` —
-see `app/services/tokens.py`):
+Three roles, one `tokens` table (`data/auth.sqlite`, same schema as the
+Python branch — see
+[`crates/server/src/services/tokens.rs`](crates/server/src/services/tokens.rs)):
 
 - **regular** — a plain API key. No console login, tracked in the usage
   log by owner name.
@@ -634,14 +676,15 @@ see `app/services/tokens.py`):
   key (the same token doubles as both — a superuser calling the public API
   programmatically uses their own token same as anyone else).
 
-Token secrets are high-entropy (`secrets.token_urlsafe(32)`) and stored as
-a fast hash (`sha256`) — safe to look up on every request without a slow
-KDF, since brute-forcing a 32-byte random value is infeasible regardless
-of hash speed. Passwords are human-chosen and lower-entropy, so those get
-a proper slow KDF (`hashlib.pbkdf2_hmac`, 310k iterations, OWASP's current
-baseline) — no new dependency, both are stdlib `hashlib`/`secrets`/`hmac`.
-A raw token/password is only ever shown once, at creation or regeneration
-time, exactly like a GitHub PAT.
+Token secrets are high-entropy (32 random bytes, URL-safe base64) and
+stored as a fast hash (SHA-256) — safe to look up on every request without
+a slow KDF, since brute-forcing a 32-byte random value is infeasible
+regardless of hash speed. Passwords are human-chosen and lower-entropy, so
+those get a proper slow KDF (PBKDF2-HMAC-SHA256, 310k iterations, OWASP's
+current baseline) — byte-for-byte the same hashing scheme as the Python
+branch, so `data/auth.sqlite` is portable between the two. A raw
+token/password is only ever shown once, at creation or regeneration time,
+exactly like a GitHub PAT.
 
 Every console login attempt (success or failure) lands in the login log;
 every authenticated public-API call lands in the usage log — both
@@ -656,9 +699,13 @@ proves the raw-netCDF → browser-rendering path end-to-end using the
 [netcdf-three](https://github.com/umrlastig/netcdf-three) library, vendored
 as a git submodule at `clients/netcdf-three-demo/vendor/netcdf-three`.
 
+It's a static page — serve `clients/netcdf-three-demo/` with any web server
+(it needs one, not a `file://` open, since it fetches its sample dataset via
+`fetch()`). E.g. with the Rust binary itself, or any static-file server you
+have on hand:
+
 ```bash
-cd clients/netcdf-three-demo
-python3 -m http.server 8765
+npx serve clients/netcdf-three-demo -l 8765
 # -> open http://127.0.0.1:8765/ in a browser
 ```
 
@@ -678,261 +725,290 @@ without re-deriving the architecture.
 
 ### Repo shape
 
+This branch is a Cargo **workspace** split so the compute core can also
+target WASM later — `crates/core` has zero I/O and zero C dependencies
+(no tokio, no rusqlite, no netcdf-C), so it compiles to `wasm32-unknown-
+unknown` as well as native; `crates/server` wraps it with everything that
+needs the OS (filesystem, SQLite, HTTP, the netCDF-C decode). See
+[RUST.md](RUST.md) for the full build recipe and current port status.
+
 ```
-app/
-  main.py            FastAPI app, CORS (open — this API is meant for other sites too), configure_logging()
-                      (called at import time, before anything else logs), the log_requests middleware
-                      (one line per request to logs/app.log, plus per-token usage-log recording — see
-                      _record_token_usage), SessionMiddleware (admin console auth), a startup event that
-                      runs tokens.migrate_legacy_admin_credentials() once, router includes (satellite/tdr/
-                      raw/storms/recon get require_api_token as a router-level dependency; health and admin
-                      don't), /cache + /demo/netcdf-three static mounts, GET /llms.txt, and the console
-                      static mount at "/" (registered LAST so it doesn't shadow the more specific routes
-                      above it).
-  auth.py            Two mechanisms: console session (require_login, require_superuser — reads
-                      request.session, set by admin.py's /login against app/services/tokens.py) and the
-                      public-API token gate (require_api_token, a no-op unless auth_config.json's
-                      "enabled" is true — see is_auth_enabled()/set_auth_enabled()). Still owns
-                      admin_credentials.json (gitignored, repo root) purely as the session cookie's
-                      secret_key source and the one-time legacy-migration input — it's no longer the
-                      active credential store once any token exists.
-  logging_config.py    configure_logging(): rotating file handler (10MB x5) attached to the ROOT logger
-                        ONLY — attaching to "uvicorn.error"/"uvicorn.access" too caused every line to be
-                        logged twice (they propagate to root by default; found and fixed empirically, see
-                        the module docstring). app.* loggers (e.g. goes.py's `log`) need no extra setup.
-  paths.py            CACHE_ROOT = <repo>/cache, REPO_ROOT
-  models.py            Pydantic response schemas
-  console/index.html   Static admin console UI (no build step) — login form + dashboard + cache preview
-                        pane (tile images w/ full metadata, netCDF dimension/variable/attribute inspection),
-                        calls /v1/admin/*. All requests are prefixed with a runtime-computed API_BASE (see
-                        "Real bugs" below) — never hardcode a path starting with "/" in this file.
-  routers/
-    satellite.py       GET /v1/satellite/tile, /status/{key}, /colortable  — IMPLEMENTED
-    admin.py            GET/POST /v1/admin/* — login/logout/whoami, status, cache list/delete (satellite
-                         + goes_nc separately, goes_nc also has a GET .../info for netCDF structural
-                         metadata), bulk prefetch (POST /prefetch, GET /prefetch/{job_id}), self-update
-                         (check/apply require_superuser; status polling stays require_login). Prefetch
-                         jobs are tracked in an in-memory dict (fine for this scope — lost on restart,
-                         not persisted).
-    admin_tokens.py      GET/POST/PATCH/DELETE /v1/admin/tokens*, GET /v1/admin/login-log,
-                         GET /v1/admin/usage-log, GET/POST /v1/admin/auth-config. Split out from admin.py
-                         so all the RBAC-sensitive (mostly require_superuser) surface lives in one file —
-                         usage-log is the one route here a moderator can also hit.
-    tdr.py              GET /v1/tdr/missions, GET /v1/tdr/sweep                — STUB (501)
-    raw.py              GET /v1/raw/netcdf                                     — STUB (501)
-    health.py           GET /v1/health
-  services/
-    tokens.py            Token/account store backing both auth mechanisms above — data/auth.sqlite, same
-                         schema-in-code-string/get_connection() pattern as storms.py/recon_met.py. sha256
-                         for token secrets (high-entropy, fast lookup is fine), PBKDF2-HMAC-SHA256 (310k
-                         iterations) for passwords. migrate_legacy_admin_credentials() is the one-time-
-                         idempotent fixup that bootstraps the first superuser from admin_credentials.json.
-    goes.py             Ported from the hurricanes site's goes_tile.py: ABI Fixed Grid reprojection
-                         (PUG Vol 5 Sec 4.2), Web Mercator row spacing (_mercator_y — see "Real bugs"
-                         below), collision-safe forward-paint (_paint_coldest), per-band "default ABI"
-                         colortables (abi13, abi9 — exact stops, evaluated without LUT quantization via
-                         _apply_stops_exact/STOPS_BY_CMAP) plus 5 LUT-based approximate tables in LUTS.
-                         resolve_nearest() picks the closest scan to an arbitrary timestamp for true
-                         ~10-min resolution. render_bbox_to_png() is a two-pass sparse-locate +
-                         native-resolution-crop renderer for center+dims requests (render_to_png() is
-                         the full-disk path).
-    cache.py            ResultCache: lock-file + TTL pattern (mirrors proxy.php's approach),
-                         driven by FastAPI BackgroundTasks instead of subprocess/nohup. Also has
-                         list_keys()/delete()/stats() for the admin console's cache browser.
-    tdr.py              Empty stub — see its docstring for the planned crawler/parse/render shape.
+crates/
+  core/                        noaa-recon-core — WASM-safe compute, no I/O, no C deps
+    src/
+      lib.rs
+      models.rs                  TileStatus/TileState (serde port of the old Pydantic models.py)
+      colormap.rs                 Every colortable: LUT-based (bd/enhanced/nrl/grayscale/ir4) AND
+                                   exact-stops (abi13/abi9/abi7 — evaluated per-pixel, no LUT
+                                   quantization, same reasoning as "Real bugs" #2 below) plus the
+                                   reflectance-band gamma-stretch ramp.
+      catalog.rs                   Band/cmap/product validity + per-band defaults + native GSD.
+      bbox.rs                       Bounding-box request validation/clamping + geometry helpers shared
+                                   by the server's netcdf crop-locate step and the render step.
+      project.rs                    ABI Fixed Grid -> lat/lon (abi_to_latlon, PUG Vol 5 Sec 4.2) +
+                                   Web Mercator row spacing (mercator_y) — see "Real bugs" #1/#4 below.
+      render.rs                     The pure-math render pipeline: collision-safe forward-paint
+                                   (paint_project, "Real bugs" #3), NaN gap-fill, NaN-aware smoothing,
+                                   colorize -> RGBA. render_full_disk()/render_bbox() are the two
+                                   entry points; the server calls these with an already-decoded array.
+  server/                       noaa-recon-api — the axum binary; every native/C dependency lives here
+    src/
+      main.rs                      Entry point: with no args, boots the HTTP server (CORS, request-
+                                   logging + stats middleware, the token gate on data routes, static
+                                   mounts, router registration). With a subcommand
+                                   (ingest-storms | ingest-recon | clean-nc-cache), runs that instead
+                                   and exits — these replace what used to be separate Python scripts.
+      config.rs                     Paths (repo root / cache / data / DB paths — resolves relative to
+                                   cwd, since a binary has no __file__) + bind_addr() (PORT/
+                                   NOAA_RECON_HOST env vars).
+      state.rs                      AppState — paths, the in-memory stats counter, and the session
+                                   cookie signing key, cloned into every handler.
+      logging.rs                    tracing subscriber: stdout + a daily-rotating file under logs/.
+      auth.rs                       Console session (signed cookie via axum-extra's SignedCookieJar;
+                                   require_login/require_superuser) and the public-API token gate
+                                   (require_api_token — a no-op unless auth_config.json's "enabled" is
+                                   true). Still owns admin_credentials.json purely as the session
+                                   cookie's secret-key source and the one-time legacy-migration input.
+      error.rs                      ApiError -> {"detail": msg} JSON, matching FastAPI's HTTPException
+                                   body shape exactly so error responses are unchanged for clients.
+      routers/
+        satellite.rs                 GET /v1/satellite/tile (bands 7/9/13 only right now — see
+                                   RUST.md), /status/{key}, /colortable, /colortables, /products.
+        admin.rs                      Login/logout/whoami, status, log tail, cache list/delete
+                                   (satellite + goes_nc, goes_nc also has netCDF structural-metadata
+                                   info). Bulk prefetch / archive-update / self-update are NOT ported
+                                   — routed to a 501 handler.
+        admin_tokens.rs                Token CRUD, login-log, usage-log, auth-config toggle.
+        storms.rs / recon.rs           Read-path routers (the ingest logic lives in services/, called
+                                   from main.rs's subcommand dispatch, not from these routers).
+        tdr.rs / raw.rs                 501 stubs, same messages as the Python branch.
+        health.rs
+      services/
+        tokens.rs                       Token/account store backing both auth mechanisms — data/
+                                   auth.sqlite, same schema and hash outputs as the Python branch
+                                   (SHA-256 for token secrets, PBKDF2-HMAC-SHA256/310k iterations for
+                                   passwords — verified byte-identical, see its test module).
+                                   migrate_legacy_admin_credentials() bootstraps the first superuser.
+        storms.rs                       storms.sqlite: the GET /v1/storms/* read path AND the
+                                   HURDAT2 + ATCF ingest pipeline (run_ingest, called by main.rs's
+                                   `ingest-storms` subcommand) in one file.
+        recon_met.rs                     recon_met.sqlite READ path only (GET /v1/recon/*).
+        recon_ingest.rs                   recon_met.sqlite ingest: crawl seb.omao.noaa.gov, netCDF
+                                   decode, PDF storm-name extraction (pdf-extract crate), and the full
+                                   haversine-track-matching reconciliation layer that figures out which
+                                   storm each mission actually flew. Called by `ingest-recon`.
+        goes.rs                          S3 list/fetch (reqwest + quick-xml) + netCDF decode (the
+                                   netcdf crate — mask/scale handling is manual, unlike netCDF4-python;
+                                   see RUST.md's "critical decode gotcha") + PNG encode. Owns the
+                                   process-wide nc_lock() mutex shared with recon_ingest.rs (HDF5 isn't
+                                   thread-safe — see "Real bugs" #7 below) and clean_nc_cache() (the
+                                   `clean-nc-cache` subcommand).
+        cache.rs / stats.rs               ResultCache (lock-file + TTL, same pattern as the Python
+                                   branch) and the in-memory request-stats counter.
 admin_credentials.json        Gitignored, auto-created on first run — session secret + legacy-migration
                                input only, not the active credential store (see README "Admin console").
 auth_config.json               Gitignored — {"enabled": bool}, whether the public API requires a token.
                                Absent = disabled (today's open-by-default behavior). See README "API
                                tokens & accounts".
-logs/app.log                  Gitignored, auto-created on first run — rotating request/error log (see API.md "Logging").
-clients/netcdf-three-demo/   Static demo client (see "netcdf-three demo client" above)
-deploy/                       nginx snippet + systemd unit for this specific host (joshmurdock.net) —
-                               install.sh generates its own versions of these for other machines
-install.sh                    Interactive installer/updater/uninstaller (dnf/apt/nix) — see INSTALL.md
+logs/app.log                  Gitignored, auto-created on first run — daily-rotating request/error log.
+app/console/index.html        Static admin console UI (no build step, unchanged from the Python
+                               branch) — calls /v1/admin/*, prefixed with a runtime-computed API_BASE
+                               (see "Real bugs" below). Never hardcode a path starting with "/" here.
+clients/netcdf-three-demo/    Static demo client (see "netcdf-three demo client" above)
+deploy/                       nginx snippet + the three timer units the installer's nightly
+                               ingest/cleanup jobs use. The .service units are generated by
+                               install.sh directly (variant-aware ExecStart), not stored here.
+install.sh                    Interactive installer/updater/uninstaller (dnf/apt/nix), variant-aware
+                               (Rust vs Python) — see INSTALL.md
 docs/assets/                  README example images
 docs/colortable_sources/      Source JSON for the abi13/abi9 exact color stops
-tests/test_satellite.py       Offline math/parsing tests + one network-gated e2e test
+RUST.md                       Rust-branch build recipe, toolchain setup, and detailed port status
 API.md                        Full human+agent endpoint reference, kept in sync with routers/ by hand —
                                if you add/change an endpoint, update this file and llms.txt in the same change.
 llms.txt                      Terse agent-discovery summary (llmstxt.org convention); also served live at
-                               GET /llms.txt (app/main.py) — keep both in sync with reality, not aspiration.
+                               GET /llms.txt — keep both in sync with reality, not aspiration.
 ```
 
 ### Real bugs already found and fixed here
 
-1. **180° longitude flip.** The original `goes_tile.py` (and by extension
-   this port, before the fix) had `Sx` defined with the wrong sign in
-   `abi_to_latlon()`, which silently rotates every computed longitude by
-   180° — `lat` is unaffected (it only depends on `Sx**2`) so it's easy to
-   miss, but it makes the renderer paint ~0% of pixels onto the output grid
-   and produce a blank tile. Fixed by computing
+*Bugs 1-4 and 7 below were found in the original Python implementation and
+carried forward as fixes that had to be **preserved during the Rust port** —
+the algorithms are line-for-line translations, so getting any of these
+backwards again would silently reintroduce the same failure mode. Bug 5 lives
+in the unchanged static console HTML, unaffected by which server serves it.
+The old bug 6 (FastAPI's Swagger UI `root_path` handling) doesn't apply to
+this branch — axum has no auto-generated docs UI to misconfigure.*
+
+1. **180° longitude flip.** `abi_to_latlon()` needs `Sx` defined with the
+   correct sign — get it backwards and every computed longitude silently
+   rotates 180°. `lat` is unaffected (it only depends on `Sx**2`) so it's
+   easy to miss, but it makes the renderer paint ~0% of pixels onto the
+   output grid and produce a blank tile. Must be
    `Sx = H - rs*cos(x)*cos(y)` per PUG Vol 5 Sec 4.2 (not
-   `rs*cos(x)*cos(y) - H`). **The same bug likely exists in the live
-   hurricanes site's `goes_tile.py`** — flag it to a person before touching
-   that file, since it's in active production use.
-   `tests/test_satellite.py::test_abi_to_latlon_subsatellite_point_is_origin`
-   guards against a regression.
+   `rs*cos(x)*cos(y) - H`) — see
+   [`crates/core/src/project.rs`](crates/core/src/project.rs), guarded by
+   `project::tests::nadir_maps_to_subsatellite_point`.
 
-2. **Color-table quantization smearing.** `abi13`/`abi9` were originally
-   built through the same shared 256-bucket LUT system (`_build_lut`/
-   `_t2i`/`_i2t`) as the other colortables, which quantizes the full
-   temperature range into ~0.6°C steps. That's fine for smooth gradients,
-   but `abi13`'s source data has a deliberate 1°C-wide hard cut
-   (cyan@-32°C → light grey@-31°C) which quantization smeared into a muddy
-   blended color absent from the source palette, and the LUT's fixed
-   -113..+42°C window clamped `abi13`'s warm end (needs up to +57°C) before
-   it ever reached true black. Fixed by evaluating `abi13`/`abi9` exactly,
-   per-pixel, via `_apply_stops_exact()` (vectorized `np.interp`) instead of
-   routing them through the shared LUT — see the comment above `LUTS` in
-   `app/services/goes.py`.
-   `tests/test_satellite.py::test_apply_stops_exact_matches_direct_function_with_no_quantization`
-   guards against a regression. **If you add another colortable with a
-   sharp transition or a range outside ~-113..+42°C, add it to
-   `STOPS_BY_CMAP` instead of `LUTS`, not the other way around.**
+2. **Color-table quantization smearing.** `abi13`/`abi9`/`abi7` must be
+   evaluated **exactly**, per-pixel (`interp_stops` in
+   [`crates/core/src/colormap.rs`](crates/core/src/colormap.rs)), not routed
+   through the shared 256-bucket LUT the other colortables use. The LUT
+   quantizes the full temperature range into ~0.6°C steps — fine for smooth
+   gradients, but `abi13`'s source data has a deliberate 1°C-wide hard cut
+   (cyan@-32°C → light grey@-31°C) that quantization would smear into a
+   muddy blended color absent from the source palette, and the LUT's fixed
+   -113..+42°C window would clamp `abi13`'s warm end (needs up to +57°C)
+   before it ever reached true black. Guarded by
+   `colormap::tests::abi13_exact_stops_match_python` (asserts an exact
+   interpolated value, not just endpoints). **If you add another colortable
+   with a sharp transition or a range outside ~-113..+42°C, add it to
+   `stops_by_cmap()` instead of `build_lut()`, not the other way around.**
 
-3. **Forward-paint collision loss.** The reprojection paint step used plain
-   `output[row, col] = values` assignment. When multiple source pixels land
-   on the same output cell (real and not rare — ~330 of ~51k cells on a
-   typical 500km/native-resolution bbox render), numpy keeps an arbitrary
-   one (whichever is last in array order), not the meteorologically
-   significant one. Verified cell-by-cell on a real render: 160 cells
-   differed between old and fixed behavior, with up to a 23°C difference at
-   one cell — enough to jump entire color zones. Fixed via
-   `_paint_coldest()` using `np.minimum.at` to deterministically keep the
-   coldest value on collision.
-   `tests/test_satellite.py::test_paint_coldest_keeps_minimum_on_collision`
-   covers it.
+3. **Forward-paint collision loss.** The reprojection paint step must keep
+   the **coldest** value when multiple source pixels land on the same output
+   cell (real and not rare — ~330 of ~51k cells on a typical 500km/native-
+   resolution bbox render) — a plain last-write-wins assignment keeps an
+   arbitrary one, not the meteorologically significant one, and can be off
+   by 20°C+ at a colliding cell (enough to jump entire color zones). See
+   `paint_project()` in
+   [`crates/core/src/render.rs`](crates/core/src/render.rs) (the
+   `if v < out[idx]` check).
 
 4. **Equirectangular vs. Web Mercator mismatch (georeferencing).**
    `L.imageOverlay` (and every standard web map) positions an image's
    corners at the map's *Web Mercator* screen coordinates for the given
-   bounds, then stretches the raw image **linearly** between them. The
-   renderer was spacing output rows linearly by *latitude*
-   (`row = f(lat)`, plain equirectangular/Plate Carrée), which doesn't
-   match — the displayed imagery was vertically mispositioned, worse away
-   from the image's vertical center and worse at higher latitudes. Fixed by
-   spacing rows linearly in Web Mercator Y instead (`_mercator_y()`); the
-   column/longitude mapping was already correct, since Web Mercator
-   *is* linear in longitude. Verified on a real Hurricane Melissa render
-   (1000nm box, 17.55°N–25.9°N): the storm's true latitude landed ~11px
-   off-position (out of 926, ~1.2%) under the old method. The effect grows
-   with box size and latitude, so it's far more severe for the full-disk
-   render path (spans ±81.3°) or any higher-latitude storm.
-   `tests/test_satellite.py::test_mercator_row_spacing_differs_from_linear_latitude`
-   guards against a regression.
+   bounds, then stretches the raw image **linearly** between them. Output
+   rows must be spaced linearly in Web Mercator Y (`mercator_y()` in
+   `crates/core/src/project.rs`), not linearly by latitude (plain
+   equirectangular/Plate Carrée) — the latter mispositions imagery
+   vertically, worse away from the image's vertical center and worse at
+   higher latitudes. The column/longitude mapping needs no equivalent fix,
+   since Web Mercator *is* linear in longitude. On the original Python
+   render this was worth ~11px off-position (out of 926, ~1.2%) on a 1000nm
+   Hurricane Melissa box — the effect grows with box size and latitude, so
+   it's most severe on the full-disk path (spans ±81.3°) or a high-latitude
+   storm.
 
    ![Before (plain latitude spacing) vs after (Web Mercator spacing) — same scan, same bbox](docs/assets/mercator-fix-before-after.jpg)
 
 5. **Admin console fetch requests used domain-root absolute paths.** The
-   console (`app/console/index.html`) used literal absolute paths like
-   `fetch('/v1/admin/login', ...)`. In production the page is served at
-   `/api/` (nginx proxies `/api/` → this app's `/`), so the browser
-   resolved `/v1/admin/login` against the domain root
-   (`joshmurdock.net/v1/admin/login`, a 404 never proxied to us) rather than
-   the page's own directory (`joshmurdock.net/api/v1/admin/login`). FastAPI's
-   own request-handling was never even reached — but my generic `!res.ok`
-   handler showed "Invalid username or password" for any non-OK response,
-   masking the real 404 behind a plausible auth error. Fixed by computing
+   console (`app/console/index.html`, unchanged by the Rust port) used
+   literal absolute paths like `fetch('/v1/admin/login', ...)`. If the API
+   is ever served behind a path prefix (e.g. `nginx` proxying
+   `example.com/api/` → this app's `/`), the browser resolves
+   `/v1/admin/login` against the domain root instead of the page's own
+   directory — a 404 the server never even sees, further masked by a
+   generic `!res.ok` handler that showed "Invalid username or password" for
+   any non-OK response. Fixed by computing
    `API_BASE = window.location.pathname.replace(/\/$/, '')` at page load and
    prefixing every fetch. **If you add new fetch() calls to the console, you
    MUST prefix them with `API_BASE + '/v1/...'` — never a bare `/v1/...`
-   string.** Only caught because a user attempted login in production (where
-   the `/api/` prefix exists); local dev testing (`127.0.0.1:8000`, no
-   prefix) didn't trigger it. No automated test covers this — a real browser
-   click-test is the only reliable check.
+   string.** No automated test covers this — a real browser click-test is
+   the only reliable check, and it only surfaces when actually deployed
+   behind a path prefix (a bare-domain or subdomain deployment won't trigger
+   it).
 
-6. **Swagger UI 404 on `/openapi.json`.** FastAPI's auto-generated `/docs`
-   page hardcodes the `url` it fetches the OpenAPI schema from as a simple
-   `openapi.json` reference, which FastAPI rewrites to an absolute URL based
-   on `root_path`. Without `root_path=/api`, the URL became the bare
-   `/openapi.json` (domain root, not proxied to our app) instead of
-   `/api/openapi.json`. Fixed by adding `--root-path /api` to the production
-   uvicorn command in `deploy/noaa-recon-api.service` — local dev (`uvicorn
-   app.main:app --reload`, no flag) is unaffected since there's no proxy
-   prefix there. Same root-cause class as bug #5 (absolute paths constructed
-   without awareness of a reverse-proxy path prefix), same symptom (works
-   locally, breaks in production), same diagnostic approach (check what URL
-   the failing fetch is actually constructing by inspecting the rendered HTML
-   or browser devtools).
-
-7. **netCDF4/HDF5 concurrent-access crash + reflectance-band OOM.** Found
-   while adding the sandwich/geocolor composites: `BackgroundTasks` runs
-   synchronous task functions in a thread pool, so two renders landing at
-   the same moment call into `netCDF4`/HDF5 from different threads
-   simultaneously — HDF5 isn't guaranteed thread-safe for this, and it
-   reproducibly crashed the whole process (`double free or corruption`)
-   the first time two composite renders (each opening several files)
-   overlapped in testing. Fixed with a single process-wide
-   `threading.Lock()` (`app/services/netcdf_lock.py`) that every
-   `netCDF4.Dataset(...)` open/read/close anywhere in the project must
-   hold — see that module's docstring. Compounding it: reading a
-   reflectance band's full-resolution array before downsampling (fine for
-   the 2km bands 9/13, ~118MB) is multiple GB for Band 2 at its native
-   0.5km (~21700×21700px full disk) — enough to reproduce an OOM kill on
-   this project's ~4GB deployment host with two composites running at
-   once. Fixed by reading a strided (already-downsampled) view straight
-   from the netCDF variable (`_read_source_downsampled()`) for every
-   full-disk render path — the composites and `render_to_png`'s
-   single-band full-disk path both use it now — instead of materializing
-   the full array first. The same concern applies to any bbox
-   (`center`/`dims`) request — `_read_source_cropped()` locates the
-   requested box first (a cheap sparse pass over just the 1-D coordinate
-   arrays) and then reads only that crop directly from the file at a
-   stride, so a bbox request never pays Band 2's full-disk-materialization
-   cost either. If you add another product that reads Band 1/2/3/4/6 at
-   anything near full resolution, use one of these two rather than reading
-   `ds.variables["CMI"][:]` directly.
+6. **netCDF/HDF5 concurrent-access crash + reflectance-band OOM.** HDF5
+   isn't guaranteed thread-safe, and two renders (or a render racing an
+   ingest crawl) opening netCDF files at the same moment can crash the whole
+   process. Every netCDF open/read/close anywhere in this project must go
+   through the single process-wide mutex in
+   [`crates/server/src/services/goes.rs`](crates/server/src/services/goes.rs)
+   (`nc_lock()`, shared with `recon_ingest.rs`) — it only needs to wrap the
+   open/read/close itself (fast, in-memory), not the slow S3/HTTP download
+   that precedes it. Compounding it: reading a reflectance band's full-
+   resolution array before downsampling is multiple GB for Band 2 at its
+   native 0.5km (~21700×21700px full disk) — enough to OOM a small
+   deployment host. Fixed by reading a **strided** (already-downsampled)
+   view straight from the netCDF variable for every full-disk render path
+   (`read_source_downsampled()`), and by locating a bbox request's target
+   area first via a cheap sparse pass over just the 1-D coordinate arrays,
+   then reading only that crop at a stride (`read_source_cropped()`) — never
+   materializing the full array first, for either path.
 
 ### Roadmap (not yet implemented)
 
-1. **A closer-to-official GeoColor** — today's `product=geocolor` is a
-   documented approximation (synthetic true color + colorized IR, blended
-   by solar zenith angle; see `GET /v1/satellite/products`). No city-lights
-   layer, no atmospheric/Rayleigh correction. Closing that gap means
-   sourcing (or building) a city-lights raster and implementing real
+**Rust-branch-specific, in rough priority order:**
+
+1. **Reflectance-band satellite imagery (bands 2/3/5) + composite products
+   (`sandwich`/`geocolor`)** — currently `501`. Blocked on a real build
+   limitation: GOES compresses those bands' netCDF with a zstd HDF5 filter
+   (32015) the static `hdf5-metno-src`/`netcdf-src` build doesn't include
+   (IR bands 7/9/13 use plain deflate and work fine). Fix path: enable
+   `NETCDF_ENABLE_FILTER_ZSTD` + link `libzstd` in the static build, or link
+   a system netCDF that bundles all standard filters instead (e.g. MSYS2's
+   `mingw-w64-x86_64-netcdf` on Windows; distro netCDF packages on Linux
+   generally already include zstd, so this is likely Windows-static-only).
+   See [RUST.md](RUST.md).
+2. **Admin console: bulk prefetch, on-demand archive-update, self-update**
+   — all currently `501`. The underlying data-ingest logic these would
+   trigger already exists as CLI subcommands (`ingest-storms`/
+   `ingest-recon`); what's missing is wiring them up as background jobs
+   behind the console's HTTP endpoints (`crates/server/src/routers/
+   admin.rs`'s `not_ported` handler), plus the self-update mechanism itself
+   (git pull + rebuild + restart) isn't ported at all yet.
+3. **A WASM build of `crates/core`** — the actual motivation for this
+   branch's workspace split. `core` already compiles to
+   `wasm32-unknown-unknown` (verified); what's missing is a `crates/wasm`
+   crate with `wasm-bindgen` bindings and a browser demo exercising it
+   (likely paired with the raw-netCDF-passthrough item below, so the
+   browser has real decoded data to render, not just the math).
+4. **Mirror the installer's version picker to `main`** and to
+   `install.ps1` (Windows) — `install.sh` on this branch has the Rust/
+   Python variant picker; `main`'s copy and the Windows installer don't yet.
+5. **A Python-vs-Rust benchmark harness** — the two-branch setup exists
+   specifically to A/B these; no harness has been built yet.
+
+**Carried over from the Python branch, still applicable either way:**
+
+6. **A closer-to-official GeoColor** — today's `product=geocolor` (once
+   ported) is a documented approximation (synthetic true color + colorized
+   IR, blended by solar zenith angle; see `GET /v1/satellite/products`). No
+   city-lights layer, no atmospheric/Rayleigh correction. Closing that gap
+   means sourcing (or building) a city-lights raster and implementing real
    atmospheric correction — a substantially bigger lift than the rest of
    this project's rendering pipeline.
-2. **TDR**: see `app/services/tdr.py` docstring. In short: crawl
-   `https://seb.omao.noaa.gov/pub/acdata/{year}/` for `YYYYMMDD[N|I|H]#/`
-   mission directories (no manifest exists — build a local index, e.g.
-   SQLite), download/extract the `.tar.gz` bundles in each mission's
-   `RADAR_TDR/`, parse the raw netCDF sweeps (variable/dimension layout not
-   yet inspected from a real file as of this writing), and render to the
-   same storm-relative grid + Plotly-colorscale shape the hurricanes site's
-   `js/tdr-archive.js` already consumes from TC-Atlas (match that response
-   shape so the client needs minimal changes when migrated onto this API).
-3. **Raw netCDF passthrough** (`app/routers/raw.py`): for the GOES side this
-   can subset directly from the same file `goes.py` already downloads (no new
-   data source) — implement as a `netCDF4` variable slice by
+7. **TDR**: crawl `https://seb.omao.noaa.gov/pub/acdata/{year}/` for
+   `YYYYMMDD[N|I|H]#/` mission directories (no manifest exists — build a
+   local index, e.g. SQLite), download/extract the `.tar.gz` bundles in each
+   mission's `RADAR_TDR/`, parse the raw netCDF sweeps (variable/dimension
+   layout not yet inspected from a real file as of this writing), and
+   render to a storm-relative grid + Plotly-colorscale shape matching
+   whatever the intended downstream client expects.
+8. **Raw netCDF passthrough** (`crates/server/src/routers/raw.rs`): for the
+   GOES side this can subset directly from the same file `goes.rs` already
+   downloads (no new data source) — a `netcdf` crate variable slice by
    center/dimensions, streamed back with `Content-Type: application/x-netcdf`.
    The recon MET side already has this — see `GET /v1/recon/mission/{id}/download`.
-   The TDR side depends on (2) above.
-4. **Migrate the hurricanes site's `goes-archive.js`/`tdr-archive.js`** onto
-   this API instead of the local `goes_tile.py` subprocess / TC-Atlas proxy
-   — not done in the MVP since those already work in production; this is a
-   deliberate follow-up, not an oversight. (`recon-archive.js` and the storm
-   track archive have already been migrated onto this API.)
-5. Move off this host into its own container — `Dockerfile`/
-   `docker-compose.yml` already exist for this.
-6. **Extend historical satellite coverage** — see the note in API.md /
-   the project's GOES satellite history research; pre-2017 storms (e.g.
+   The TDR side depends on (7) above.
+9. **Extend historical satellite coverage** — pre-2017 storms (e.g.
    Katrina, 2005) predate the ABI instrument entirely and need a
    different data source and file-format parser, not just another S3
    bucket.
 
 ### Conventions to keep
 
-- CORS stays open (`allow_origins=["*"]`) — this is meant for third-party
-  sites, not just the hurricanes site.
+- CORS stays open (`Any`/`*`) — this is meant for third-party sites, not
+  just one consumer.
 - New endpoints should return the same `{status, ...}` shape pattern as
-  `satellite.py` (`ready|generating|error|idle`) for anything that does
+  `satellite.rs` (`ready|generating|error|idle`) for anything that does
   background work, so polling clients have one contract to handle.
-- Keep dependencies minimal — no rasterio/pyproj/boto3/satpy/metpy, matching
-  the constraint the original `goes_tile.py` was built under (plain
-  `netCDF4`/`numpy`/`Pillow`/stdlib + `httpx` for async HTTP).
-- Output rows must stay spaced in Web Mercator (`_mercator_y`), not plain
+- Keep the WASM-safe/native split intact: anything that's pure math
+  (projection, colorization, array transforms) belongs in `crates/core` with
+  no I/O and no C-linked dependency; filesystem, SQLite, HTTP, and the
+  netCDF-C decode belong in `crates/server`. Adding a C dependency to `core`
+  breaks the WASM build silently until someone tries it.
+- Keep server-side dependencies deliberate — this project intentionally
+  avoids heavyweight geo/scientific stacks (no gdal-equivalent, no full
+  raster-processing crate) in favor of direct math against `Vec<f32>`,
+  matching the constraint the original Python `goes_tile.py` was built
+  under.
+- Output rows must stay spaced in Web Mercator (`mercator_y`), not plain
   latitude — see bug #4 above. Any new render path needs the same spacing.
+- Preserve response-shape parity with the Python branch (`main`) wherever
+  both implement the same endpoint — field names, types, and null-handling
+  should match exactly, since the whole point of this branch is a fair,
+  drop-in-compatible A/B comparison.
 
 ## License
 

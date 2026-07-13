@@ -1,0 +1,70 @@
+[package]
+name = "noaa-recon-api"
+description = "Native NOAA recon API server (axum) — the full HTTP API benchmarked against the Python/FastAPI version. Wraps noaa-recon-core with filesystem, SQLite, HTTP fetch, and auth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "noaa-recon-api"
+path = "src/main.rs"
+
+[dependencies]
+# The WASM-safe compute core (shared with the future wasm build).
+noaa-recon-core = { path = "../core" }
+
+# ── Web stack (FastAPI + uvicorn -> axum + tokio) ───────────────────────────
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["cookie-signed"] }  # signed-cookie session (Starlette SessionMiddleware equiv)
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# ── Serialization ───────────────────────────────────────────────────────────
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# ── Errors ──────────────────────────────────────────────────────────────────
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# ── Persistence + auth (services/tokens.py) ─────────────────────────────────
+# `bundled` compiles SQLite from C via our mingw gcc — same toolchain path the
+# netcdf crate will exercise later.
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"                     # hashlib.sha256 (token hashing)
+pbkdf2 = "0.12"                   # hashlib.pbkdf2_hmac (password hashing)
+subtle = "2.6"                    # hmac.compare_digest (constant-time compare)
+hex = "0.4"                       # .hex() digests
+base64 = "0.22"                   # secrets.token_urlsafe
+rand = "0.8"                      # os.urandom / secrets
+chrono = "0.4"                    # datetime.fromisoformat / ISO-8601 validation
+
+# ── HTTP client (httpx -> reqwest) ──────────────────────────────────────────
+# rustls (not native-tls) so there's no OpenSSL C dependency to link.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "charset"] }
+futures-util = "0.3"              # stream adaptors for proxying the download
+
+# ── GOES imagery (goes.py) ──────────────────────────────────────────────────
+# `static` compiles netCDF-C + HDF5 from source (needs cmake + CFLAGS to
+# downgrade GCC-16 permerrors — see RUST.md). This is the only C dependency
+# beyond bundled SQLite; kept OUT of `core` so the wasm build stays clean.
+netcdf = { version = "0.10", features = ["static"] }
+quick-xml = "0.36"               # parse the S3 ListBucket XML
+image = { workspace = true }     # Pillow -> PNG encode
+
+# ── Storm-track ingest (ingest_storms.py -> Rust) ───────────────────────────
+flate2 = "1"                     # gunzip ATCF archive b-decks
+regex = "1"                      # HURDAT2 header + ATCF filename parsing
+
+# ── Recon MET ingest (ingest_recon_met.py -> Rust) ──────────────────────────
+tempfile = "3"                   # spill downloaded netCDF to a temp file for the netcdf crate
+pdf-extract = "0.7"              # storm-name extraction from mission PDFs (pypdf equivalent)
+
+# Added as their modules land: reqwest (httpx), netcdf, jsonwebtoken (sessions).

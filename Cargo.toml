@@ -1,0 +1,29 @@
+# Cargo workspace root.
+#
+# The port is split so the compute core can target WASM independently of the
+# server. See crates/core (WASM-safe) vs crates/server (native axum API).
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/server"]
+# crates/wasm is added later once there's compute in core worth exposing to JS.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+# Shared dependency versions so core/server/wasm can't drift. Each crate opts in
+# with `dep = { workspace = true }`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ndarray = "0.16"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

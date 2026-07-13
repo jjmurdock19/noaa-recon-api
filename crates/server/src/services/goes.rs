@@ -1,0 +1,528 @@
+//! GOES ABI L2 CMI fetch + decode + render — server-side port of the netCDF/S3
+//! half of `app/services/goes.py`. The pure render math lives in
+//! `noaa_recon_core::render`; this module does the parts that can't go to WASM:
+//! S3 listing/download (reqwest) and netCDF decode (the `netcdf` C library).
+//!
+//! Scope: single-band tiles (full-disk + bbox). The composite products
+//! (sandwich/geocolor) are a follow-up — `/tile?product=` still 501s.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use serde_json::json;
+
+use noaa_recon_core::bbox::{bbox_bounds, bbox_out_size, BBoxRequest};
+use noaa_recon_core::catalog::native_gsd_km;
+use noaa_recon_core::project::abi_to_latlon;
+use noaa_recon_core::render::{self, Proj};
+
+use crate::services::cache::ResultCache;
+
+/// HDF5 is not guaranteed thread-safe as built here; serialize every netCDF
+/// open/read (port of `netcdf_lock.NC_LOCK`). Only wraps the decode, not the
+/// download.
+static NC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Shared netCDF/HDF5 serialization lock — recon ingest opens netCDF too, and
+/// HDF5 isn't guaranteed thread-safe as built here.
+pub fn nc_lock() -> std::sync::MutexGuard<'static, ()> {
+    NC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+const USER_AGENT: &str = "noaa-recon-api/0.1";
+
+#[derive(Debug, Clone)]
+pub struct ResolvedScan {
+    pub bucket: String,
+    pub key: String,
+    pub satellite: i64,
+    pub band: i64,
+    pub scan_start: DateTime<Utc>,
+}
+
+/// Operational GOES-East/West satellite + bucket for a date (`_get_satellite_bucket`).
+fn get_satellite_bucket(date: DateTime<Utc>, satellite: &str) -> (i64, String) {
+    let ymd = (date.year(), date.month(), date.day());
+    if satellite == "west" {
+        if ymd >= (2023, 1, 10) {
+            return (18, "noaa-goes18".into());
+        }
+        return (17, "noaa-goes17".into());
+    }
+    if ymd >= (2025, 1, 14) {
+        return (19, "noaa-goes19".into());
+    }
+    (16, "noaa-goes16".into())
+}
+
+/// Parse the `_sYYYYDDDHHMMSSf_` scan-start stamp from an ABI key (`_parse_scan_start`).
+pub fn parse_scan_start(key: &str) -> Option<DateTime<Utc>> {
+    let idx = key.find("_s")?;
+    let digits: &str = key.get(idx + 2..idx + 2 + 14)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Char after the 14 digits should be '_' (the file convention).
+    let year: i32 = digits[0..4].parse().ok()?;
+    let doy: i64 = digits[4..7].parse().ok()?;
+    let hh: u32 = digits[7..9].parse().ok()?;
+    let mm: u32 = digits[9..11].parse().ok()?;
+    let ss: u32 = digits[11..13].parse().ok()?;
+    let base = Utc.with_ymd_and_hms(year, 1, 1, hh, mm, ss).single()?;
+    Some(base + Duration::days(doy - 1))
+}
+
+/// List an S3 prefix (public bucket, no auth) — `list_s3_prefix`.
+async fn list_s3_prefix(bucket: &str, prefix: &str) -> anyhow::Result<Vec<String>> {
+    let url = format!(
+        "https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}&max-keys=100"
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let xml = client.get(&url).send().await?.error_for_status()?.text().await?;
+
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut keys = Vec::new();
+    let mut in_key = false;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"Key" => in_key = true,
+            Ok(Event::End(e)) if e.name().as_ref() == b"Key" => in_key = false,
+            Ok(Event::Text(t)) if in_key => keys.push(t.unescape().unwrap_or_default().into_owned()),
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("S3 XML parse: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(keys)
+}
+
+/// Find the ABI-L2-CMIPF scan for `band` nearest `target` (`resolve_nearest`).
+/// Returns `Ok(None)` when no scan is found (-> HTTP 404 in the caller).
+pub async fn resolve_nearest(
+    target: DateTime<Utc>,
+    band: i64,
+    satellite: &str,
+) -> anyhow::Result<Option<ResolvedScan>> {
+    let this_hour = target
+        .with_minute(0)
+        .and_then(|d| d.with_second(0))
+        .and_then(|d| d.with_nanosecond(0))
+        .unwrap_or(target);
+    let next_hour = this_hour + Duration::hours(1);
+    let chan = format!("C{band:02}");
+
+    let mut candidates: Vec<(String, String, DateTime<Utc>)> = Vec::new();
+    for hour_dt in [this_hour, next_hour] {
+        let (_, bucket) = get_satellite_bucket(hour_dt, satellite);
+        let prefix = format!(
+            "ABI-L2-CMIPF/{}/{:03}/{:02}/",
+            hour_dt.year(),
+            hour_dt.ordinal(),
+            hour_dt.hour()
+        );
+        let keys = match list_s3_prefix(&bucket, &prefix).await {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        for k in keys {
+            if !k.contains(&chan) || !k.ends_with(".nc") {
+                continue;
+            }
+            if let Some(ss) = parse_scan_start(&k) {
+                candidates.push((bucket.clone(), k, ss));
+            }
+        }
+    }
+
+    let best = candidates.into_iter().min_by_key(|c| (c.2 - target).num_seconds().abs());
+    Ok(best.map(|(bucket, key, scan_start)| {
+        let (sat_num, _) = get_satellite_bucket(scan_start, satellite);
+        ResolvedScan { bucket, key, satellite: sat_num, band, scan_start }
+    }))
+}
+
+/// Download the object to `nc_cache_dir` if not already cached (`ensure_downloaded`).
+async fn ensure_downloaded(resolved: &ResolvedScan, nc_cache_dir: &Path) -> anyhow::Result<PathBuf> {
+    tokio::fs::create_dir_all(nc_cache_dir).await?;
+    let filename = resolved.key.rsplit('/').next().unwrap_or("scan.nc");
+    let local_path = nc_cache_dir.join(filename);
+    if local_path.exists() {
+        return Ok(local_path);
+    }
+    let url = format!("https://{}.s3.amazonaws.com/{}", resolved.bucket, resolved.key);
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+    let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
+    tokio::fs::write(&local_path, &bytes).await?;
+    Ok(local_path)
+}
+
+// ── netCDF decode ────────────────────────────────────────────────────────────
+
+struct Source {
+    cmi: Vec<f32>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    proj: Proj,
+}
+
+fn attr_f64(var: &netcdf::Variable, name: &str) -> Option<f64> {
+    use netcdf::AttributeValue::*;
+    match var.attribute_value(name)?.ok()? {
+        Uchar(v) => Some(v as f64),
+        Schar(v) => Some(v as f64),
+        Ushort(v) => Some(v as f64),
+        Short(v) => Some(v as f64),
+        Uint(v) => Some(v as f64),
+        Int(v) => Some(v as f64),
+        Ulonglong(v) => Some(v as f64),
+        Longlong(v) => Some(v as f64),
+        Float(v) => Some(v as f64),
+        Double(v) => Some(v),
+        _ => None,
+    }
+}
+
+fn attr_pair_f64(var: &netcdf::Variable, name: &str) -> Option<(f64, f64)> {
+    use netcdf::AttributeValue::*;
+    let two = |a: f64, b: f64| Some((a, b));
+    match var.attribute_value(name)?.ok()? {
+        Shorts(v) if v.len() == 2 => two(v[0] as f64, v[1] as f64),
+        Ushorts(v) if v.len() == 2 => two(v[0] as f64, v[1] as f64),
+        Ints(v) if v.len() == 2 => two(v[0] as f64, v[1] as f64),
+        Floats(v) if v.len() == 2 => two(v[0] as f64, v[1] as f64),
+        Doubles(v) if v.len() == 2 => two(v[0], v[1]),
+        _ => None,
+    }
+}
+
+/// Apply _FillValue/valid_range masking then scale_factor/add_offset — the
+/// equivalent of netCDF4-python's default mask-and-scale, which the Rust crate
+/// doesn't do automatically.
+fn scale_and_mask(raw: &[f32], scale: f64, offset: f64, fill: Option<f64>, valid: Option<(f64, f64)>) -> Vec<f32> {
+    raw.iter()
+        .map(|&r| {
+            let r = r as f64;
+            if let Some(f) = fill {
+                if r == f {
+                    return f32::NAN;
+                }
+            }
+            if let Some((lo, hi)) = valid {
+                if r < lo || r > hi {
+                    return f32::NAN;
+                }
+            }
+            (r * scale + offset) as f32
+        })
+        .collect()
+}
+
+fn read_proj(ds: &netcdf::File) -> anyhow::Result<Proj> {
+    let proj = ds
+        .variable("goes_imager_projection")
+        .ok_or_else(|| anyhow::anyhow!("missing goes_imager_projection"))?;
+    Ok(Proj {
+        sat_lon: attr_f64(&proj, "longitude_of_projection_origin").ok_or_else(|| anyhow::anyhow!("no sat_lon"))?,
+        h: attr_f64(&proj, "perspective_point_height").ok_or_else(|| anyhow::anyhow!("no height"))?,
+        r_eq: attr_f64(&proj, "semi_major_axis").ok_or_else(|| anyhow::anyhow!("no r_eq"))?,
+        r_pol: attr_f64(&proj, "semi_minor_axis").ok_or_else(|| anyhow::anyhow!("no r_pol"))?,
+    })
+}
+
+fn cmi_scale(var: &netcdf::Variable) -> (f64, f64, Option<f64>, Option<(f64, f64)>) {
+    (
+        attr_f64(var, "scale_factor").unwrap_or(1.0),
+        attr_f64(var, "add_offset").unwrap_or(0.0),
+        attr_f64(var, "_FillValue"),
+        attr_pair_f64(var, "valid_range"),
+    )
+}
+
+/// Read a 1-D coordinate variable (`x`/`y`) applying its scale_factor/add_offset.
+/// GOES stores x/y as scaled shorts (radians only after scaling) — the same
+/// mask-and-scale netCDF4-python applies automatically, which we must replicate.
+fn read_coord<E: Into<netcdf::Extents>>(
+    ds: &netcdf::File,
+    name: &str,
+    extents: E,
+) -> anyhow::Result<Vec<f64>> {
+    let var = ds.variable(name).ok_or_else(|| anyhow::anyhow!("missing coord {name}"))?;
+    let scale = attr_f64(&var, "scale_factor").unwrap_or(1.0);
+    let offset = attr_f64(&var, "add_offset").unwrap_or(0.0);
+    let raw: Vec<f64> = var.get_values::<f64, _>(extents)?;
+    Ok(raw.into_iter().map(|v| v * scale + offset).collect())
+}
+
+/// Strided full-disk read (`_read_source_downsampled`).
+fn read_source_downsampled(nc_path: &Path, step: Option<usize>) -> anyhow::Result<Source> {
+    let _guard = NC_LOCK.lock().unwrap();
+    let ds = netcdf::open(nc_path)?;
+    let cmi_var = ds.variable("CMI").ok_or_else(|| anyhow::anyhow!("no CMI variable"))?;
+    let dims = cmi_var.dimensions();
+    let (ny, nx) = (dims[0].len(), dims[1].len());
+    let step = step.unwrap_or_else(|| (ny.max(nx) / 2160).max(1));
+
+    let ext = |n: usize| netcdf::Extent::from((0..n).step_by(step));
+    let raw: Vec<f32> = cmi_var.get_values::<f32, _>([ext(ny), ext(nx)])?;
+    let (scale, offset, fill, valid) = cmi_scale(&cmi_var);
+    let cmi = scale_and_mask(&raw, scale, offset, fill, valid);
+
+    let x = read_coord(&ds, "x", (0..nx).step_by(step))?;
+    let y = read_coord(&ds, "y", (0..ny).step_by(step))?;
+    let proj = read_proj(&ds)?;
+    anyhow::ensure!(cmi.len() == x.len() * y.len(), "CMI/coord shape mismatch");
+    Ok(Source { cmi, x, y, proj })
+}
+
+/// Locate-then-crop native read (`_read_source_cropped`). Returns `Ok(None)` if
+/// the box misses this scan's disk.
+fn read_source_cropped(
+    nc_path: &Path,
+    lat_s: f64,
+    lat_n: f64,
+    lon_w: f64,
+    lon_e: f64,
+    fine_step: usize,
+) -> anyhow::Result<Option<Source>> {
+    const LOCATE_GRID: usize = 160;
+    let _guard = NC_LOCK.lock().unwrap();
+    let ds = netcdf::open(nc_path)?;
+    let cmi_var = ds.variable("CMI").ok_or_else(|| anyhow::anyhow!("no CMI variable"))?;
+    let dims = cmi_var.dimensions();
+    let (ny, nx) = (dims[0].len(), dims[1].len());
+    let x_full = read_coord(&ds, "x", 0..nx)?;
+    let y_full = read_coord(&ds, "y", 0..ny)?;
+    let proj = read_proj(&ds)?;
+
+    let step_y = (ny / LOCATE_GRID).max(1);
+    let step_x = (nx / LOCATE_GRID).max(1);
+    // Sparse locate pass over the 1-D coords only.
+    let (mut r_lo, mut r_hi, mut c_lo, mut c_hi) = (usize::MAX, 0usize, usize::MAX, 0usize);
+    let mut hit = false;
+    let mut si = 0;
+    while si < ny {
+        let mut sj = 0;
+        while sj < nx {
+            if let Some((lon, lat)) = abi_to_latlon(x_full[sj], y_full[si], proj.sat_lon, proj.h, proj.r_eq, proj.r_pol) {
+                if lon >= lon_w && lon <= lon_e && lat >= lat_s && lat <= lat_n {
+                    hit = true;
+                    r_lo = r_lo.min(si);
+                    r_hi = r_hi.max(si);
+                    c_lo = c_lo.min(sj);
+                    c_hi = c_hi.max(sj);
+                }
+            }
+            sj += step_x;
+        }
+        si += step_y;
+    }
+    if !hit {
+        return Ok(None);
+    }
+    let pad_y = step_y * 2;
+    let pad_x = step_x * 2;
+    let row_lo = r_lo.saturating_sub(pad_y);
+    let row_hi = ((r_hi + 1) + pad_y).min(ny);
+    let col_lo = c_lo.saturating_sub(pad_x);
+    let col_hi = ((c_hi + 1) + pad_x).min(nx);
+
+    // Read x/y crop through the SAME netcdf striding as CMI so element counts
+    // always agree (mixing Rust's .step_by with the crate's produced off-by-a-few
+    // mismatches at the tail).
+    let x = read_coord(&ds, "x", (col_lo..col_hi).step_by(fine_step))?;
+    let y = read_coord(&ds, "y", (row_lo..row_hi).step_by(fine_step))?;
+    let raw: Vec<f32> = cmi_var.get_values::<f32, _>([
+        netcdf::Extent::from((row_lo..row_hi).step_by(fine_step)),
+        netcdf::Extent::from((col_lo..col_hi).step_by(fine_step)),
+    ])?;
+    let (scale, offset, fill, valid) = cmi_scale(&cmi_var);
+    let cmi = scale_and_mask(&raw, scale, offset, fill, valid);
+    anyhow::ensure!(cmi.len() == x.len() * y.len(), "crop CMI/coord shape mismatch");
+    Ok(Some(Source { cmi, x, y, proj }))
+}
+
+/// Delete cached raw GOES netCDF files older than `max_age_hours` from
+/// `nc_cache_dir` — port of `scripts/clear_nc_cache.py`. Safe any time (files are
+/// re-downloaded on demand). Returns (files_removed, bytes_freed).
+pub fn clean_nc_cache(nc_cache_dir: &Path, max_age_hours: f64) -> (usize, u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs_f64(max_age_hours * 3600.0))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let (mut removed, mut freed) = (0usize, 0u64);
+    if let Ok(entries) = std::fs::read_dir(nc_cache_dir) {
+        for e in entries.flatten() {
+            let md = match e.metadata() {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+            let old = md.modified().map(|m| m < cutoff).unwrap_or(false);
+            if old {
+                freed += md.len();
+                if std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    (removed, freed)
+}
+
+/// Structural metadata for a netCDF file (dimensions, variables, global attrs) —
+/// the console's `ncdump -h`-style preview (`get_goes_nc_info`).
+pub fn nc_info(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let _guard = NC_LOCK.lock().unwrap();
+    let ds = netcdf::open(path)?;
+    let dimensions: serde_json::Map<String, serde_json::Value> = ds
+        .dimensions()
+        .map(|d| (d.name(), json!(d.len())))
+        .collect();
+    let mut variables: Vec<serde_json::Value> = ds
+        .variables()
+        .map(|v| {
+            let dims: Vec<String> = v.dimensions().iter().map(|d| d.name()).collect();
+            let shape: Vec<usize> = v.dimensions().iter().map(|d| d.len()).collect();
+            json!({
+                "name": v.name(),
+                "dimensions": dims,
+                "shape": shape,
+                "dtype": format!("{:?}", v.vartype()),
+                "units": attr_str(&v, "units"),
+                "long_name": attr_str(&v, "long_name"),
+            })
+        })
+        .collect();
+    variables.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let global_attrs: serde_json::Map<String, serde_json::Value> = ds
+        .attributes()
+        .filter_map(|a| a.value().ok().map(|v| (a.name().to_string(), json!(format!("{v:?}")))))
+        .collect();
+    Ok(json!({
+        "dimensions": dimensions,
+        "variables": variables,
+        "global_attrs": global_attrs,
+    }))
+}
+
+fn attr_str(var: &netcdf::Variable, name: &str) -> Option<String> {
+    match var.attribute_value(name)?.ok()? {
+        netcdf::AttributeValue::Str(s) => Some(s),
+        other => Some(format!("{other:?}")),
+    }
+}
+
+// ── Orchestration ────────────────────────────────────────────────────────────
+
+/// Background-task entry point (`render_and_store`): download, decode, render,
+/// PNG-encode, and write the result into the shared cache. Never panics — all
+/// failures are reported to the client via an `error` cache entry.
+pub async fn render_and_store(
+    resolved: ResolvedScan,
+    cmap: String,
+    key: String,
+    nc_cache_dir: PathBuf,
+    cache: ResultCache,
+    bbox: Option<BBoxRequest>,
+) {
+    let result = render_and_store_inner(&resolved, &cmap, &key, &nc_cache_dir, &cache, bbox.as_ref()).await;
+    if let Err(e) = result {
+        tracing::error!("GOES render failed for key={key}: {e:#}");
+        let mut meta = json!({
+            "status": "error",
+            "key": key,
+            "message": e.to_string(),
+            "band": resolved.band,
+            "cmap": cmap,
+            "satellite": format!("GOES-{}", resolved.satellite),
+            "scan_start": resolved.scan_start.to_rfc3339(),
+        });
+        if let Some(b) = bbox {
+            let m = meta.as_object_mut().unwrap();
+            m.insert("center".into(), json!([b.center_lat, b.center_lon]));
+            m.insert("width_km".into(), json!(b.width_km));
+        }
+        let _ = cache.write_result(&key, &meta);
+    }
+}
+
+async fn render_and_store_inner(
+    resolved: &ResolvedScan,
+    cmap: &str,
+    key: &str,
+    nc_cache_dir: &Path,
+    cache: &ResultCache,
+    bbox: Option<&BBoxRequest>,
+) -> anyhow::Result<()> {
+    let nc_path = ensure_downloaded(resolved, nc_cache_dir).await?;
+    let out_png = cache.output_path(key, "png");
+    let band = resolved.band;
+    let cmap_s = cmap.to_string();
+    let bbox = bbox.copied();
+
+    // netCDF decode + render + PNG encode is blocking/CPU-bound.
+    let render_meta = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let (rgba, out_size, bounds, sat_lon, extra) = match bbox {
+            None => {
+                let src = read_source_downsampled(&nc_path, None)?;
+                let r = render::render_full_disk(
+                    &src.cmi, src.y.len(), src.x.len(), &src.x, &src.y, src.proj, &cmap_s, band, 2048,
+                );
+                (r.rgba, r.out_size, r.bounds, r.sat_lon, None)
+            }
+            Some(b) => {
+                let (lat_s, lat_n, lon_w, lon_e) = bbox_bounds(b.center_lat, b.center_lon, b.width_km);
+                let gsd = native_gsd_km(band).unwrap_or(2.0);
+                let fine_step = ((b.resolution_km / gsd).round() as usize).max(1);
+                let src = read_source_cropped(&nc_path, lat_s, lat_n, lon_w, lon_e, fine_step)?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Requested area ({lat_s:.2},{lon_w:.2})-({lat_n:.2},{lon_e:.2}) is outside this scan's visible disk"
+                    ))?;
+                let out_size = bbox_out_size(b.width_km, b.resolution_km);
+                let r = render::render_bbox(
+                    &src.cmi, src.y.len(), src.x.len(), &src.x, &src.y, src.proj, &cmap_s, band,
+                    b.center_lat, b.center_lon, b.width_km, out_size,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                (r.rgba, r.out_size, r.bounds, r.sat_lon, Some(b.resolution_km))
+            }
+        };
+        // Encode RGBA -> PNG (Pillow equivalent).
+        let img = image::RgbaImage::from_raw(out_size as u32, out_size as u32, rgba)
+            .ok_or_else(|| anyhow::anyhow!("RGBA buffer size mismatch"))?;
+        if let Some(parent) = out_png.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        img.save_with_format(&out_png, image::ImageFormat::Png)?;
+        Ok(json!({ "bounds": bounds, "sat_lon": sat_lon, "resolution_km": extra }))
+    })
+    .await??;
+
+    let mut meta = json!({
+        "status": "ready",
+        "key": key,
+        "png_url": format!("/cache/satellite/{key}.png"),
+        "bounds": render_meta["bounds"],
+        "band": resolved.band,
+        "cmap": cmap,
+        "satellite": format!("GOES-{}", resolved.satellite),
+        "sat_lon": render_meta["sat_lon"],
+        "scan_start": resolved.scan_start.to_rfc3339(),
+    });
+    if let Some(b) = bbox {
+        let m = meta.as_object_mut().unwrap();
+        m.insert("center".into(), json!([b.center_lat, b.center_lon]));
+        m.insert("width_km".into(), json!(b.width_km));
+        m.insert("resolution_km".into(), render_meta["resolution_km"].clone());
+    }
+    cache.write_result(key, &meta)?;
+    Ok(())
+}
