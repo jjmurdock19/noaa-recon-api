@@ -42,6 +42,11 @@ CLI_PATH="/usr/local/bin/noaa-recon-api"
 INSTALL_DIR="/opt/noaa-recon-api"
 RUN_USER=""
 BRANCH="main"
+# Which implementation to run as the API server: "python" (FastAPI, branch main)
+# or "rust" (compiled axum server, branch rust). Empty => the version picker asks.
+# NOTE: even the rust variant still installs a Python venv — the data-ingest and
+# nightly-maintenance scripts are Python and shared by both variants.
+VARIANT=""
 PORT="8000"
 NET_MODE="local"      # local | lan | domain
 DOMAIN=""
@@ -189,11 +194,14 @@ noaa-recon-api installer
 
 Usage:
   ./install.sh                 Interactive install / update / reconfigure wizard
-  ./install.sh --update        Non-interactive: pull latest code, reinstall deps, restart
+                               (asks which version to install: Rust or Python)
+  ./install.sh --update        Non-interactive: pull latest code, rebuild, restart
   ./install.sh --uninstall     Remove the service, timers, webserver config, and CLI
   ./install.sh --status        Show service status and a health check
   ./install.sh --dir PATH      Install to PATH instead of /opt/noaa-recon-api
-  ./install.sh --branch NAME   Track a branch other than 'main'
+  ./install.sh --variant V     'python' (FastAPI, branch main) or 'rust' (compiled
+                               axum server, branch rust). Omit to be asked.
+  ./install.sh --branch NAME   Track a branch other than the variant's default
   ./install.sh -y, --yes       Accept defaults for anything not given on the command line
   ./install.sh -h, --help      This message
 
@@ -221,12 +229,22 @@ detect_pkg_manager() {
 }
 
 install_base_packages() {
-    log_step "Installing base dependencies (git, python3, build tools)"
+    # The rust variant is fully self-contained (ingest is native subcommands), so
+    # it needs NO Python — just git, a C compiler + make (for the netcdf crate's C
+    # deps), curl (rustup), and cmake (netCDF-C/HDF5 from source). The python
+    # variant needs python3 + venv/pip instead of cmake/curl.
+    log_step "Installing base dependencies for the ${VARIANT} variant"
     case "$PKG_MANAGER" in
-        dnf)  $SUDO dnf install -y git python3 python3-pip python3-devel gcc gcc-c++ make sudo >&2 ;;
-        apt)  $SUDO apt-get update -y >&2 && $SUDO apt-get install -y git python3 python3-venv python3-pip python3-dev build-essential sudo >&2 ;;
-        nix)  nix-env -iA nixpkgs.git nixpkgs.python3 nixpkgs.gcc nixpkgs.gnumake >&2 ;;
-        *)    log_warn "Unrecognized package manager — make sure git, python3 (with venv+pip), and a C compiler are installed." ;;
+        dnf)  $SUDO dnf install -y git gcc gcc-c++ make sudo >&2
+              if [[ "$VARIANT" == "rust" ]]; then $SUDO dnf install -y cmake curl >&2
+              else $SUDO dnf install -y python3 python3-pip python3-devel >&2; fi ;;
+        apt)  $SUDO apt-get update -y >&2 && $SUDO apt-get install -y git build-essential sudo >&2
+              if [[ "$VARIANT" == "rust" ]]; then $SUDO apt-get install -y cmake curl >&2
+              else $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev >&2; fi ;;
+        nix)  nix-env -iA nixpkgs.git nixpkgs.gcc nixpkgs.gnumake >&2
+              if [[ "$VARIANT" == "rust" ]]; then nix-env -iA nixpkgs.cmake nixpkgs.curl nixpkgs.rustup >&2
+              else nix-env -iA nixpkgs.python3 >&2; fi ;;
+        *)    log_warn "Unrecognized package manager — ensure git + a C compiler$([[ "$VARIANT" == "rust" ]] && echo " + cmake + curl" || echo " + python3 (venv+pip)") are installed." ;;
     esac
     log_ok "base packages present"
 }
@@ -272,6 +290,7 @@ save_config() {
 INSTALL_DIR="${INSTALL_DIR}"
 RUN_USER="${RUN_USER}"
 BRANCH="${BRANCH}"
+VARIANT="${VARIANT}"
 PORT="${PORT}"
 NET_MODE="${NET_MODE}"
 DOMAIN="${DOMAIN}"
@@ -301,6 +320,54 @@ load_config() {
 # ---------------------------------------------------------------------------
 # Wizard steps
 # ---------------------------------------------------------------------------
+choose_version() {
+    # Skip the picker if a variant was already chosen (via --variant, or derived
+    # from --branch, or restored from an existing install's config).
+    if [[ -n "$VARIANT" ]]; then
+        log_ok "version: ${VARIANT} (branch ${BRANCH})"
+        return
+    fi
+    menu_select "Which version of the API do you want to install?" \
+        "Rust — compiled axum server (experimental, faster). Branch: rust" \
+        "Python — the original FastAPI app (stable). Branch: main"
+    case "$MENU_INDEX" in
+        0) VARIANT="rust";   BRANCH="rust" ;;
+        1) VARIANT="python"; BRANCH="main" ;;
+    esac
+    log_ok "selected: ${VARIANT} (branch ${BRANCH})"
+    [[ "$VARIANT" == "rust" ]] && log_warn "Rust variant note: reflectance satellite bands (2/3/5) and composites aren't available yet, and data ingest still runs via Python scripts. See RUST.md."
+}
+
+# Rust variant only: install the toolchain (per RUN_USER, minimal profile) and
+# compile the release binary. The first build compiles netCDF-C + HDF5 from
+# source (a few minutes); CFLAGS downgrades permerrors that GCC >= 14 raises on
+# netCDF-C's older source.
+# Resolve RUN_USER's cargo binary path (rustup installs with --no-modify-path,
+# so cargo isn't on PATH; and $HOME isn't reliable under sudo -u).
+_cargo_bin() {
+    local uhome; uhome="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+    echo "${uhome}/.cargo/bin/cargo"
+}
+
+install_rust_toolchain() {
+    if [[ -x "$(_cargo_bin)" ]]; then
+        log_ok "rust toolchain already present for ${RUN_USER}"
+        return
+    fi
+    log_step "Installing the Rust toolchain (rustup) for ${RUN_USER}"
+    run_as "$RUN_USER" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path' >&2
+    [[ -x "$(_cargo_bin)" ]] || die "rustup install did not produce $(_cargo_bin)"
+    log_ok "rust toolchain installed"
+}
+
+build_rust() {
+    local cargo; cargo="$(_cargo_bin)"
+    log_step "Building the Rust server (cargo build --release — first build compiles netCDF/HDF5, can take several minutes)"
+    run_as "$RUN_USER" bash -c "cd '${INSTALL_DIR}' && CFLAGS='-Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration' '${cargo}' build --release -p noaa-recon-api" >&2
+    [[ -x "${INSTALL_DIR}/target/release/noaa-recon-api" ]] || die "Rust build did not produce ${INSTALL_DIR}/target/release/noaa-recon-api"
+    log_ok "rust binary built -> target/release/noaa-recon-api"
+}
+
 choose_install_dir() {
     INSTALL_DIR="$(ask_text "Where should noaa-recon-api live?" "$INSTALL_DIR")"
 }
@@ -453,21 +520,34 @@ PYEOF
 }
 
 write_systemd_service() {
-    log_step "Writing the systemd service"
+    log_step "Writing the systemd service (${VARIANT} variant)"
     local bindhost="127.0.0.1"
     [[ "$NET_MODE" == "lan" ]] && bindhost="0.0.0.0"
-    local rootpath_flag=""
-    [[ "$NET_MODE" == "domain" && "$DOMAIN_MODE" == "path" ]] && rootpath_flag="--root-path ${API_PATH}"
+
+    # ExecStart + any extra unit lines differ by variant. The rust binary reads
+    # its host/port/repo-root from the environment (config.rs).
+    local exec_start extra_lines=""
+    if [[ "$VARIANT" == "rust" ]]; then
+        exec_start="${INSTALL_DIR}/target/release/noaa-recon-api"
+        extra_lines=$'Environment=PORT='"${PORT}"$'\n'"Environment=NOAA_RECON_HOST=${bindhost}"$'\n'"Environment=NOAA_RECON_REPO_ROOT=${INSTALL_DIR}"
+        [[ "$NET_MODE" == "domain" && "$DOMAIN_MODE" == "path" ]] && log_warn "Rust variant doesn't support a --root-path prefix; if OpenAPI/doc links look off under ${API_PATH}, that's why (the API itself works)."
+    else
+        local rootpath_flag=""
+        [[ "$NET_MODE" == "domain" && "$DOMAIN_MODE" == "path" ]] && rootpath_flag="--root-path ${API_PATH}"
+        exec_start="${INSTALL_DIR}/.venv/bin/uvicorn app.main:app --host ${bindhost} --port ${PORT} ${rootpath_flag}"
+    fi
+
     $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<SERVICE_EOF
 [Unit]
-Description=noaa-recon-api (GOES/TDR data API)
+Description=noaa-recon-api (GOES/TDR data API, ${VARIANT})
 After=network.target
 
 [Service]
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/.venv/bin/uvicorn app.main:app --host ${bindhost} --port ${PORT} ${rootpath_flag}
+${extra_lines}
+ExecStart=${exec_start}
 Restart=on-failure
 RestartSec=5
 # Memory guardrail: the API idles around ~100MB, but a pathological render
@@ -648,26 +728,49 @@ configure_selinux() {
 
 build_archives() {
     log_step "Building the storm-track archive (backs GET /v1/storms/*, usually ~10s)"
-    run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" "${INSTALL_DIR}/scripts/ingest_storms.py" >&2
+    # Storms ingest is native in the rust variant; recon MET is still Python.
+    if [[ "$VARIANT" == "rust" ]]; then
+        run_as "$RUN_USER" "${INSTALL_DIR}/target/release/noaa-recon-api" ingest-storms >&2
+    else
+        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" "${INSTALL_DIR}/scripts/ingest_storms.py" >&2
+    fi
     log_ok "storm archive built"
 
+    local full_flag=""
     if ask_yesno "Build the FULL recon MET archive now (every hurricane hunter mission since 2011)? This can take SEVERAL HOURS. Choosing no builds just current+previous season (fast, minutes)." n; then
+        full_flag="--full"
         log_step "Building the full recon MET archive — this will take a while"
-        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" "${INSTALL_DIR}/scripts/ingest_recon_met.py" --full >&2
     else
         log_step "Building the recon MET archive (current + previous season)"
-        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" "${INSTALL_DIR}/scripts/ingest_recon_met.py" >&2
+    fi
+    if [[ "$VARIANT" == "rust" ]]; then
+        run_as "$RUN_USER" "${INSTALL_DIR}/target/release/noaa-recon-api" ingest-recon $full_flag >&2
+    else
+        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" "${INSTALL_DIR}/scripts/ingest_recon_met.py" $full_flag >&2
     fi
     log_ok "recon MET archive built"
 }
 
 install_timers() {
     log_step "Installing nightly archive-update and cache-cleanup timers"
+    local rust_bin="${INSTALL_DIR}/target/release/noaa-recon-api"
+    local py="${INSTALL_DIR}/.venv/bin/python3"
     local svc
     for svc in storm-archive-update recon-met-update goes-nc-cache-cleanup; do
-        local script="ingest_storms.py"; local desc="storm track archive (HURDAT2 + ATCF) update"; local after="After=network.target"
-        [[ "$svc" == "recon-met-update" ]] && script="ingest_recon_met.py" && desc="recon MET archive update"
-        [[ "$svc" == "goes-nc-cache-cleanup" ]] && script="clear_nc_cache.py" && desc="cleanup of GOES netCDF cache files older than 1 day" && after=""
+        # Storms + cache cleanup are native subcommands in the rust variant;
+        # recon MET is Python in both variants.
+        local desc after="After=network.target" execstart
+        case "$svc" in
+            storm-archive-update)
+                desc="storm track archive (HURDAT2 + ATCF) update"
+                if [[ "$VARIANT" == "rust" ]]; then execstart="${rust_bin} ingest-storms"; else execstart="${py} scripts/ingest_storms.py"; fi ;;
+            recon-met-update)
+                desc="recon MET archive update"
+                if [[ "$VARIANT" == "rust" ]]; then execstart="${rust_bin} ingest-recon"; else execstart="${py} scripts/ingest_recon_met.py"; fi ;;
+            goes-nc-cache-cleanup)
+                desc="cleanup of GOES netCDF cache files older than 1 day"; after=""
+                if [[ "$VARIANT" == "rust" ]]; then execstart="${rust_bin} clean-nc-cache"; else execstart="${py} scripts/clear_nc_cache.py"; fi ;;
+        esac
         $SUDO tee "/etc/systemd/system/${svc}.service" >/dev/null <<TIMER_SVC_EOF
 [Unit]
 Description=Nightly ${desc}
@@ -676,7 +779,7 @@ ${after}
 [Service]
 Type=oneshot
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/.venv/bin/python3 scripts/${script}
+ExecStart=${execstart}
 User=${RUN_USER}
 Group=${RUN_USER}
 
@@ -754,13 +857,20 @@ print_summary() {
 # Top-level commands
 # ---------------------------------------------------------------------------
 run_wizard() {
+    choose_version
     choose_install_dir
     choose_run_user
     choose_network_mode
     choose_webserver
     install_base_packages
     clone_or_update_repo
-    setup_python_env
+    # rust variant is fully native (server + ingest); python variant uses a venv.
+    if [[ "$VARIANT" == "rust" ]]; then
+        install_rust_toolchain
+        build_rust
+    else
+        setup_python_env
+    fi
     configure_admin_credentials
     configure_auth
     write_systemd_service
@@ -800,11 +910,15 @@ cmd_install() {
 
 cmd_update() {
     load_config || die "No existing install found at ${CONFIG_FILE}. Run ./install.sh normally first."
-    log_step "Updating ${INSTALL_DIR} to the latest ${BRANCH}"
+    log_step "Updating ${INSTALL_DIR} to the latest ${BRANCH} (${VARIANT:-python})"
     run_as "$RUN_USER" git -C "$INSTALL_DIR" fetch origin >&2
     run_as "$RUN_USER" git -C "$INSTALL_DIR" reset --hard "origin/${BRANCH}" >&2
     run_as "$RUN_USER" git -C "$INSTALL_DIR" submodule update --init --recursive >&2
-    run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/pip" install -e "${INSTALL_DIR}" -q
+    if [[ "$VARIANT" == "rust" ]]; then
+        build_rust
+    else
+        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/pip" install -e "${INSTALL_DIR}" -q
+    fi
     $SUDO systemctl restart "${SERVICE_NAME}"
     log_ok "updated and restarted — now on $(run_as "$RUN_USER" git -C "$INSTALL_DIR" rev-parse --short HEAD)"
 }
@@ -854,11 +968,20 @@ while [[ $# -gt 0 ]]; do
         --status)    ACTION="status"; shift ;;
         --dir)       INSTALL_DIR="$2"; shift 2 ;;
         --branch)    BRANCH="$2"; shift 2 ;;
+        --variant)   VARIANT="$2"; shift 2 ;;
         -y|--yes)    exec </dev/null; shift ;;
         -h|--help)   print_help; exit 0 ;;
         *) log_err "Unknown option: $1"; print_help; exit 1 ;;
     esac
 done
+
+# Reconcile --variant / --branch. An explicit --branch rust implies the rust
+# variant; --variant rust implies the rust branch unless a branch was named.
+if [[ -n "$VARIANT" && "$VARIANT" != "python" && "$VARIANT" != "rust" ]]; then
+    log_err "Unknown --variant: '$VARIANT' (expected 'python' or 'rust')"; exit 1
+fi
+[[ -z "$VARIANT" && "$BRANCH" == "rust" ]] && VARIANT="rust"
+[[ "$VARIANT" == "rust" && "$BRANCH" == "main" ]] && BRANCH="rust"
 
 case "$ACTION" in
     install)   cmd_install ;;
