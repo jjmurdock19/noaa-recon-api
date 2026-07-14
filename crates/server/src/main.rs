@@ -245,7 +245,7 @@ const SELF_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(1800);
 fn spawn_self_update_checker(state: AppState) {
     tokio::spawn(async move {
         loop {
-            match services::self_update::check_for_update(&state.paths.repo_root).await {
+            match services::self_update::check_for_update(&state.paths.repo_root, None).await {
                 Ok(result) => state.self_update.set_cached_check(Some(result), None),
                 Err(e) => state.self_update.set_cached_check(None, Some(e)),
             }

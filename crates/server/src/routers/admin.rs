@@ -36,6 +36,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/cache/goes_nc/:filename", delete(delete_goes_nc_entry))
         .route("/admin/cache/goes_nc/:filename/info", get(get_goes_nc_info))
         .route("/admin/self-update/status", get(self_update_status))
+        .route("/admin/self-update/branches", get(self_update_branches))
         .route("/admin/self-update/check", post(self_update_check))
         .route("/admin/self-update/apply", post(self_update_apply).get(self_update_job))
         // Jobs that depend on unported pieces:
@@ -349,6 +350,11 @@ async fn clear_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar
 // operator having to click anything; actually pulling + restarting only ever
 // happens from the explicit apply endpoint.
 
+#[derive(Deserialize)]
+struct BranchQuery {
+    branch: Option<String>,
+}
+
 async fn self_update_status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
     auth::require_login(&jar)?;
     Ok(Json(json!({
@@ -357,10 +363,29 @@ async fn self_update_status(State(state): State<AppState>, jar: SignedCookieJar)
     })))
 }
 
+/// Backs the console's branch-selector dropdown.
+async fn self_update_branches(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    let branches = crate::services::self_update::list_remote_branches(&state.paths.repo_root)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to list branches: {e}")))?;
+    let current = crate::services::self_update::current_branch(&state.paths.repo_root)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "branches": branches, "current": current })))
+}
+
 /// "Check now" button — bypasses the periodic timer for an immediate fetch.
-async fn self_update_check(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+/// `?branch=` checks a branch other than whatever's currently checked out
+/// (see `check_for_update`'s `branch_switch` field); omitted, it checks the
+/// current branch, same as the periodic background check.
+async fn self_update_check(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Query(q): Query<BranchQuery>,
+) -> ApiResult<Json<Value>> {
     auth::require_superuser(&jar)?;
-    match crate::services::self_update::check_for_update(&state.paths.repo_root).await {
+    match crate::services::self_update::check_for_update(&state.paths.repo_root, q.branch.as_deref()).await {
         Ok(result) => {
             state.self_update.set_cached_check(Some(result), None);
             Ok(Json(state.self_update.get_cached_check()))
@@ -372,7 +397,11 @@ async fn self_update_check(State(state): State<AppState>, jar: SignedCookieJar) 
     }
 }
 
-async fn self_update_apply(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+async fn self_update_apply(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Query(q): Query<BranchQuery>,
+) -> ApiResult<Json<Value>> {
     auth::require_superuser(&jar)?;
     {
         let mut job = state.self_update.job.lock().unwrap();
@@ -383,11 +412,12 @@ async fn self_update_apply(State(state): State<AppState>, jar: SignedCookieJar) 
             "status": "checking",
             "started_at": Utc::now().to_rfc3339(),
             "finished_at": Value::Null, "result": Value::Null, "error": Value::Null, "new_commit": Value::Null,
+            "branch": q.branch,
         });
     }
     let repo_root = state.paths.repo_root.clone();
     let su_state = state.self_update.clone();
-    tokio::spawn(crate::services::self_update::apply_update(repo_root, su_state));
+    tokio::spawn(crate::services::self_update::apply_update(repo_root, su_state, q.branch));
     Ok(Json(state.self_update.job.lock().unwrap().clone()))
 }
 

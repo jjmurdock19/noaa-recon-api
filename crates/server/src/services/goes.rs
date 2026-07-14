@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use futures_util::StreamExt;
 use serde_json::json;
 
 use noaa_recon_core::bbox::{bbox_bounds, bbox_out_size, BBoxRequest};
@@ -191,12 +192,70 @@ async fn resolve_companion_band(resolved: &ResolvedScan, band: i64) -> anyhow::R
     )
 }
 
-/// Download the object to `nc_cache_dir` if not already cached (`ensure_downloaded`).
-async fn ensure_downloaded(resolved: &ResolvedScan, nc_cache_dir: &Path) -> anyhow::Result<PathBuf> {
+/// Live per-render-job download progress, surfaced to the console through the
+/// cache's lock file (`ResultCache::update_progress`) so `/status/{key}`
+/// reports live per-band byte counts instead of just an opaque "generating"
+/// while a composite's several companion-band downloads are in flight.
+/// Writes are throttled (`FLUSH_INTERVAL`) so a fast connection doesn't turn
+/// every network chunk into a disk write.
+struct ProgressTracker {
+    cache: ResultCache,
+    key: String,
+    bands: Mutex<std::collections::BTreeMap<i64, (u64, u64)>>,
+    last_flush: Mutex<std::time::Instant>,
+}
+
+impl ProgressTracker {
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+    fn new(cache: ResultCache, key: String) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cache,
+            key,
+            bands: Mutex::new(Default::default()),
+            last_flush: Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    /// `force`: bypass the flush throttle — used for a download's first and
+    /// last report so "0 bytes" and "done" are never dropped by unlucky timing.
+    fn report(&self, band: i64, downloaded: u64, total: u64, force: bool) {
+        self.bands.lock().unwrap().insert(band, (downloaded, total));
+        if !force {
+            let mut last = self.last_flush.lock().unwrap();
+            if last.elapsed() < Self::FLUSH_INTERVAL {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        let downloads: Vec<serde_json::Value> = self
+            .bands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(band, (downloaded, total))| json!({ "band": band, "bytes": downloaded, "total_bytes": total }))
+            .collect();
+        self.cache.update_progress(&self.key, &json!({ "downloads": downloads }));
+    }
+}
+
+/// Download the object to `nc_cache_dir` if not already cached
+/// (`ensure_downloaded`). Streams to a temp file (renamed into place once
+/// complete, so a crash mid-download never leaves a corrupt cached `.nc`),
+/// reporting progress through `progress` if given.
+async fn ensure_downloaded(
+    resolved: &ResolvedScan,
+    nc_cache_dir: &Path,
+    progress: Option<&std::sync::Arc<ProgressTracker>>,
+) -> anyhow::Result<PathBuf> {
     tokio::fs::create_dir_all(nc_cache_dir).await?;
     let filename = resolved.key.rsplit('/').next().unwrap_or("scan.nc");
     let local_path = nc_cache_dir.join(filename);
     if local_path.exists() {
+        if let Some(p) = progress {
+            let size = tokio::fs::metadata(&local_path).await.map(|m| m.len()).unwrap_or(0);
+            p.report(resolved.band, size, size, true);
+        }
         return Ok(local_path);
     }
     let url = format!("https://{}.s3.amazonaws.com/{}", resolved.bucket, resolved.key);
@@ -204,8 +263,30 @@ async fn ensure_downloaded(resolved: &ResolvedScan, nc_cache_dir: &Path) -> anyh
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
-    let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
-    tokio::fs::write(&local_path, &bytes).await?;
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let total = resp.content_length().unwrap_or(0);
+    if let Some(p) = progress {
+        p.report(resolved.band, 0, total, true);
+    }
+
+    let tmp_path = nc_cache_dir.join(format!("{filename}.part"));
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        downloaded += chunk.len() as u64;
+        if let Some(p) = progress {
+            p.report(resolved.band, downloaded, total, false);
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, &local_path).await?;
+    if let Some(p) = progress {
+        p.report(resolved.band, downloaded, downloaded.max(total), true);
+    }
     Ok(local_path)
 }
 
@@ -505,7 +586,8 @@ async fn render_and_store_inner(
     cache: &ResultCache,
     bbox: Option<&BBoxRequest>,
 ) -> anyhow::Result<()> {
-    let nc_path = ensure_downloaded(resolved, nc_cache_dir).await?;
+    let progress = ProgressTracker::new(cache.clone(), key.to_string());
+    let nc_path = ensure_downloaded(resolved, nc_cache_dir, Some(&progress)).await?;
     let out_png = cache.output_path(key, "png");
     let band = resolved.band;
     let cmap_s = cmap.to_string();
@@ -623,18 +705,38 @@ async fn render_product_and_store_inner(
         _ => anyhow::bail!("unknown composite product: {product}"),
     };
 
-    // Resolve (band 13 is `resolved_ir` itself — every other band is its
-    // companion) + download every band this product needs.
-    let mut nc_paths: std::collections::HashMap<i64, PathBuf> = std::collections::HashMap::new();
-    for &band in band_list {
-        let resolved = if band == resolved_ir.band {
-            resolved_ir.clone()
-        } else {
-            resolve_companion_band(resolved_ir, band).await?
-        };
-        let path = ensure_downloaded(&resolved, nc_cache_dir).await?;
-        nc_paths.insert(band, path);
-    }
+    // Resolve every band this product needs (band 13 is `resolved_ir` itself
+    // — every other band is its companion, each an independent S3 listing
+    // call) concurrently rather than one at a time — geocolor's 4 bands
+    // otherwise pay 4x the listing latency for no reason, since none of
+    // these calls depend on each other.
+    let resolved_list: Vec<(i64, ResolvedScan)> = futures_util::future::try_join_all(band_list.iter().map(|&band| {
+        let resolved_ir = resolved_ir.clone();
+        async move {
+            let resolved = if band == resolved_ir.band {
+                resolved_ir
+            } else {
+                resolve_companion_band(&resolved_ir, band).await?
+            };
+            Ok::<_, anyhow::Error>((band, resolved))
+        }
+    }))
+    .await?;
+
+    // Likewise download every band's file concurrently — this is the real
+    // win for a composite (geocolor fetches ~4x a single band's ~25MB at
+    // once instead of serially), bounded only by the S3 connection/bandwidth
+    // available, not by however many companion bands the product needs.
+    let progress = ProgressTracker::new(cache.clone(), key.to_string());
+    let downloaded: Vec<(i64, PathBuf)> = futures_util::future::try_join_all(resolved_list.iter().map(|(band, resolved)| {
+        let progress = progress.clone();
+        async move {
+            let path = ensure_downloaded(resolved, nc_cache_dir, Some(&progress)).await?;
+            Ok::<_, anyhow::Error>((*band, path))
+        }
+    }))
+    .await?;
+    let nc_paths: std::collections::HashMap<i64, PathBuf> = downloaded.into_iter().collect();
 
     let out_png = cache.output_path(key, "png");
     let product_s = product.to_string();

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
+#[derive(Clone)]
 pub struct ResultCache {
     base_dir: PathBuf,
     lock_timeout: u64,
@@ -69,6 +70,24 @@ impl ResultCache {
         let _ = std::fs::remove_file(&json_path);
         let body = params.cloned().unwrap_or_else(|| Value::Object(Map::new()));
         std::fs::write(&lock_path, serde_json::to_vec(&body).unwrap_or_default())
+    }
+
+    /// Overlay `updates`' fields onto the still-held lock file so `get_status`
+    /// reflects live progress (e.g. per-band download bytes) while a render is
+    /// in flight. No-op if the lock is already gone (result already written,
+    /// or timed out) — progress reporting is best-effort, never load-bearing.
+    pub fn update_progress(&self, key: &str, updates: &Value) {
+        let (_, lock_path) = self.paths(key);
+        let Ok(text) = std::fs::read_to_string(&lock_path) else { return };
+        let Some(mut obj) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.as_object().cloned()) else {
+            return;
+        };
+        if let Some(u) = updates.as_object() {
+            for (k, v) in u {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        let _ = std::fs::write(&lock_path, serde_json::to_vec(&Value::Object(obj)).unwrap_or_default());
     }
 
     pub fn write_result(&self, key: &str, meta: &Value) -> std::io::Result<()> {

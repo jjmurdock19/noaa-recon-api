@@ -329,6 +329,10 @@
   .progress-bar-fill { background: var(--accent-strong); height: 100%; width: 0%; transition: width 0.3s; }
   .error-list { max-height: 120px; overflow-y: auto; font-size: 10px; color: var(--error); margin-top: 8px; }
 
+  #q-downloads { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+  .dl-row { display: grid; grid-template-columns: 60px 1fr 90px; align-items: center; gap: 8px; font-size: 10px; color: var(--text-muted); }
+  .dl-row .progress-bar-fill.done { background: var(--accent-strong); }
+
   .error-box {
     background: var(--error-soft-bg); border: 1px solid var(--error-soft-border);
     border-radius: 0; padding: 12px 16px; margin-bottom: 14px;
@@ -519,6 +523,7 @@
           <button class="primary-btn" id="q-submit-btn">Load</button>
           <span class="status-text" id="q-status"></span>
         </div>
+        <div id="q-downloads"></div>
         <div id="query-result"></div>
       </section>
 
@@ -571,6 +576,8 @@
     <section>
         <h2>API update</h2>
         <div class="row">
+          <span class="field-label">Branch</span>
+          <select id="self-update-branch"><option value="">(current)</option></select>
           <span class="status-text" id="self-update-status">Checking…</span>
         </div>
         <div class="row">
@@ -763,6 +770,7 @@ function showApp() {
     pollLogs();
     refreshUsageLog();
     if (currentRole === 'superuser') refreshLoginLog();
+    refreshSelfUpdateBranches();
     startLiveRefresh();
 }
 
@@ -1258,6 +1266,31 @@ function waitForRestart() {
     }, 2000);
 }
 
+// Branch dropdown: "(current)" (blank value -> server defaults to whatever's
+// checked out) plus every branch on origin. Repopulating preserves the
+// operator's current selection where it still exists, so a live-refresh
+// tick can't silently reset a branch they picked mid-interaction.
+async function refreshSelfUpdateBranches() {
+    const sel = document.getElementById('self-update-branch');
+    try {
+        const res = await api('/v1/admin/self-update/branches');
+        const data = await res.json();
+        const prevValue = sel.value;
+        sel.innerHTML = '<option value="">(current)</option>' + data.branches.map((b) => {
+            const label = b === data.current ? `${b} (current)` : b;
+            return `<option value="${b}">${label}</option>`;
+        }).join('');
+        if (data.branches.includes(prevValue)) sel.value = prevValue;
+    } catch (e) {
+        // Transient — the dropdown just keeps whatever it last had.
+    }
+}
+
+function selfUpdateBranchParam() {
+    const branch = document.getElementById('self-update-branch').value;
+    return branch ? `?branch=${encodeURIComponent(branch)}` : '';
+}
+
 function renderSelfUpdate(data) {
     const statusEl = document.getElementById('self-update-status');
     const checkBtn = document.getElementById('self-update-check-btn');
@@ -1277,7 +1310,8 @@ function renderSelfUpdate(data) {
     }
     if (inProgress) {
         statusEl.textContent = {
-            checking: 'Checking…', pulling: 'Pulling latest code…', installing_dependencies: 'Installing dependencies…',
+            checking: 'Checking…', pulling: job.branch ? `Switching to ${job.branch}…` : 'Pulling latest code…',
+            installing_dependencies: 'Installing dependencies…',
         }[job.status];
         statusEl.className = 'status-text working';
         applyBtn.disabled = true;
@@ -1296,15 +1330,18 @@ function renderSelfUpdate(data) {
     } else if (!check.result) {
         statusEl.textContent = 'Not checked yet.';
         statusEl.className = 'status-text';
+    } else if (check.result.branch_switch) {
+        statusEl.textContent = `Switch to ${check.result.branch} available (${check.result.remote_commit.slice(0, 8)})`;
+        statusEl.className = 'status-text working';
     } else if (check.result.up_to_date) {
-        statusEl.textContent = `Up to date (${check.result.local_commit.slice(0, 8)})`;
+        statusEl.textContent = `Up to date on ${check.result.branch} (${check.result.local_commit.slice(0, 8)})`;
         statusEl.className = 'status-text ok';
     } else {
-        statusEl.textContent = `Update available — ${check.result.commits_behind} commit(s) behind`;
+        statusEl.textContent = `Update available on ${check.result.branch} — ${check.result.commits_behind} commit(s) behind`;
         statusEl.className = 'status-text working';
     }
 
-    const updateAvailable = !!(check.result && !check.result.up_to_date);
+    const updateAvailable = !!(check.result && (check.result.branch_switch || !check.result.up_to_date));
     applyBtn.disabled = !updateAvailable;
     if (updateAvailable && check.result.log.length) {
         logEl.style.display = 'block';
@@ -1345,15 +1382,19 @@ document.getElementById('self-update-check-btn').addEventListener('click', async
     statusEl.textContent = 'Checking…';
     statusEl.className = 'status-text working';
     try {
-        await api('/v1/admin/self-update/check', { method: 'POST' });
+        await api('/v1/admin/self-update/check' + selfUpdateBranchParam(), { method: 'POST' });
     } catch (e) {}
     refreshSelfUpdateStatus();
 });
 
 document.getElementById('self-update-apply-btn').addEventListener('click', async () => {
-    if (!confirm('Pull the latest code from GitHub and restart the API now? This causes a few seconds of downtime.')) return;
+    const branch = document.getElementById('self-update-branch').value;
+    const msg = branch
+        ? `Switch to branch "${branch}", pull its latest code, and restart the API now? This causes a few seconds of downtime.`
+        : 'Pull the latest code from GitHub and restart the API now? This causes a few seconds of downtime.';
+    if (!confirm(msg)) return;
     try {
-        await api('/v1/admin/self-update/apply', { method: 'POST' });
+        await api('/v1/admin/self-update/apply' + selfUpdateBranchParam(), { method: 'POST' });
     } catch (e) {}
     pollSelfUpdateJob();
 });
@@ -1775,6 +1816,25 @@ function setQStatus(msg, cls) {
     el.className = 'status-text ' + (cls || '');
 }
 
+// Per-band download progress, as reported by /v1/satellite/status while a
+// tile/composite is "generating" — see ProgressTracker in services/goes.rs.
+// Downloads run concurrently (one row per band), not sequentially, so this
+// is a live picture of exactly what the server's fetching from S3 right now.
+function renderDownloads(downloads) {
+    const el = document.getElementById('q-downloads');
+    if (!downloads || !downloads.length) { el.innerHTML = ''; return; }
+    el.innerHTML = downloads.map((d) => {
+        const pct = d.total_bytes ? Math.min(100, Math.round((d.bytes / d.total_bytes) * 100)) : 0;
+        const done = d.total_bytes > 0 && d.bytes >= d.total_bytes;
+        return `
+          <div class="dl-row">
+            <span>Band ${d.band}</span>
+            <div class="progress-bar-track"><div class="progress-bar-fill${done ? ' done' : ''}" style="width:${pct}%"></div></div>
+            <span>${fmtBytes(d.bytes)}${d.total_bytes ? ' / ' + fmtBytes(d.total_bytes) : ''}</span>
+          </div>`;
+    }).join('');
+}
+
 async function loadQuery() {
     const timeVal = document.getElementById('q-time').value;
     if (!timeVal) { setQStatus('Pick a time.', 'err'); return; }
@@ -1799,14 +1859,18 @@ async function loadQuery() {
     btn.disabled = true;
     setQStatus('Requesting…', 'working');
     document.getElementById('query-result').innerHTML = '';
+    renderDownloads(null);
 
     try {
         let data = await fetch(`${API_BASE}/v1/satellite/tile?${new URLSearchParams(params)}`, { credentials: 'same-origin' }).then(r => r.json());
         while (data.status === 'generating') {
-            await new Promise(r => setTimeout(r, 3000));
+            await new Promise(r => setTimeout(r, 1000));
             data = await fetch(`${API_BASE}/v1/satellite/status/${data.key}`, { credentials: 'same-origin' }).then(r => r.json());
-            setQStatus(`Processing… ${data.elapsed || 0}s elapsed.`, 'working');
+            renderDownloads(data.downloads);
+            const downloading = (data.downloads || []).some((d) => !d.total_bytes || d.bytes < d.total_bytes);
+            setQStatus(downloading ? `Downloading… ${data.elapsed || 0}s elapsed.` : `Processing… ${data.elapsed || 0}s elapsed.`, 'working');
         }
+        renderDownloads(null);
         if (data.status !== 'ready') {
             setQStatus('Error: ' + (data.message || 'unknown'), 'err');
         } else {
