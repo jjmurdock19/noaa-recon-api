@@ -44,8 +44,10 @@ RUN_USER=""
 BRANCH="main"
 # Which implementation to run as the API server: "python" (FastAPI, branch main)
 # or "rust" (compiled axum server, branch rust). Empty => the version picker asks.
-# NOTE: even the rust variant still installs a Python venv — the data-ingest and
-# nightly-maintenance scripts are Python and shared by both variants.
+# NOTE: the rust variant is fully self-contained (ingest + cache-cleanup are
+# native subcommands, see main.rs) and never gets a Python venv — see
+# configure_admin_credentials()/configure_auth() below, which branch on this
+# to avoid touching .venv/bin/python3 for that variant.
 VARIANT=""
 PORT="8000"
 NET_MODE="local"      # local | lan | domain
@@ -218,6 +220,21 @@ SUDO="sudo"
 run_as() { # run_as USER CMD...
     local u="$1"; shift
     if [[ "$(id -un)" == "$u" ]]; then "$@"; else sudo -u "$u" "$@"; fi
+}
+
+# Coreutils-only random token generators, for the rust variant which has no
+# Python (venv or system) available — see the VARIANT note above.
+gen_token_urlsafe() { # gen_token_urlsafe NUM_BYTES -- like Python's secrets.token_urlsafe()
+    head -c "$1" /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'
+}
+gen_token_hex() { # gen_token_hex NUM_BYTES -- like Python's secrets.token_hex()
+    head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+json_escape() { # json_escape STR -- backslash+quote escaping for embedding in a JSON string literal
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
 }
 
 detect_pkg_manager() {
@@ -470,12 +487,26 @@ configure_admin_credentials() {
     local user pass secret
     user="$(ask_text "Admin console username" "admin")"
     if ask_yesno "Generate a random admin password (recommended)?" y; then
-        pass="$(run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" -c "import secrets;print(secrets.token_urlsafe(16))")"
+        if [[ "$VARIANT" == "rust" ]]; then
+            pass="$(gen_token_urlsafe 16)"
+        else
+            pass="$(run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" -c "import secrets;print(secrets.token_urlsafe(16))")"
+        fi
     else
         pass="$(ask_text "Admin console password" "")"
     fi
-    secret="$(run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" -c "import secrets;print(secrets.token_hex(32))")"
-    run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" - "$cred_file" "$user" "$pass" "$secret" <<'PYEOF'
+    if [[ "$VARIANT" == "rust" ]]; then
+        secret="$(gen_token_hex 32)"
+        run_as "$RUN_USER" bash -c 'cat > "$1" && chmod 600 "$1"' _ "$cred_file" <<EOF
+{
+  "username": "$(json_escape "$user")",
+  "password": "$(json_escape "$pass")",
+  "secret_key": "$(json_escape "$secret")"
+}
+EOF
+    else
+        secret="$(run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" -c "import secrets;print(secrets.token_hex(32))")"
+        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" - "$cred_file" "$user" "$pass" "$secret" <<'PYEOF'
 import json, os, sys
 path, user, pw, secret = sys.argv[1:5]
 with open(path, "w") as f:
@@ -483,6 +514,7 @@ with open(path, "w") as f:
     f.write("\n")
 os.chmod(path, 0o600)
 PYEOF
+    fi
     ADMIN_USER="$user"; ADMIN_PASS="$pass"
     log_ok "admin console credentials set (username: ${user})"
     # This account becomes the first superuser automatically the first time
@@ -505,13 +537,21 @@ configure_auth() {
     fi
     local enabled_json="false"
     [[ "$AUTH_ENABLED" == "y" ]] && enabled_json="true"
-    run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" - "$auth_file" "$enabled_json" <<'PYEOF'
+    if [[ "$VARIANT" == "rust" ]]; then
+        run_as "$RUN_USER" bash -c "cat > \"\$1\"" _ "$auth_file" <<EOF
+{
+  "enabled": ${enabled_json}
+}
+EOF
+    else
+        run_as "$RUN_USER" "${INSTALL_DIR}/.venv/bin/python3" - "$auth_file" "$enabled_json" <<'PYEOF'
 import json, sys
 path, enabled_json = sys.argv[1:3]
 with open(path, "w") as f:
     json.dump({"enabled": json.loads(enabled_json)}, f, indent=2)
     f.write("\n")
 PYEOF
+    fi
     if [[ "$AUTH_ENABLED" == "y" ]]; then
         log_ok "API tokens required — issue accounts/keys from the admin console's API management pane after setup"
     else
