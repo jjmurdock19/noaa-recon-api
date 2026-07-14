@@ -271,6 +271,12 @@ async fn list_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar)
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             if e.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                // `.part` files are downloads still in flight — reported
+                // separately below (with byte-level progress) instead of
+                // showing up here as a mysteriously-growing "cached" file.
+                if e.file_name().to_string_lossy().ends_with(".part") {
+                    continue;
+                }
                 let mt = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                 files.push((mt, e.path()));
             }
@@ -289,7 +295,7 @@ async fn list_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar)
             })
         })
         .collect();
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(json!({ "entries": entries, "in_progress": state.downloads.snapshot() })))
 }
 
 fn safe_nc_path(state: &AppState, filename: &str) -> ApiResult<PathBuf> {

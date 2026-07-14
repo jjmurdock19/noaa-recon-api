@@ -20,6 +20,7 @@ use noaa_recon_core::project::{abi_to_latlon, mercator_y};
 use noaa_recon_core::render::{self, Proj};
 
 use crate::services::cache::ResultCache;
+use crate::services::downloads::DownloadsRegistry;
 
 /// HDF5 is not guaranteed thread-safe as built here; serialize every netCDF
 /// open/read (port of `netcdf_lock.NC_LOCK`). Only wraps the decode, not the
@@ -246,6 +247,7 @@ impl ProgressTracker {
 async fn ensure_downloaded(
     resolved: &ResolvedScan,
     nc_cache_dir: &Path,
+    downloads: &DownloadsRegistry,
     progress: Option<&std::sync::Arc<ProgressTracker>>,
 ) -> anyhow::Result<PathBuf> {
     tokio::fs::create_dir_all(nc_cache_dir).await?;
@@ -268,22 +270,35 @@ async fn ensure_downloaded(
     if let Some(p) = progress {
         p.report(resolved.band, 0, total, true);
     }
+    downloads.start(filename, total);
 
     let tmp_path = nc_cache_dir.join(format!("{filename}.part"));
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    let mut downloaded: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-        downloaded += chunk.len() as u64;
-        if let Some(p) = progress {
-            p.report(resolved.band, downloaded, total, false);
+    // Run the actual streaming in a block so `downloads.finish` runs on every
+    // exit path (success or error via `?`) — otherwise a failed/aborted
+    // download would leave a stale "in progress" entry in the registry
+    // forever, since there's no `finally` to hang cleanup off of.
+    let result: anyhow::Result<u64> = async {
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut downloaded: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+            downloaded += chunk.len() as u64;
+            downloads.update(filename, downloaded);
+            if let Some(p) = progress {
+                p.report(resolved.band, downloaded, total, false);
+            }
         }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, &local_path).await?;
+        Ok(downloaded)
     }
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
-    drop(file);
-    tokio::fs::rename(&tmp_path, &local_path).await?;
+    .await;
+    downloads.finish(filename);
+    let downloaded = result?;
+
     if let Some(p) = progress {
         p.report(resolved.band, downloaded, downloaded.max(total), true);
     }
@@ -556,8 +571,10 @@ pub async fn render_and_store(
     nc_cache_dir: PathBuf,
     cache: ResultCache,
     bbox: Option<BBoxRequest>,
+    downloads: std::sync::Arc<DownloadsRegistry>,
 ) {
-    let result = render_and_store_inner(&resolved, &cmap, &key, &nc_cache_dir, &cache, bbox.as_ref()).await;
+    let result =
+        render_and_store_inner(&resolved, &cmap, &key, &nc_cache_dir, &cache, bbox.as_ref(), &downloads).await;
     if let Err(e) = result {
         tracing::error!("GOES render failed for key={key}: {e:#}");
         let mut meta = json!({
@@ -585,9 +602,10 @@ async fn render_and_store_inner(
     nc_cache_dir: &Path,
     cache: &ResultCache,
     bbox: Option<&BBoxRequest>,
+    downloads: &DownloadsRegistry,
 ) -> anyhow::Result<()> {
     let progress = ProgressTracker::new(cache.clone(), key.to_string());
-    let nc_path = ensure_downloaded(resolved, nc_cache_dir, Some(&progress)).await?;
+    let nc_path = ensure_downloaded(resolved, nc_cache_dir, downloads, Some(&progress)).await?;
     let out_png = cache.output_path(key, "png");
     let band = resolved.band;
     let cmap_s = cmap.to_string();
@@ -669,9 +687,18 @@ pub async fn render_product_and_store(
     nc_cache_dir: PathBuf,
     cache: ResultCache,
     bbox: Option<BBoxRequest>,
+    downloads: std::sync::Arc<DownloadsRegistry>,
 ) {
-    let result =
-        render_product_and_store_inner(&product, &resolved_ir, &key, &nc_cache_dir, &cache, bbox.as_ref()).await;
+    let result = render_product_and_store_inner(
+        &product,
+        &resolved_ir,
+        &key,
+        &nc_cache_dir,
+        &cache,
+        bbox.as_ref(),
+        &downloads,
+    )
+    .await;
     if let Err(e) = result {
         tracing::error!("Composite render failed for key={key} product={product}: {e:#}");
         let mut meta = json!({
@@ -698,6 +725,7 @@ async fn render_product_and_store_inner(
     nc_cache_dir: &Path,
     cache: &ResultCache,
     bbox: Option<&BBoxRequest>,
+    downloads: &DownloadsRegistry,
 ) -> anyhow::Result<()> {
     let band_list: &[i64] = match product {
         "sandwich" => &[13, 2],
@@ -731,7 +759,7 @@ async fn render_product_and_store_inner(
     let downloaded: Vec<(i64, PathBuf)> = futures_util::future::try_join_all(resolved_list.iter().map(|(band, resolved)| {
         let progress = progress.clone();
         async move {
-            let path = ensure_downloaded(resolved, nc_cache_dir, Some(&progress)).await?;
+            let path = ensure_downloaded(resolved, nc_cache_dir, downloads, Some(&progress)).await?;
             Ok::<_, anyhow::Error>((*band, path))
         }
     }))

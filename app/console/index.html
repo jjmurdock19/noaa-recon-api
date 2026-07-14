@@ -333,6 +333,9 @@
   .dl-row { display: grid; grid-template-columns: 60px 1fr 90px; align-items: center; gap: 8px; font-size: 10px; color: var(--text-muted); }
   .dl-row .progress-bar-fill.done { background: var(--accent-strong); }
 
+  #goesnc-downloads { margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+  #goesnc-downloads .dl-row { grid-template-columns: 1fr 2fr 140px; }
+
   .error-box {
     background: var(--error-soft-bg); border: 1px solid var(--error-soft-border);
     border-radius: 0; padding: 12px 16px; margin-bottom: 14px;
@@ -463,6 +466,7 @@
           Raw netCDF cache
           <button class="clear-btn" id="clear-goesnc-btn">Clear all</button>
         </h2>
+        <div id="goesnc-downloads"></div>
         <div class="table-scroll">
           <table>
             <thead><tr><th>Filename</th><th>Scan start</th><th>Size</th><th>Modified</th><th></th></tr></thead>
@@ -988,35 +992,66 @@ async function refreshSatelliteCache() {
     });
 }
 
+// Live per-file raw netCDF download progress, as reported by
+// /v1/admin/cache/goes_nc's `in_progress` field — see DownloadsRegistry in
+// services/downloads.rs. Unlike the per-band rows under "Submit a query"
+// (renderDownloads), this tracks every download by filename regardless of
+// which query/composite kicked it off, so it's the place to watch to see how
+// long an individual raw file actually takes to fetch from S3.
+function renderGoesNcDownloads(inProgress) {
+    const el = document.getElementById('goesnc-downloads');
+    if (!inProgress || !inProgress.length) { el.innerHTML = ''; return; }
+    el.innerHTML = inProgress.map((d) => {
+        const pct = d.total_bytes ? Math.min(100, Math.round((d.bytes / d.total_bytes) * 100)) : 0;
+        return `
+          <div class="dl-row">
+            <span class="code" title="${d.filename}">${d.filename.slice(0, 40)}${d.filename.length > 40 ? '…' : ''}</span>
+            <div class="progress-bar-track"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+            <span>${fmtBytes(d.bytes)}${d.total_bytes ? ' / ' + fmtBytes(d.total_bytes) : ''} · ${d.elapsed_seconds}s</span>
+          </div>`;
+    }).join('');
+}
+
+let _goesNcFastPollTimer = null;
 async function refreshGoesNcCache() {
     const res = await api('/v1/admin/cache/goes_nc');
     const data = await res.json();
     _goesNcEntries = data.entries;
+    renderGoesNcDownloads(data.in_progress);
+
     const body = document.getElementById('goesnc-cache-body');
     if (!data.entries.length) {
         body.innerHTML = '<tr class="empty-row"><td colspan="5">No cached netCDF files.</td></tr>';
-        return;
-    }
-    body.innerHTML = data.entries.map(e => `
-        <tr>
-            <td class="code" title="${e.filename}">${e.filename.slice(0, 50)}${e.filename.length > 50 ? '…' : ''}</td>
-            <td>${e.scan_start ? e.scan_start.slice(0, 16).replace('T', ' ') : ''}</td>
-            <td>${fmtBytes(e.size_bytes)}</td>
-            <td>${e.modified.slice(0, 16).replace('T', ' ')}</td>
-            <td class="actions-cell">
-                <button class="view-btn" data-name="${e.filename}">View</button>
-                <button class="del-btn" data-name="${e.filename}">Delete</button>
-            </td>
-        </tr>`).join('');
-    body.querySelectorAll('.view-btn').forEach(btn => {
-        btn.addEventListener('click', () => previewGoesNcEntry(btn.dataset.name));
-    });
-    body.querySelectorAll('.del-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(btn.dataset.name)}`, { method: 'DELETE' });
-            refreshGoesNcCache(); refreshStatus();
+    } else {
+        body.innerHTML = data.entries.map(e => `
+            <tr>
+                <td class="code" title="${e.filename}">${e.filename.slice(0, 50)}${e.filename.length > 50 ? '…' : ''}</td>
+                <td>${e.scan_start ? e.scan_start.slice(0, 16).replace('T', ' ') : ''}</td>
+                <td>${fmtBytes(e.size_bytes)}</td>
+                <td>${e.modified.slice(0, 16).replace('T', ' ')}</td>
+                <td class="actions-cell">
+                    <button class="view-btn" data-name="${e.filename}">View</button>
+                    <button class="del-btn" data-name="${e.filename}">Delete</button>
+                </td>
+            </tr>`).join('');
+        body.querySelectorAll('.view-btn').forEach(btn => {
+            btn.addEventListener('click', () => previewGoesNcEntry(btn.dataset.name));
         });
-    });
+        body.querySelectorAll('.del-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(btn.dataset.name)}`, { method: 'DELETE' });
+                refreshGoesNcCache(); refreshStatus();
+            });
+        });
+    }
+
+    // While a download's actually in flight, poll faster than the base 5s
+    // liveRefresh tick so the progress bar looks live rather than chunky.
+    // Idle (the common case) stays on the cheap 5s cadence.
+    if (_goesNcFastPollTimer) { clearTimeout(_goesNcFastPollTimer); _goesNcFastPollTimer = null; }
+    if (data.in_progress && data.in_progress.length) {
+        _goesNcFastPollTimer = setTimeout(refreshGoesNcCache, 1000);
+    }
 }
 
 // ── Log terminal ─────────────────────────────────────────────────────────

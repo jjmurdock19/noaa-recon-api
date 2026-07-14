@@ -12,6 +12,7 @@ use axum::extract::FromRef;
 use axum_extra::extract::cookie::Key;
 
 use crate::config::Paths;
+use crate::services::downloads::DownloadsRegistry;
 use crate::services::self_update::SelfUpdateState;
 use crate::services::stats::Stats;
 
@@ -20,6 +21,8 @@ pub struct AppState {
     pub paths: Arc<Paths>,
     pub stats: Arc<Stats>,
     pub self_update: Arc<SelfUpdateState>,
+    /// Live per-file raw netCDF download progress — see services/downloads.rs.
+    pub downloads: Arc<DownloadsRegistry>,
     /// Signing key for the admin session cookie (derived from admin_credentials.json).
     pub cookie_key: Key,
 }
@@ -30,6 +33,7 @@ impl AppState {
             paths: Arc::new(paths),
             stats: Arc::new(Stats::default()),
             self_update: Arc::new(SelfUpdateState::default()),
+            downloads: Arc::new(DownloadsRegistry::default()),
             cookie_key,
         }
     }

@@ -4,6 +4,7 @@
 //! lives in `noaa-recon-core`. Ported incrementally.
 
 pub mod cache;
+pub mod downloads;
 pub mod goes;
 pub mod hdf5_zstd;
 pub mod recon_ingest;

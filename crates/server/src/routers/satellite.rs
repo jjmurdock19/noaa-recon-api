@@ -172,6 +172,7 @@ async fn get_tile(State(state): State<AppState>, Query(q): Query<TileQuery>) -> 
             nc_cache_dir,
             task_cache,
             bbox,
+            state.downloads.clone(),
         ));
 
         let mut resp = lock_params;
@@ -254,6 +255,7 @@ async fn get_tile(State(state): State<AppState>, Query(q): Query<TileQuery>) -> 
         nc_cache_dir,
         task_cache,
         bbox,
+        state.downloads.clone(),
     ));
 
     let mut resp = lock_params;
