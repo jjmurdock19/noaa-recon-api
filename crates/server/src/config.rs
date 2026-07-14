@@ -53,6 +53,10 @@ impl Paths {
     pub fn llms_txt(&self) -> PathBuf {
         self.repo_root.join("llms.txt")
     }
+
+    pub fn api_md(&self) -> PathBuf {
+        self.repo_root.join("API.md")
+    }
 }
 
 /// Bind address for the server. `uvicorn` defaults to 127.0.0.1:8000; the

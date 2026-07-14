@@ -77,4 +77,10 @@ regex = "1"                      # HURDAT2 header + ATCF filename parsing
 tempfile = "3"                   # spill downloaded netCDF to a temp file for the netcdf crate
 pdf-extract = "0.7"              # storm-name extraction from mission PDFs (pypdf equivalent)
 
+# ── API docs (FastAPI's auto Swagger UI has no axum equivalent) ────────────
+# /docs renders API.md as HTML instead of a full OpenAPI UI — see main.rs's
+# `docs` handler. Pure Rust, no C toolchain, so it doesn't touch the build
+# story the other native deps above have to worry about.
+pulldown-cmark = "0.12"
+
 # Added as their modules land: reqwest (httpx), netcdf, jsonwebtoken (sessions).

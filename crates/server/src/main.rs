@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Capture the paths the static mounts need before `paths` is moved into state.
     let llms_txt_path = paths.llms_txt();
+    let api_md_path = paths.api_md();
     let cache_dir = paths.cache_root.clone();
     let demo_dir = paths.netcdf_three_demo_dir();
     let console_dir = paths.console_dir();
@@ -134,6 +135,19 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .nest("/v1", v1)
         .route("/llms.txt", get(move || llms_txt(llms_txt_path.clone())))
+        // FastAPI gets /docs for free (auto Swagger UI from route type hints);
+        // axum has no equivalent, and reproducing it would mean OpenAPI-
+        // annotating every handler across every router — real scope beyond
+        // "the docs link shouldn't 404". Render the existing hand-maintained
+        // API.md instead. Deliberately self-contained (no sub-resource
+        // fetches, no absolute URLs) so it also works correctly proxied
+        // under an nginx path prefix (e.g. /api/docs) with no root-path
+        // awareness needed — see RUST.md's path-prefix caveat.
+        .route("/docs", get({
+            let api_md_path = api_md_path.clone();
+            move || docs(api_md_path.clone())
+        }))
+        .route("/redoc", get(move || docs(api_md_path.clone())))
         .nest_service("/cache", cache_service)
         .nest_service("/demo/netcdf-three", demo_service)
         .fallback_service(console_service)
@@ -264,6 +278,52 @@ async fn llms_txt(path: std::path::PathBuf) -> Response {
             .into_response(),
         Err(_) => (axum::http::StatusCode::NOT_FOUND, "llms.txt not found").into_response(),
     }
+}
+
+/// `/docs` and `/redoc` — see the route registration above for why this
+/// renders `API.md` instead of a real OpenAPI UI.
+async fn docs(api_md_path: std::path::PathBuf) -> Response {
+    let markdown = match tokio::fs::read_to_string(&api_md_path).await {
+        Ok(s) => s,
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "API.md not found").into_response(),
+    };
+    let mut body_html = String::new();
+    let mut opts = pulldown_cmark::Options::empty();
+    opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    opts.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    pulldown_cmark::html::push_html(&mut body_html, pulldown_cmark::Parser::new_ext(&markdown, opts));
+
+    let page = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>noaa-recon-api docs</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 860px; margin: 0 auto; padding: 24px 20px 80px;
+    line-height: 1.55;
+  }}
+  pre {{ background: rgba(127,127,127,0.12); padding: 12px; overflow-x: auto; border-radius: 4px; }}
+  code {{ background: rgba(127,127,127,0.12); padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.9em; }}
+  pre code {{ background: none; padding: 0; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
+  th, td {{ border: 1px solid rgba(127,127,127,0.35); padding: 6px 10px; text-align: left; }}
+  h1, h2, h3 {{ line-height: 1.25; }}
+  h1 {{ border-bottom: 1px solid rgba(127,127,127,0.35); padding-bottom: 0.3em; }}
+  a {{ color: #4a9eff; }}
+  blockquote {{ margin: 1em 0; padding: 0.2em 1em; border-left: 3px solid rgba(127,127,127,0.35); opacity: 0.85; }}
+</style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"#
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response()
 }
 
 use axum::response::IntoResponse;
