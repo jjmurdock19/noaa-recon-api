@@ -467,14 +467,26 @@ async fn list_products() -> Json<Value> {
 
 // ── Presentation-layer text (kept out of core) ───────────────────────────────
 
+/// Nicknames/wavelengths from NOAA/NESDIS's official ABI Bands Quick Guides
+/// (https://www.goes-r.gov/mission/ABI-bands-quick-info.html).
 fn band_name(band: i64) -> &'static str {
     match band {
+        1 => "Blue (Visible), 0.47µm",
         2 => "Red (Visible), 0.64µm",
         3 => "Veggie (Vegetation/NIR), 0.86µm",
+        4 => "Cirrus, 1.37µm",
         5 => "Near-IR (Snow/Ice), 1.6µm",
+        6 => "Cloud Particle Size, 2.2µm",
         7 => "Shortwave IR (\"Fire Temperature\"), 3.9µm",
+        8 => "Upper-Level Water Vapor, 6.2µm",
         9 => "Mid-Level Water Vapor, 6.9µm",
+        10 => "Lower-Level Water Vapor, 7.3µm",
+        11 => "Cloud-Top Phase, 8.4µm",
+        12 => "Ozone, 9.6µm",
         13 => "Clean IR Window, 10.3µm",
+        14 => "IR Longwave Window, 11.2µm",
+        15 => "\"Dirty\" Longwave Window, 12.3µm",
+        16 => "CO2 Longwave IR, 13.3µm",
         _ => "",
     }
 }
@@ -483,19 +495,25 @@ fn band_name(band: i64) -> &'static str {
 fn cmap_description(cmap: &str) -> Value {
     let (name, desc): (&str, &str) = match cmap {
         "abi13" => ("Band 13 Standard Enhancement",
-            "White at the most extreme cold overshooting tops (-110C) down through black (-80C), a rainbow band -80C to -32C highlighting severe convection, a hard cut to light grey at -31C, then greyscale (light=cold, dark=warm) to black at +57C."),
-        "abi9" => ("Band 9 (Water Vapor) Standard Enhancement",
-            "Cyan at coldest/moist (-93C) through green tones, white at the moist/dry transition (-42C), a purple/navy/indigo band (-30C to -18C), then yellow-orange-red to black at warmest/driest (+7C)."),
+            "White at the most extreme cold overshooting tops (-110C) down through black (-80C), a rainbow band -80C to -32C highlighting severe convection, a hard cut to light grey at -31C, then greyscale (light=cold, dark=warm) to black at +57C. Band 13's own dedicated table — the recommended default for Band 13 specifically."),
+        "abi9" => ("Water-Vapor Standard Enhancement (Bands 8/9/10)",
+            "Cyan at coldest/moist (-93C) through green tones, white at the moist/dry transition (-42C), a purple/navy/indigo band (-30C to -18C), then yellow-orange-red to black at warmest/driest (+7C). Shared default across the water-vapor trio (upper/mid/lower-level, bands 8/9/10) — NOAA's own WV products use a near-identical enhancement across all three."),
         "abi7" => ("Band 7 (Shortwave IR / Fire Temperature) Standard Enhancement",
             "Greyscale over the same cloud-top range as 9/13, then a yellow-red highlight above normal clear-sky warmth (~+57C) to flag hotspots — this band saturates far higher than 9/13."),
-        "abi5" => ("Band 5 (Near-IR Snow/Ice) Reflectance Ramp",
-            "Not a temperature colortable — reports reflectance factor (~0-1), rendered as a gamma-stretched 0-100% grayscale."),
+        "abi1" => ("Band 1 (Blue/Visible) Reflectance Ramp",
+            "Reflectance, not temperature — gamma-stretched 0-100% grayscale, same treatment as abi2/abi3/abi5/abi6. Daylight-only, no signal at night."),
         "abi2" => ("Band 2 (Red/Visible) Reflectance Ramp",
-            "Same treatment as abi5/abi3 — reflectance, not temperature, rendered as a gamma-stretched grayscale. The sharpest band this API renders (0.5km native) — daylight-only, no signal at night."),
+            "Same treatment as abi1/abi3/abi4/abi5/abi6 — reflectance, not temperature, rendered as a gamma-stretched grayscale. The sharpest band this API renders (0.5km native) — daylight-only, no signal at night."),
         "abi3" => ("Band 3 (Veggie / Vegetation-NIR) Reflectance Ramp",
             "Same treatment as abi5 — reflectance, not temperature, rendered as a gamma-stretched grayscale. Sensitive to chlorophyll/vegetation reflectance."),
-        "ir4" => ("IR4 (satpy colorized_ir_clouds)",
-            "An alternate Band 13 enhancement sourced from satpy: greyscale -20C to +30C, then the ColorBrewer 'Spectral' 11-class diverging palette -80C to -20C. Kept for comparison — abi13 is the recommended default for Band 13."),
+        "abi4" => ("Band 4 (Cirrus) Reflectance Ramp",
+            "Reflectance, not temperature — gamma-stretched 0-100% grayscale, same treatment as abi1/abi2/abi3/abi5/abi6. Sensitive to thin cirrus cloud detection; daylight-only."),
+        "abi5" => ("Band 5 (Near-IR Snow/Ice) Reflectance Ramp",
+            "Not a temperature colortable — reports reflectance factor (~0-1), rendered as a gamma-stretched 0-100% grayscale."),
+        "abi6" => ("Band 6 (Cloud Particle Size) Reflectance Ramp",
+            "Reflectance, not temperature — gamma-stretched 0-100% grayscale, same treatment as abi1/abi2/abi3/abi4/abi5. Used operationally for cloud particle-size characterization; daylight-only."),
+        "ir4" => ("IR4 Rainbow Window Enhancement (satpy colorized_ir_clouds)",
+            "Greyscale -20C to +30C, then the ColorBrewer 'Spectral' 11-class diverging rainbow palette -80C to -20C. Shared default across the longwave-window family (bands 11/12/14/15/16 — cloud-top phase, ozone, window, dirty window, CO2) — comparable cloud-top/surface brightness-temperature range across all five. Band 13 defaults to its own dedicated abi13 table instead, but ir4 is selectable there too for comparison."),
         "bd" => ("NWS/Dvorak BD Enhancement",
             "Standard NWS/Dvorak BD enhancement — greyscale for warm/moderate tops, blue-purple-red for cold convection."),
         "enhanced" => ("Enhanced", "Darker surface/low clouds, white mid/high clouds, color for coldest tops."),

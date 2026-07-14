@@ -43,7 +43,7 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | Endpoint | Status |
 |---|---|
 | `GET /v1/health` | 🟢 Live |
-| `GET /v1/satellite/tile` (bands 2, 3, 5, 7, 9, 13) | 🟢 Live |
+| `GET /v1/satellite/tile` (bands 1-16) | 🟢 Live |
 | `GET /v1/satellite/tile` (`product=sandwich`, `product=geocolor`) | 🟢 Live (geocolor is an approximation — see `/v1/satellite/products`) |
 | `GET /v1/satellite/status/{key}` | 🟢 Live |
 | `GET /v1/satellite/colortable` | 🟢 Live |

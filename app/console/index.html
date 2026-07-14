@@ -491,11 +491,22 @@
           <div class="field-group">
             <span class="field-label">Band</span>
             <select id="q-band">
-              <option value="13">13 — Clean IR</option>
-              <option value="9">9 — Water Vapor</option>
-              <option value="7">7 — Shortwave IR (Fire Temp)</option>
-              <option value="5">5 — Near-IR Snow/Ice</option>
-              <option value="3">3 — Veggie (Vegetation)</option>
+              <option value="1">1 — Blue (Visible), 0.47µm</option>
+              <option value="2">2 — Red (Visible), 0.64µm</option>
+              <option value="3">3 — Veggie (Vegetation/NIR), 0.86µm</option>
+              <option value="4">4 — Cirrus, 1.37µm</option>
+              <option value="5">5 — Near-IR (Snow/Ice), 1.6µm</option>
+              <option value="6">6 — Cloud Particle Size, 2.2µm</option>
+              <option value="7">7 — Shortwave IR (Fire Temp), 3.9µm</option>
+              <option value="8">8 — Upper-Level Water Vapor, 6.2µm</option>
+              <option value="9">9 — Mid-Level Water Vapor, 6.9µm</option>
+              <option value="10">10 — Lower-Level Water Vapor, 7.3µm</option>
+              <option value="11">11 — Cloud-Top Phase, 8.4µm</option>
+              <option value="12">12 — Ozone, 9.6µm</option>
+              <option value="13" selected>13 — Clean IR Window, 10.3µm</option>
+              <option value="14">14 — IR Longwave Window, 11.2µm</option>
+              <option value="15">15 — "Dirty" Longwave Window, 12.3µm</option>
+              <option value="16">16 — CO2 Longwave IR, 13.3µm</option>
             </select>
           </div>
           <div class="field-group">
@@ -504,7 +515,14 @@
           </div>
           <div class="field-group">
             <span class="field-label">Cmap</span>
-            <select id="q-cmap"><option value="default">default</option><option value="abi13">abi13</option><option value="abi9">abi9</option><option value="abi7">abi7</option><option value="abi5">abi5</option><option value="ir4">ir4</option><option value="bd">bd</option><option value="enhanced">enhanced</option><option value="nrl">nrl</option><option value="grayscale">grayscale</option></select>
+            <select id="q-cmap">
+              <option value="default">default</option>
+              <option value="abi13">abi13</option><option value="abi9">abi9 (WV: bands 8/9/10)</option><option value="abi7">abi7</option>
+              <option value="ir4">ir4 (window: bands 11/12/14/15/16)</option>
+              <option value="abi1">abi1</option><option value="abi2">abi2</option><option value="abi3">abi3</option>
+              <option value="abi4">abi4</option><option value="abi5">abi5</option><option value="abi6">abi6</option>
+              <option value="bd">bd</option><option value="enhanced">enhanced</option><option value="nrl">nrl</option><option value="grayscale">grayscale</option>
+            </select>
           </div>
         </div>
         <div class="row">
@@ -544,7 +562,12 @@
           </div>
           <div class="field-group">
             <span class="field-label">Band</span>
-            <select id="p-band"><option value="13">13</option><option value="9">9</option><option value="7">7</option><option value="5">5</option><option value="3">3</option></select>
+            <select id="p-band">
+              <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+              <option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option>
+              <option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
+              <option value="13" selected>13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option>
+            </select>
           </div>
           <div class="field-group">
             <span class="field-label">Satellite</span>
@@ -1270,11 +1293,18 @@ function waitForRestart() {
 // checked out) plus every branch on origin. Repopulating preserves the
 // operator's current selection where it still exists, so a live-refresh
 // tick can't silently reset a branch they picked mid-interaction.
+// selfUpdateCurrentBranch lets the UI tell "explicitly picked the branch
+// that's already checked out" (a no-op, same-branch update) apart from
+// "picked a genuinely different branch" (a real switch) — the dropdown
+// value alone can't distinguish these, since both are non-blank.
+let selfUpdateCurrentBranch = null;
+
 async function refreshSelfUpdateBranches() {
     const sel = document.getElementById('self-update-branch');
     try {
         const res = await api('/v1/admin/self-update/branches');
         const data = await res.json();
+        selfUpdateCurrentBranch = data.current;
         const prevValue = sel.value;
         sel.innerHTML = '<option value="">(current)</option>' + data.branches.map((b) => {
             const label = b === data.current ? `${b} (current)` : b;
@@ -1289,6 +1319,15 @@ async function refreshSelfUpdateBranches() {
 function selfUpdateBranchParam() {
     const branch = document.getElementById('self-update-branch').value;
     return branch ? `?branch=${encodeURIComponent(branch)}` : '';
+}
+
+/// True only when the dropdown names a branch other than the one already
+/// checked out — a blank "(current)" selection, or explicitly picking the
+/// current branch by name, are both "no switch" (see selfUpdateCurrentBranch
+/// above).
+function selfUpdateIsSwitch() {
+    const branch = document.getElementById('self-update-branch').value;
+    return !!branch && branch !== selfUpdateCurrentBranch;
 }
 
 function renderSelfUpdate(data) {
@@ -1309,8 +1348,9 @@ function renderSelfUpdate(data) {
         return;
     }
     if (inProgress) {
+        const switching = job.branch && job.branch !== selfUpdateCurrentBranch;
         statusEl.textContent = {
-            checking: 'Checking…', pulling: job.branch ? `Switching to ${job.branch}…` : 'Pulling latest code…',
+            checking: 'Checking…', pulling: switching ? `Switching to ${job.branch}…` : 'Pulling latest code…',
             installing_dependencies: 'Installing dependencies…',
         }[job.status];
         statusEl.className = 'status-text working';
@@ -1389,7 +1429,7 @@ document.getElementById('self-update-check-btn').addEventListener('click', async
 
 document.getElementById('self-update-apply-btn').addEventListener('click', async () => {
     const branch = document.getElementById('self-update-branch').value;
-    const msg = branch
+    const msg = selfUpdateIsSwitch()
         ? `Switch to branch "${branch}", pull its latest code, and restart the API now? This causes a few seconds of downtime.`
         : 'Pull the latest code from GitHub and restart the API now? This causes a few seconds of downtime.';
     if (!confirm(msg)) return;

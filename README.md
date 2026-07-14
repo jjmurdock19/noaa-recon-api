@@ -238,9 +238,9 @@ the mission-directory listing).
 
 ## Imagery Processing
 
-> On this branch, every single-band tile (bands 2/3/5/7/9/13) and both
-> composite products (`sandwich`/`geocolor`) render. This section documents
-> the full pipeline; where a piece exists only in the (still current, still
+> On this branch, every ABI band (1-16) and both composite products
+> (`sandwich`/`geocolor`) render. This section documents the full pipeline;
+> where a piece exists only in the (still current, still
 > deployed) Python implementation on `main`, it's called out.
 
 Every tile goes through the same four stages, split across the WASM-safe
