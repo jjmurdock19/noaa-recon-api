@@ -14,14 +14,12 @@ live at `{base}/llms.txt`
 > **This is the `rust` branch.** The API server and all data ingest are a
 > ground-up Rust rewrite (axum + a WASM-safe compute core) of the original
 > Python/FastAPI implementation on `main` — same HTTP API surface, native
-> binary instead of a Python process. Two gaps versus `main` today:
-> reflectance-band imagery (bands 2/3/5) and the `sandwich`/`geocolor`
-> composites are blocked on an HDF5 compression-filter limitation in the
-> static build, and a few admin-console jobs (bulk prefetch, on-demand
-> archive-update, self-update) aren't ported yet. Everything else —
-> including all data ingest, which now runs as native subcommands with
-> zero Python anywhere in this tree — works and is verified against live
-> NOAA data. Full port status, build recipe, and known-issue details:
+> binary instead of a Python process. One gap versus `main` today: two
+> admin-console jobs (bulk prefetch, on-demand archive-update) aren't wired
+> up yet. Everything else — all satellite imagery (every band, both
+> composites), all data ingest (native subcommands, zero Python anywhere in
+> this tree), and self-update — works and is verified against live NOAA
+> data. Full port status, build recipe, and known-issue details:
 > **[RUST.md](RUST.md)**.
 
 
@@ -55,8 +53,7 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   `abi5` (near-IR reflectance), `abi3` (Veggie/vegetation reflectance), or
   `abi2` (red/visible reflectance) — built from exact temperature→color
   stops (or a reflectance ramp for bands 2/3/5), not a generic
-  approximation. *On this branch, bands 2/3/5 (reflectance) currently
-  `501` — see the callout above.* See ["How the imagery is
+  approximation. See ["How the imagery is
   processed"](#how-the-imagery-is-processed) below for exactly how each
   one is computed, and [the live color legend tool](#color-legend) for
   rendering one client-side.
@@ -66,8 +63,7 @@ curl "https://joshmurdock.net/api/v1/satellite/tile?time=2025-10-28T12:00:00Z&ba
   ["How the imagery is processed"](#how-the-imagery-is-processed) below
   for the exact blend formulas, or `GET /v1/satellite/products` for a
   machine-readable summary). Both support `center`/`dims` bbox cropping
-  the same as a single-band tile. *Not yet ported to Rust on this branch
-  — currently `501`.*
+  the same as a single-band tile.
 - **`GET /v1/satellite/products`** — discovery endpoint listing every band/
   product this API can render and the exact UTC date range each satellite
   covers, so a client can build a picker without hardcoding any of that.
@@ -242,12 +238,10 @@ the mission-directory listing).
 
 ## Imagery Processing
 
-> On this branch, only single-band **IR** tiles (bands 7/9/13) are
-> currently renderable — reflectance bands (2/3/5) and both composite
-> products are blocked on a build limitation (see RUST.md) and return
-> `501`. This section documents the full pipeline, including the parts not
-> yet reachable in the Rust build; where a piece exists only in the (still
-> current, still deployed) Python implementation on `main`, it's called out.
+> On this branch, every single-band tile (bands 2/3/5/7/9/13) and both
+> composite products (`sandwich`/`geocolor`) render. This section documents
+> the full pipeline; where a piece exists only in the (still current, still
+> deployed) Python implementation on `main`, it's called out.
 
 Every tile goes through the same four stages, split across the WASM-safe
 core and the native server (see "Repo shape" above) — no external
@@ -294,13 +288,10 @@ depending on the band/cmap, and which one matters for accuracy:
   (1/1.5) * 255`) to a 0–100% grayscale ramp. Linear reflectance reads
   unnaturally dark/flat to the eye, so VIS/near-IR imagery is conventionally
   displayed gamma-stretched — the same idea (not a tuned match) as satpy's
-  default reflectance enhancement. This code is ported and unit-tested, but
-  unreachable via `/tile` today since band=2/3/5 requests are blocked
-  upstream (see the callout above) — `/colortable`'s reflectance-ramp
-  legend still works, since it doesn't need a real render.
-- **`abi13`/`abi9`/`abi7`** (the recommended per-band default enhancements,
-  and the only ones currently renderable) are evaluated **exactly**,
-  per-pixel, via `interp_stops()` over the literal temperature→color stops
+  default reflectance enhancement.
+- **`abi13`/`abi9`/`abi7`** (the recommended per-band default enhancements)
+  are evaluated **exactly**, per-pixel, via `interp_stops()` over the
+  literal temperature→color stops
   (`ABI13_STOPS`/`ABI9_STOPS`/`ABI7_STOPS` in `colormap.rs`) rather than
   through a quantized lookup table. This is deliberate, not an optimization
   detail: `abi13`'s source palette has a genuinely sharp 1°C-wide cut
@@ -324,12 +315,10 @@ depending on the band/cmap, and which one matters for accuracy:
 is guaranteed to match what a render actually produced — not a hand-copied
 approximation that can drift out of sync.
 
-> **The composite formulas below are not yet ported to Rust** — `/tile`
-> with `product=sandwich`/`geocolor` returns `501` on this branch. Kept
-> here as the spec for that port (see Roadmap); the algorithm is unchanged
-> from the currently-deployed Python implementation on `main`, described
-> in terms of the functions that exist *there* (`render_sandwich_to_png()`,
-> `_solar_zenith_deg()`, etc.).
+> The composite formulas below are described in terms of the Python
+> implementation on `main` (`render_sandwich_to_png()`, `_solar_zenith_deg()`,
+> etc.) — the algorithm is unchanged in the Rust port
+> (`render_sandwich()`/`render_geocolor()` in `crates/core/src/render.rs`).
 
 **`product=sandwich`** 
 `render_sandwich_to_png()` colorizes Band 13 with the exact `abi13`
@@ -621,11 +610,12 @@ build's binary) — the commands above are for manual/non-installer setups.
 Visiting the API's root (`/` locally) serves a login-gated admin console —
 status/cache stats, browsing and deleting cached rendered tiles and raw
 netCDF downloads, and a "Databases" panel with size/record-count cards for
-the storm-track and recon MET archives. **Not yet ported on this branch:**
-the bulk-prefetch-a-timeframe job and the per-archive "force update" /
-self-update buttons all still return `501` (the console UI shows them, but
-they don't work yet — see [RUST.md](RUST.md)). Run the ingest subcommands
-above by hand or via the nightly timer instead for now.
+the storm-track and recon MET archives. Self-update (check for a new commit,
+pull + rebuild + restart) is ported and works. **Not yet ported on this
+branch:** the bulk-prefetch-a-timeframe job and the per-archive "force
+update" buttons still return `501` (the console UI shows them, but they
+don't work yet — see [RUST.md](RUST.md)). Run the ingest subcommands above
+by hand or via the nightly timer instead for now.
 
 Every console user has their own account with one of two roles (see
 "API tokens & accounts" below for how they're created):
@@ -772,11 +762,11 @@ crates/
       error.rs                      ApiError -> {"detail": msg} JSON, matching FastAPI's HTTPException
                                    body shape exactly so error responses are unchanged for clients.
       routers/
-        satellite.rs                 GET /v1/satellite/tile (bands 7/9/13 only right now — see
-                                   RUST.md), /status/{key}, /colortable, /colortables, /products.
+        satellite.rs                 GET /v1/satellite/tile (all bands + both composite products),
+                                   /status/{key}, /colortable, /colortables, /products.
         admin.rs                      Login/logout/whoami, status, log tail, cache list/delete
                                    (satellite + goes_nc, goes_nc also has netCDF structural-metadata
-                                   info). Bulk prefetch / archive-update / self-update are NOT ported
+                                   info), self-update. Bulk prefetch / archive-update are NOT ported
                                    — routed to a 501 handler.
         admin_tokens.rs                Token CRUD, login-log, usage-log, auth-config toggle.
         storms.rs / recon.rs           Read-path routers (the ingest logic lives in services/, called
@@ -799,10 +789,17 @@ crates/
                                    storm each mission actually flew. Called by `ingest-recon`.
         goes.rs                          S3 list/fetch (reqwest + quick-xml) + netCDF decode (the
                                    netcdf crate — mask/scale handling is manual, unlike netCDF4-python;
-                                   see RUST.md's "critical decode gotcha") + PNG encode. Owns the
-                                   process-wide nc_lock() mutex shared with recon_ingest.rs (HDF5 isn't
-                                   thread-safe — see "Real bugs" #7 below) and clean_nc_cache() (the
-                                   `clean-nc-cache` subcommand).
+                                   see RUST.md's "critical decode gotcha") + PNG encode, single-band and
+                                   composite (render_product_and_store, companion-band resolution).
+                                   Owns the process-wide nc_lock() mutex shared with recon_ingest.rs
+                                   (HDF5 isn't thread-safe — see "Real bugs" #7 below) and
+                                   clean_nc_cache() (the `clean-nc-cache` subcommand).
+        hdf5_zstd.rs                       Registers the zstd HDF5 filter (id 32015) with H5Zregister()
+                                   at startup, so reflectance-band (2/3/5) netCDF chunks decode — see
+                                   RUST.md's "Solved: reflectance bands + composites" for why this exists
+                                   instead of a CMake flag.
+        self_update.rs                    git fetch/check + fast-forward pull + rebuild + restart
+                                   (systemd Restart=on-failure relaunches the freshly built binary).
         cache.rs / stats.rs               ResultCache (lock-file + TTL, same pattern as the Python
                                    branch) and the in-memory request-stats counter.
 admin_credentials.json        Gitignored, auto-created on first run — session secret + legacy-migration
@@ -930,33 +927,23 @@ this branch — axum has no auto-generated docs UI to misconfigure.*
 
 **Rust-branch-specific, in rough priority order:**
 
-1. **Reflectance-band satellite imagery (bands 2/3/5) + composite products
-   (`sandwich`/`geocolor`)** — currently `501`. Blocked on a real build
-   limitation: GOES compresses those bands' netCDF with a zstd HDF5 filter
-   (32015) the static `hdf5-metno-src`/`netcdf-src` build doesn't include
-   (IR bands 7/9/13 use plain deflate and work fine). Fix path: enable
-   `NETCDF_ENABLE_FILTER_ZSTD` + link `libzstd` in the static build, or link
-   a system netCDF that bundles all standard filters instead (e.g. MSYS2's
-   `mingw-w64-x86_64-netcdf` on Windows; distro netCDF packages on Linux
-   generally already include zstd, so this is likely Windows-static-only).
-   See [RUST.md](RUST.md).
-2. **Admin console: bulk prefetch, on-demand archive-update, self-update**
-   — all currently `501`. The underlying data-ingest logic these would
-   trigger already exists as CLI subcommands (`ingest-storms`/
-   `ingest-recon`); what's missing is wiring them up as background jobs
-   behind the console's HTTP endpoints (`crates/server/src/routers/
-   admin.rs`'s `not_ported` handler), plus the self-update mechanism itself
-   (git pull + rebuild + restart) isn't ported at all yet.
-3. **A WASM build of `crates/core`** — the actual motivation for this
+1. **Admin console: bulk prefetch, on-demand archive-update** — still
+   `501`. The underlying data-ingest logic these would trigger already
+   exists as CLI subcommands (`ingest-storms`/`ingest-recon`); what's
+   missing is wiring them up as background jobs behind the console's HTTP
+   endpoints (`crates/server/src/routers/admin.rs`'s `not_ported` handler).
+   (Self-update — git pull + rebuild + restart, `services/self_update.rs`
+   — is ported.)
+2. **A WASM build of `crates/core`** — the actual motivation for this
    branch's workspace split. `core` already compiles to
    `wasm32-unknown-unknown` (verified); what's missing is a `crates/wasm`
    crate with `wasm-bindgen` bindings and a browser demo exercising it
    (likely paired with the raw-netCDF-passthrough item below, so the
    browser has real decoded data to render, not just the math).
-4. **Mirror the installer's version picker to `main`** and to
+3. **Mirror the installer's version picker to `main`** and to
    `install.ps1` (Windows) — `install.sh` on this branch has the Rust/
    Python variant picker; `main`'s copy and the Windows installer don't yet.
-5. **A Python-vs-Rust benchmark harness** — the two-branch setup exists
+4. **A Python-vs-Rust benchmark harness** — the two-branch setup exists
    specifically to A/B these; no harness has been built yet.
 
 **Carried over from the Python branch, still applicable either way:**

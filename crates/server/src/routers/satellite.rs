@@ -110,31 +110,80 @@ async fn get_tile(State(state): State<AppState>, Query(q): Query<TileQuery>) -> 
     let cache = sat_cache(&state)?;
     let nc_cache_dir = state.paths.cache_root.join("goes_nc");
 
-    // Composite products aren't ported yet — be explicit rather than pretend.
     if let Some(product) = q.product.as_deref() {
         if !catalog::is_valid_product(product) {
             return Err(invalid_product());
         }
-        return Err(ApiError::not_implemented(
-            "Composite products (sandwich/geocolor) are not ported to Rust yet; single-band \
-             tiles (band=2/3/5/7/9/13) are available.",
+
+        let bbox = match (q.center.as_deref(), q.dims) {
+            (Some(center), Some(dims)) => {
+                let (lat, lon) = parse_center(center)?;
+                let width_km = if unit == "km" { dims } else { dims * 1.852 };
+                // band=2 here only picks which band's native GSD floors the
+                // resolution clamp — Band 2 (0.5km) is the finest of any band
+                // either composite uses, so a bbox request can go as sharp
+                // as the sharpest input actually supports.
+                let b = resolve_bbox_request(lat, lon, width_km, q.resolution_km, 2)
+                    .map_err(ApiError::bad_request)?;
+                Some(b)
+            }
+            _ => None,
+        };
+
+        let resolved_ir = goes::resolve_nearest(time, 13, sat_side)
+            .await
+            .map_err(|e| ApiError::bad_gateway(format!("S3 resolve failed: {e}")))?
+            .ok_or_else(|| {
+                ApiError::not_found(format!("No GOES-{sat_side} Band 13 scan found near {}", time.to_rfc3339()))
+            })?;
+
+        let scan_stamp = resolved_ir.scan_start.format("%Y%m%dT%H%M%S");
+        let mut key = format!("goes_{product}_{}_{scan_stamp}", resolved_ir.satellite);
+        if let Some(b) = &bbox {
+            key += &format!(
+                "_c{:.3}_{:.3}_w{:.0}_r{:.1}",
+                b.center_lat, b.center_lon, b.width_km, b.resolution_km
+            );
+        }
+
+        if let Some(status) = cache.get_status(&key) {
+            return Ok(Json(status));
+        }
+
+        let mut lock_params = json!({
+            "product": product,
+            "satellite": format!("GOES-{}", resolved_ir.satellite),
+            "scan_start": resolved_ir.scan_start.to_rfc3339(),
+        });
+        if let Some(b) = &bbox {
+            let m = lock_params.as_object_mut().unwrap();
+            m.insert("center".into(), json!([b.center_lat, b.center_lon]));
+            m.insert("width_km".into(), json!(b.width_km));
+        }
+        cache
+            .acquire_lock(&key, Some(&lock_params))
+            .map_err(|e| ApiError::internal(format!("cache lock: {e}")))?;
+
+        let task_cache = sat_cache(&state)?;
+        tokio::spawn(goes::render_product_and_store(
+            product.to_string(),
+            resolved_ir,
+            key.clone(),
+            nc_cache_dir,
+            task_cache,
+            bbox,
         ));
+
+        let mut resp = lock_params;
+        let m = resp.as_object_mut().unwrap();
+        m.insert("status".into(), json!("generating"));
+        m.insert("key".into(), json!(key));
+        return Ok(Json(resp));
     }
 
     let band = q.band.unwrap_or(13);
     if !catalog::is_valid_band(band) {
         return Err(invalid_band());
-    }
-    // Reflectance bands (2/3/5) compress their CMI with a filter (zstd) that the
-    // statically-built netCDF/HDF5 doesn't include, so they decode to fill.
-    // Report that honestly rather than downloading + returning "no valid data".
-    // IR bands (7/9/13) use deflate and render fine. See RUST.md.
-    if catalog::is_reflectance_band(band) {
-        return Err(ApiError::not_implemented(format!(
-            "Band {band} (reflectance) isn't renderable in this build yet: its netCDF uses a \
-             compression filter (zstd) not included in the static HDF5 build. IR bands \
-             (7, 9, 13) work. See RUST.md."
-        )));
     }
     let mut cmap = q.cmap.unwrap_or_else(|| "default".into());
     if !catalog::is_valid_cmap(&cmap) {

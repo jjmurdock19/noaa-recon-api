@@ -3,8 +3,9 @@
 //! `noaa_recon_core::render`; this module does the parts that can't go to WASM:
 //! S3 listing/download (reqwest) and netCDF decode (the `netcdf` C library).
 //!
-//! Scope: single-band tiles (full-disk + bbox). The composite products
-//! (sandwich/geocolor) are a follow-up — `/tile?product=` still 501s.
+//! Single-band tiles (full-disk + bbox) and the composite products
+//! (sandwich/geocolor) are both implemented; see `render_and_store` and
+//! `render_product_and_store` respectively.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,7 +15,7 @@ use serde_json::json;
 
 use noaa_recon_core::bbox::{bbox_bounds, bbox_out_size, BBoxRequest};
 use noaa_recon_core::catalog::native_gsd_km;
-use noaa_recon_core::project::abi_to_latlon;
+use noaa_recon_core::project::{abi_to_latlon, mercator_y};
 use noaa_recon_core::render::{self, Proj};
 
 use crate::services::cache::ResultCache;
@@ -146,6 +147,48 @@ pub async fn resolve_nearest(
         let (sat_num, _) = get_satellite_bucket(scan_start, satellite);
         ResolvedScan { bucket, key, satellite: sat_num, band, scan_start }
     }))
+}
+
+/// Given an already-resolved scan, finds the sibling file for a different
+/// band from the exact same scan cycle (`resolve_companion_band`) — every
+/// ABI band is captured simultaneously per scan, so the sibling file shares
+/// `resolved`'s exact `scan_start` (not just "close"), which is what lets
+/// the composite products (sandwich, geocolor) combine multiple bands
+/// without any time-alignment error between them.
+async fn resolve_companion_band(resolved: &ResolvedScan, band: i64) -> anyhow::Result<ResolvedScan> {
+    let hour_dt = resolved
+        .scan_start
+        .with_minute(0)
+        .and_then(|d| d.with_second(0))
+        .and_then(|d| d.with_nanosecond(0))
+        .unwrap_or(resolved.scan_start);
+    let prefix = format!(
+        "ABI-L2-CMIPF/{}/{:03}/{:02}/",
+        hour_dt.year(),
+        hour_dt.ordinal(),
+        hour_dt.hour()
+    );
+    let chan = format!("C{band:02}");
+    let keys = list_s3_prefix(&resolved.bucket, &prefix).await?;
+    for k in keys {
+        if !k.contains(&chan) || !k.ends_with(".nc") {
+            continue;
+        }
+        if parse_scan_start(&k) == Some(resolved.scan_start) {
+            return Ok(ResolvedScan {
+                bucket: resolved.bucket.clone(),
+                key: k,
+                satellite: resolved.satellite,
+                band,
+                scan_start: resolved.scan_start,
+            });
+        }
+    }
+    anyhow::bail!(
+        "No companion Band {band} file found for the scan at {} in {} (needed to render this composite product)",
+        resolved.scan_start.to_rfc3339(),
+        resolved.bucket
+    )
 }
 
 /// Download the object to `nc_cache_dir` if not already cached (`ensure_downloaded`).
@@ -525,4 +568,275 @@ async fn render_and_store_inner(
     }
     cache.write_result(key, &meta)?;
     Ok(())
+}
+
+// ── Composite products (sandwich / geocolor) ────────────────────────────────
+
+/// Background-task entry point for a composite product, the `product=`
+/// counterpart of `render_and_store`: resolves + downloads every companion
+/// band the product needs (`resolved_ir` is Band 13's already-resolved scan;
+/// every other band is its companion — see `resolve_companion_band`), then
+/// reprojects each band onto one shared canvas and composes/colors them
+/// (`noaa_recon_core::render::render_sandwich`/`render_geocolor`). Never
+/// panics — all failures are reported to the client via an `error` cache
+/// entry, same as `render_and_store`.
+pub async fn render_product_and_store(
+    product: String,
+    resolved_ir: ResolvedScan,
+    key: String,
+    nc_cache_dir: PathBuf,
+    cache: ResultCache,
+    bbox: Option<BBoxRequest>,
+) {
+    let result =
+        render_product_and_store_inner(&product, &resolved_ir, &key, &nc_cache_dir, &cache, bbox.as_ref()).await;
+    if let Err(e) = result {
+        tracing::error!("Composite render failed for key={key} product={product}: {e:#}");
+        let mut meta = json!({
+            "status": "error",
+            "key": key,
+            "message": e.to_string(),
+            "product": product,
+            "satellite": format!("GOES-{}", resolved_ir.satellite),
+            "scan_start": resolved_ir.scan_start.to_rfc3339(),
+        });
+        if let Some(b) = bbox {
+            let m = meta.as_object_mut().unwrap();
+            m.insert("center".into(), json!([b.center_lat, b.center_lon]));
+            m.insert("width_km".into(), json!(b.width_km));
+        }
+        let _ = cache.write_result(&key, &meta);
+    }
+}
+
+async fn render_product_and_store_inner(
+    product: &str,
+    resolved_ir: &ResolvedScan,
+    key: &str,
+    nc_cache_dir: &Path,
+    cache: &ResultCache,
+    bbox: Option<&BBoxRequest>,
+) -> anyhow::Result<()> {
+    let band_list: &[i64] = match product {
+        "sandwich" => &[13, 2],
+        "geocolor" => &[1, 2, 3, 13],
+        _ => anyhow::bail!("unknown composite product: {product}"),
+    };
+
+    // Resolve (band 13 is `resolved_ir` itself — every other band is its
+    // companion) + download every band this product needs.
+    let mut nc_paths: std::collections::HashMap<i64, PathBuf> = std::collections::HashMap::new();
+    for &band in band_list {
+        let resolved = if band == resolved_ir.band {
+            resolved_ir.clone()
+        } else {
+            resolve_companion_band(resolved_ir, band).await?
+        };
+        let path = ensure_downloaded(&resolved, nc_cache_dir).await?;
+        nc_paths.insert(band, path);
+    }
+
+    let out_png = cache.output_path(key, "png");
+    let product_s = product.to_string();
+    let bbox_c = bbox.copied();
+    let scan_start = resolved_ir.scan_start;
+
+    let render_meta = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let (rgba, out_size, bounds, sat_lon, extra) = match product_s.as_str() {
+            "sandwich" => render_sandwich_product(&nc_paths[&13], &nc_paths[&2], bbox_c)?,
+            "geocolor" => render_geocolor_product(
+                &nc_paths[&1],
+                &nc_paths[&2],
+                &nc_paths[&3],
+                &nc_paths[&13],
+                scan_start,
+                bbox_c,
+            )?,
+            other => anyhow::bail!("unknown composite product: {other}"),
+        };
+        let img = image::RgbaImage::from_raw(out_size as u32, out_size as u32, rgba)
+            .ok_or_else(|| anyhow::anyhow!("RGBA buffer size mismatch"))?;
+        if let Some(parent) = out_png.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        img.save_with_format(&out_png, image::ImageFormat::Png)?;
+        Ok(json!({ "bounds": bounds, "sat_lon": sat_lon, "resolution_km": extra }))
+    })
+    .await??;
+
+    let mut meta = json!({
+        "status": "ready",
+        "key": key,
+        "png_url": format!("/cache/satellite/{key}.png"),
+        "bounds": render_meta["bounds"],
+        "product": product,
+        "satellite": format!("GOES-{}", resolved_ir.satellite),
+        "sat_lon": render_meta["sat_lon"],
+        "scan_start": resolved_ir.scan_start.to_rfc3339(),
+    });
+    if let Some(b) = bbox {
+        let m = meta.as_object_mut().unwrap();
+        m.insert("center".into(), json!([b.center_lat, b.center_lon]));
+        m.insert("width_km".into(), json!(b.width_km));
+        m.insert("resolution_km".into(), render_meta["resolution_km"].clone());
+    }
+    cache.write_result(key, &meta)?;
+    Ok(())
+}
+
+type RenderOutcome = (Vec<u8>, usize, [[f64; 2]; 2], f64, Option<f64>);
+
+/// Full-disk canvas bounds shared by every band of a scan (same constants
+/// `render_full_disk` uses for a single band).
+const FULL_DISK_LAT: (f64, f64) = (-81.3, 81.3);
+
+fn render_sandwich_product(
+    nc_ir: &Path,
+    nc_vis: &Path,
+    bbox: Option<BBoxRequest>,
+) -> anyhow::Result<RenderOutcome> {
+    match bbox {
+        None => {
+            let ir_src = read_source_downsampled(nc_ir, None)?;
+            let vis_src = read_source_downsampled(nc_vis, None)?;
+            let (lat_s, lat_n) = FULL_DISK_LAT;
+            let (lon_w, lon_e) = (ir_src.proj.sat_lon - 81.0, ir_src.proj.sat_lon + 81.0);
+            let (merc_y_s, merc_y_n) = (mercator_y(lat_s), mercator_y(lat_n));
+            let out_size = 2048usize;
+
+            let ir_canvas = render::project_band_to_canvas(
+                &ir_src.cmi, ir_src.y.len(), ir_src.x.len(), &ir_src.x, &ir_src.y, ir_src.proj,
+                lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+            )
+            .unwrap_or_else(|| vec![f32::NAN; out_size * out_size]);
+            let vis_canvas = render::project_band_to_canvas(
+                &vis_src.cmi, vis_src.y.len(), vis_src.x.len(), &vis_src.x, &vis_src.y, ir_src.proj,
+                lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+            );
+
+            let r = render::render_sandwich(
+                &ir_canvas, vis_canvas.as_deref(), out_size, [[lat_s, lon_w], [lat_n, lon_e]], ir_src.proj.sat_lon,
+            );
+            Ok((r.rgba, r.out_size, r.bounds, r.sat_lon, None))
+        }
+        Some(b) => {
+            let (lat_s, lat_n, lon_w, lon_e) = bbox_bounds(b.center_lat, b.center_lon, b.width_km);
+            let (merc_y_s, merc_y_n) = (mercator_y(lat_s), mercator_y(lat_n));
+            let out_size = bbox_out_size(b.width_km, b.resolution_km);
+
+            let ir_step = fine_step(b.resolution_km, 13);
+            let ir_src = read_source_cropped(nc_ir, lat_s, lat_n, lon_w, lon_e, ir_step)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Requested area ({lat_s:.2},{lon_w:.2})-({lat_n:.2},{lon_e:.2}) is outside this scan's visible disk"
+                )
+            })?;
+            let ir_canvas = render::project_band_to_canvas(
+                &ir_src.cmi, ir_src.y.len(), ir_src.x.len(), &ir_src.x, &ir_src.y, ir_src.proj,
+                lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Requested area has no valid data in this scan (off-disk or no-data)"))?;
+
+            let vis_step = fine_step(b.resolution_km, 2);
+            let vis_canvas = read_source_cropped(nc_vis, lat_s, lat_n, lon_w, lon_e, vis_step)?.and_then(|src| {
+                render::project_band_to_canvas(
+                    &src.cmi, src.y.len(), src.x.len(), &src.x, &src.y, ir_src.proj,
+                    lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+                )
+            });
+
+            let r = render::render_sandwich(
+                &ir_canvas, vis_canvas.as_deref(), out_size, [[lat_s, lon_w], [lat_n, lon_e]], ir_src.proj.sat_lon,
+            );
+            Ok((r.rgba, r.out_size, r.bounds, r.sat_lon, Some(b.resolution_km)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_geocolor_product(
+    nc_c1: &Path,
+    nc_c2: &Path,
+    nc_c3: &Path,
+    nc_ir: &Path,
+    scan_time: DateTime<Utc>,
+    bbox: Option<BBoxRequest>,
+) -> anyhow::Result<RenderOutcome> {
+    let doy = scan_time.ordinal() as i64;
+    let (hour, minute, second) = (scan_time.hour(), scan_time.minute(), scan_time.second() as f64);
+
+    match bbox {
+        None => {
+            let ir_src = read_source_downsampled(nc_ir, None)?;
+            let c1_src = read_source_downsampled(nc_c1, None)?;
+            let c2_src = read_source_downsampled(nc_c2, None)?;
+            let c3_src = read_source_downsampled(nc_c3, None)?;
+            let (lat_s, lat_n) = FULL_DISK_LAT;
+            let (lon_w, lon_e) = (ir_src.proj.sat_lon - 81.0, ir_src.proj.sat_lon + 81.0);
+            let (merc_y_s, merc_y_n) = (mercator_y(lat_s), mercator_y(lat_n));
+            let out_size = 2048usize;
+
+            let proj_band = |src: &Source| {
+                render::project_band_to_canvas(
+                    &src.cmi, src.y.len(), src.x.len(), &src.x, &src.y, ir_src.proj,
+                    lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+                )
+            };
+            let ir_canvas = proj_band(&ir_src).unwrap_or_else(|| vec![f32::NAN; out_size * out_size]);
+            let blue = proj_band(&c1_src);
+            let red = proj_band(&c2_src);
+            let veggie = proj_band(&c3_src);
+
+            let r = render::render_geocolor(
+                &ir_canvas, blue.as_deref(), red.as_deref(), veggie.as_deref(), out_size,
+                [[lat_s, lon_w], [lat_n, lon_e]], lon_w, lon_e, merc_y_s, merc_y_n, ir_src.proj.sat_lon,
+                doy, hour, minute, second,
+            );
+            Ok((r.rgba, r.out_size, r.bounds, r.sat_lon, None))
+        }
+        Some(b) => {
+            let (lat_s, lat_n, lon_w, lon_e) = bbox_bounds(b.center_lat, b.center_lon, b.width_km);
+            let (merc_y_s, merc_y_n) = (mercator_y(lat_s), mercator_y(lat_n));
+            let out_size = bbox_out_size(b.width_km, b.resolution_km);
+
+            let ir_step = fine_step(b.resolution_km, 13);
+            let ir_src = read_source_cropped(nc_ir, lat_s, lat_n, lon_w, lon_e, ir_step)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Requested area ({lat_s:.2},{lon_w:.2})-({lat_n:.2},{lon_e:.2}) is outside this scan's visible disk"
+                )
+            })?;
+            let ir_canvas = render::project_band_to_canvas(
+                &ir_src.cmi, ir_src.y.len(), ir_src.x.len(), &ir_src.x, &ir_src.y, ir_src.proj,
+                lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Requested area has no valid data in this scan (off-disk or no-data)"))?;
+
+            let load = |path: &Path, band: i64| -> anyhow::Result<Option<Vec<f32>>> {
+                let step = fine_step(b.resolution_km, band);
+                Ok(read_source_cropped(path, lat_s, lat_n, lon_w, lon_e, step)?.and_then(|src| {
+                    render::project_band_to_canvas(
+                        &src.cmi, src.y.len(), src.x.len(), &src.x, &src.y, ir_src.proj,
+                        lon_w, lon_e, merc_y_s, merc_y_n, out_size,
+                    )
+                }))
+            };
+            let blue = load(nc_c1, 1)?;
+            let red = load(nc_c2, 2)?;
+            let veggie = load(nc_c3, 3)?;
+
+            let r = render::render_geocolor(
+                &ir_canvas, blue.as_deref(), red.as_deref(), veggie.as_deref(), out_size,
+                [[lat_s, lon_w], [lat_n, lon_e]], lon_w, lon_e, merc_y_s, merc_y_n, ir_src.proj.sat_lon,
+                doy, hour, minute, second,
+            );
+            Ok((r.rgba, r.out_size, r.bounds, r.sat_lon, Some(b.resolution_km)))
+        }
+    }
+}
+
+/// `max(1, round(resolution_km / band's native GSD))` — the bbox crop's
+/// per-band netCDF read stride (same formula `render_and_store_inner` uses
+/// for a single band).
+fn fine_step(resolution_km: f64, band: i64) -> usize {
+    let gsd = native_gsd_km(band).unwrap_or(2.0);
+    ((resolution_km / gsd).round() as usize).max(1)
 }

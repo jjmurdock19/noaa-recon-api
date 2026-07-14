@@ -59,6 +59,16 @@ netcdf = { version = "0.10", features = ["static"] }
 quick-xml = "0.36"               # parse the S3 ListBucket XML
 image = { workspace = true }     # Pillow -> PNG encode
 
+# Reflectance-band (2/3/5) decode: GOES compresses those bands' CMI with the
+# zstd HDF5 filter (id 32015), which the static netCDF/HDF5 build above
+# doesn't register (it's normally a *dynamically-loaded* plugin, which can't
+# exist in a static link). Rather than switching to a system-installed
+# netCDF (extra runtime dependency) or forking netcdf-src's CMake (drifts
+# from upstream), we vendor just the zstd algorithm as a normal, offline,
+# statically-linked Cargo dependency and register the HDF5 filter callback
+# ourselves at startup — see services/hdf5_zstd.rs.
+zstd-sys = { version = "2", default-features = false }
+
 # ── Storm-track ingest (ingest_storms.py -> Rust) ───────────────────────────
 flate2 = "1"                     # gunzip ATCF archive b-decks
 regex = "1"                      # HURDAT2 header + ATCF filename parsing

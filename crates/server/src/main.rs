@@ -41,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
     // whole process (dropping it stops the async file writer).
     let _log_guard = logging::configure(&paths.repo_root)?;
 
+    // Must run before any netCDF file is opened — see hdf5_zstd.rs. Every
+    // entry point below (serve, and both ingest/cache subcommands) can open
+    // a GOES netCDF file, so this runs unconditionally ahead of the
+    // subcommand dispatch.
+    services::hdf5_zstd::register();
+
     // Subcommands (replace the Python maintenance scripts). No subcommand => serve.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -77,6 +83,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Seeded first superuser '{}' from admin_credentials.json", creds.username);
         }
     }
+
+    // Background: periodically refresh the cached self-update check so the
+    // console can show an "update available" badge without an operator
+    // click. Never pulls/restarts by itself — see main.py's
+    // `_start_self_update_checker` (this mirrors it 1:1).
+    spawn_self_update_checker(state.clone());
 
     // CORS: open, GET-only — mirrors main.py's CORSMiddleware(allow_origins=["*"],
     // allow_methods=["GET"]). This API is meant to be consumed cross-origin.
@@ -221,6 +233,25 @@ async fn log_requests(
     );
     state.stats.record_request();
     response
+}
+
+/// How often the background task below checks the git remote for new
+/// commits. Only ever updates the cached "is an update available" status the
+/// console reads (`/v1/admin/self-update/status`) — it never pulls or
+/// restarts by itself; that's exclusively triggered by an operator hitting
+/// "Update now" in the console (see services/self_update.rs).
+const SELF_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(1800);
+
+fn spawn_self_update_checker(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match services::self_update::check_for_update(&state.paths.repo_root).await {
+                Ok(result) => state.self_update.set_cached_check(Some(result), None),
+                Err(e) => state.self_update.set_cached_check(None, Some(e)),
+            }
+            tokio::time::sleep(SELF_UPDATE_CHECK_INTERVAL).await;
+        }
+    });
 }
 
 /// Port of main.py's `/llms.txt` PlainTextResponse route.

@@ -12,12 +12,14 @@ use axum::extract::FromRef;
 use axum_extra::extract::cookie::Key;
 
 use crate::config::Paths;
+use crate::services::self_update::SelfUpdateState;
 use crate::services::stats::Stats;
 
 #[derive(Clone)]
 pub struct AppState {
     pub paths: Arc<Paths>,
     pub stats: Arc<Stats>,
+    pub self_update: Arc<SelfUpdateState>,
     /// Signing key for the admin session cookie (derived from admin_credentials.json).
     pub cookie_key: Key,
 }
@@ -27,6 +29,7 @@ impl AppState {
         Self {
             paths: Arc::new(paths),
             stats: Arc::new(Stats::default()),
+            self_update: Arc::new(SelfUpdateState::default()),
             cookie_key,
         }
     }

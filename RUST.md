@@ -76,8 +76,8 @@ Important realities of the **Rust variant** install:
   a C compiler; both are installed for you).
 - The systemd unit runs `target/release/noaa-recon-api` with `PORT` /
   `NOAA_RECON_HOST` / `NOAA_RECON_REPO_ROOT` in its environment.
-- Reflectance imagery + composites are unavailable (zstd filter, above); domain
-  *path-prefix* mode has no `--root-path` equivalent (subdomain/LAN/local are fine).
+- Domain *path-prefix* mode has no `--root-path` equivalent (subdomain/LAN/local
+  are fine).
 
 > To install from a fresh VM via `curl`, fetch **this branch's** installer
 > (`raw.githubusercontent.com/<owner>/noaa-recon-api/rust/install.sh`) — the
@@ -123,11 +123,12 @@ curl localhost:8000/v1/recon/mission/<id>
 | request logging + `stats` counter | ✅ ported |
 | API-token store (SQLite, PBKDF2/SHA-256) | ✅ ported + unit-tested |
 | Satellite **discovery** (`/satellite/products`, `/colortables`, `/colortable`, `/status`) | ✅ ported (colormaps/catalog live in WASM-safe `core`) |
-| Satellite **imagery** (`/satellite/tile`) — single-band IR (7/9/13), bbox + full-disk | ✅ ported & verified end-to-end (real S3 fetch → netCDF decode → render → PNG) |
-| Satellite imagery — reflectance bands (2/3/5), composites (sandwich/geocolor) | ⛔ blocked on a build limitation (see below); returns 501 |
+| Satellite **imagery** (`/satellite/tile`) — single-band, all bands (2/3/5/7/9/13), bbox + full-disk | ✅ ported & verified end-to-end (real S3 fetch → netCDF decode → render → PNG) |
+| Satellite imagery — composites (sandwich/geocolor) | ✅ ported & verified end-to-end (multi-band fetch → shared-canvas reproject → composite → PNG) |
 | **API token gate** (`require_api_token`, off by default) | ✅ ported & verified (disabled=open, enabled=401 without token; health always open) |
 | **Admin console backend** (`/v1/admin/*`) | ✅ ported & verified — login/logout/whoami (signed-cookie session), status, log tail, token CRUD, usage/login logs, auth-config, cache browse/delete, netCDF info |
-| Admin console — self-update job | ⏳ 501 (git pull + restart not ported) |
+| Admin console — self-update job | ✅ ported & verified (git fetch/pull/rebuild + restart) |
+| Admin console — bulk prefetch, on-demand archive-update | ⏳ 501 (not wired up yet) |
 | **Ingest — storms** (HURDAT2/ATCF), **recon MET** (crawl + netCDF + PDF + reconcile), **cache cleanup** | ✅ ported to Rust & verified live (`ingest-storms` / `ingest-recon` / `clean-nc-cache` subcommands) |
 
 ### Console login
@@ -143,23 +144,39 @@ are native Rust. `pyproject.toml`, `app/*.py`, and `scripts/*.py` are gone; only
 installer builds nothing Python — no venv, no pip.
 
 ### Remaining gaps
-**Satellite reflectance bands** (2/3/5, zstd HDF5 filter — see above) and
-**composite products**, plus the console's **self-update** job (git pull + restart).
-IR imagery, all data endpoints, all ingest, auth, and the rest of the console work.
+Admin console **bulk prefetch** and **on-demand archive-update** still return
+`501` — the underlying ingest logic exists as CLI subcommands
+(`ingest-storms`/`ingest-recon`), it's just not wired up as background jobs
+behind the console's HTTP endpoints yet. Everything else — IR + reflectance
+imagery, both composite products, all data endpoints, all ingest, auth,
+self-update, and the rest of the console — works.
 
-### Known limitation: reflectance bands need the zstd HDF5 filter
+### Solved: reflectance bands + composites needed the zstd HDF5 filter
 GOES **IR** bands (7/9/13) compress their `CMI` with zlib/deflate — included in
-the static HDF5 build, so they decode and render correctly. The **reflectance**
-bands (2/3/5) and the composite products that use them compress with **zstd**
-(HDF5 filter 32015), which the static `hdf5-metno-src`/`netcdf-src` build does
-**not** include (`hdf5-metno-src` exposes only a `zlib` feature; the build log
-shows `_has_H5_HAVE_FILTER_SZIP - Failed`). HDF5 then returns fill silently, so
-those bands read as all-NaN. `/tile` now returns a clear 501 for bands 2/3/5.
-**Fix path (future):** build netCDF-C/HDF5 with zstd — either patch the
-`netcdf-src` static build to enable `NETCDF_ENABLE_FILTER_ZSTD` + link `libzstd`,
-or link a system netCDF (e.g. MSYS2 `mingw-w64-x86_64-netcdf`, which bundles all
-standard filters) instead of the static build. On Linux, distro netCDF packages
-include zstd, so this likely only bites the Windows static build.
+the static HDF5 build, so they've always decoded and rendered correctly. The
+**reflectance** bands (2/3/5) and the composite products that use them
+(`sandwich`/`geocolor`) compress with **zstd** (HDF5 filter 32015), which
+netCDF-C ships only as a *dynamically-loaded* HDF5 plugin
+(`plugins/H5Zzstd.c`) — its own CMake build ties `NETCDF_ENABLE_PLUGINS` to
+`BUILD_SHARED_LIBS`, so it's unavailable when statically linking, static build
+or not, on any OS.
+
+Rather than switching to a dynamically-linked system netCDF (extra runtime
+dependency, breaks the single-binary deploy story) or forking `netcdf-src`'s
+CMake to statically compile the plugin in (drifts from upstream), the fix
+registers the zstd filter with HDF5 **programmatically** at process startup:
+`crates/server/src/services/hdf5_zstd.rs` hand-implements a decode-only HDF5
+filter (`H5Z_class2_t`) using `zstd-sys` — a normal, offline, statically-linked
+Cargo dependency, no different from the netCDF/HDF5 crates already in the
+tree — and calls `H5Zregister()` before any netCDF file is opened
+(`main.rs`). HDF5's chunk cache then finds filter 32015 in its internal table
+the same way it already finds zlib; no dynamic plugin loading, no system
+package, no fork to maintain.
+
+Composite products (`sandwich`/`geocolor`) are implemented in
+`crates/core/src/render.rs` (`render_sandwich`/`render_geocolor` — pure array
+math, WASM-safe) with the multi-band S3 fetch/decode orchestration in
+`crates/server/src/services/goes.rs` (`render_product_and_store`).
 
 ### GOES architecture (in progress)
 The colormaps, band/cmap catalog, and bbox math are ported into `crates/core`

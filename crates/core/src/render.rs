@@ -242,6 +242,182 @@ pub fn render_bbox(
     })
 }
 
+// ── Composite products (sandwich / geocolor) ────────────────────────────────
+// Port of the composite half of `app/services/goes.py`. Each composite's
+// server-side caller (`services/goes.rs`) decodes every companion band it
+// needs and reprojects each onto one shared canvas via
+// `project_band_to_canvas` below (the multi-band counterpart of
+// `render_full_disk`/`render_bbox`'s single-band `paint_project` +
+// `fill_gaps` — same shared out_size x out_size canvas bounds for every
+// band, since they come from the same satellite/projection); the functions
+// here take those already-reprojected canvases and do the pure-math
+// composition/coloring.
+
+/// Reproject one band's already-decoded (and, for full-disk, already
+/// downsampled) CMI onto a shared canvas: `paint_project` + `fill_gaps`, the
+/// same two steps `render_full_disk`/`render_bbox` run inline for a single
+/// band. `None` means nothing from this band landed inside the canvas
+/// bounds at all (composite callers decide whether that's fatal — see
+/// `render_sandwich`/`render_geocolor`).
+#[allow(clippy::too_many_arguments)]
+pub fn project_band_to_canvas(
+    cmi: &[f32],
+    ny: usize,
+    nx: usize,
+    x: &[f64],
+    y: &[f64],
+    p: Proj,
+    lon_w: f64,
+    lon_e: f64,
+    merc_y_s: f64,
+    merc_y_n: f64,
+    out_size: usize,
+) -> Option<Vec<f32>> {
+    let mut out = paint_project(x, y, cmi, ny, nx, p, lon_w, lon_e, merc_y_s, merc_y_n, out_size)?;
+    fill_gaps(&mut out, out_size, 6);
+    Some(out)
+}
+
+/// Low-precision solar zenith angle in degrees (NOAA/Spencer Fourier-series
+/// approximation — public-domain, the same formula behind NOAA's online
+/// solar calculator; `_solar_zenith_deg` in Python). Accurate to a fraction
+/// of a degree, plenty for a several-degree-wide terminator blend; not
+/// ephemeris-grade. `doy` is UTC day-of-year (1-366); `hour`/`minute`/
+/// `second` are the UTC time-of-day (kept as separate components, rather
+/// than taking a `DateTime`, to keep this crate WASM-safe / chrono-free).
+pub fn solar_zenith_deg(lat_deg: f64, lon_deg: f64, doy: i64, hour: u32, minute: u32, second: f64) -> f64 {
+    use std::f64::consts::PI;
+    let fy = 2.0 * PI / 365.0 * ((doy - 1) as f64 + (hour as f64 - 12.0) / 24.0);
+    let decl = 0.006918 - 0.399912 * fy.cos() + 0.070257 * fy.sin() - 0.006758 * (2.0 * fy).cos()
+        + 0.000907 * (2.0 * fy).sin()
+        - 0.002697 * (3.0 * fy).cos()
+        + 0.00148 * (3.0 * fy).sin();
+    let eqtime = 229.18
+        * (0.000075 + 0.001868 * fy.cos() - 0.032077 * fy.sin() - 0.014615 * (2.0 * fy).cos()
+            - 0.040849 * (2.0 * fy).sin());
+    let time_offset = eqtime + 4.0 * lon_deg;
+    let true_solar_time = hour as f64 * 60.0 + minute as f64 + second / 60.0 + time_offset;
+    let hour_angle = (true_solar_time / 4.0 - 180.0).to_radians();
+    let lat_rad = lat_deg.to_radians();
+    let cos_zenith = lat_rad.sin() * decl.sin() + lat_rad.cos() * decl.cos() * hour_angle.cos();
+    cos_zenith.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// IR/VIS "sandwich" composite: the standard abi13 colorized IR, modulated
+/// (multiplied) by Band 2 visible brightness — surfaces convective texture
+/// (overshooting tops, gravity waves, low cloud streets) a pure IR
+/// colorization smooths over. `ir_canvas`/`vis_canvas` are both already
+/// projected onto the same shared canvas (`project_band_to_canvas`).
+/// `vis_canvas: None` (VIS band unavailable for this crop entirely) and
+/// individual NaN pixels within `Some` (night side, or no data) both fall
+/// back to a darkened — not hidden — version of the plain IR colorization,
+/// matching the Python's `_apply_stops_exact` + `nan_to_num` behavior.
+pub fn render_sandwich(
+    ir_canvas: &[f32],
+    vis_canvas: Option<&[f32]>,
+    out_size: usize,
+    bounds: [[f64; 2]; 2],
+    sat_lon: f64,
+) -> RenderResult {
+    let stops = stops_by_cmap("abi13").expect("abi13 stops table");
+    let mut rgba = vec![0u8; out_size * out_size * 4];
+    for idx in 0..out_size * out_size {
+        let k = ir_canvas[idx];
+        if !k.is_finite() {
+            continue; // alpha stays 0
+        }
+        let ir_rgb = crate::colormap::interp_stops_public(k as f64 - 273.15, stops);
+        let brightness = match vis_canvas.map(|v| v[idx]) {
+            Some(r) if r.is_finite() => 0.35 + 0.65 * (r as f64).clamp(0.0, 1.0),
+            _ => 0.35,
+        };
+        let o = idx * 4;
+        rgba[o] = (ir_rgb[0] as f64 * brightness).clamp(0.0, 255.0).round() as u8;
+        rgba[o + 1] = (ir_rgb[1] as f64 * brightness).clamp(0.0, 255.0).round() as u8;
+        rgba[o + 2] = (ir_rgb[2] as f64 * brightness).clamp(0.0, 255.0).round() as u8;
+        rgba[o + 3] = 220;
+    }
+    RenderResult { rgba, out_size, bounds, sat_lon: round1(sat_lon) }
+}
+
+/// A simplified GeoColor-*style* day/night composite (NOT NOAA/CIRA's
+/// proprietary algorithm — no city-lights layer, no atmospheric/Rayleigh
+/// correction). Day side: synthetic true color from Bands 1(blue)/2(red)/3
+/// (veggie/NIR) reflectance, with green synthesized via CIRA's published
+/// recipe (`green = 0.45*red + 0.10*NIR + 0.45*blue`). Night side: the
+/// standard abi13 colorized IR. Blended per-pixel by solar zenith angle —
+/// full day color inside ~85 deg zenith, full night IR beyond ~95 deg,
+/// linear blend across the ~10 deg terminator band between. `blue`/`red`/
+/// `veggie` all `None` together (bbox crop missing all three, or full-disk
+/// where they're not requested) forces night-side IR everywhere, matching
+/// the Python's `have_day_color` fallback (a partial/wrong day color would
+/// be worse than a consistent fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn render_geocolor(
+    ir_canvas: &[f32],
+    blue: Option<&[f32]>,
+    red: Option<&[f32]>,
+    veggie: Option<&[f32]>,
+    out_size: usize,
+    bounds: [[f64; 2]; 2],
+    lon_w: f64,
+    lon_e: f64,
+    merc_y_s: f64,
+    merc_y_n: f64,
+    sat_lon: f64,
+    doy: i64,
+    hour: u32,
+    minute: u32,
+    second: f64,
+) -> RenderResult {
+    let have_day_color = blue.is_some() && red.is_some() && veggie.is_some();
+    let stops = stops_by_cmap("abi13").expect("abi13 stops table");
+    let mut rgba = vec![0u8; out_size * out_size * 4];
+    let osz = out_size as f64;
+    for row in 0..out_size {
+        let merc_y = merc_y_n - (row as f64 + 0.5) / osz * (merc_y_n - merc_y_s);
+        let lat = (2.0 * merc_y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
+        for col in 0..out_size {
+            let idx = row * out_size + col;
+            let k = ir_canvas[idx];
+            if !k.is_finite() {
+                continue; // alpha stays 0
+            }
+            let night_rgb = crate::colormap::interp_stops_public(k as f64 - 273.15, stops);
+
+            let (day_r, day_g, day_b, day_weight) = if have_day_color {
+                let lon = lon_w + (col as f64 + 0.5) / osz * (lon_e - lon_w);
+                let r = red.unwrap()[idx];
+                let r = if r.is_finite() { r as f64 } else { 0.0 };
+                let g_in = veggie.unwrap()[idx];
+                let g_in = if g_in.is_finite() { g_in as f64 } else { 0.0 };
+                let b = blue.unwrap()[idx];
+                let b = if b.is_finite() { b as f64 } else { 0.0 };
+                let green = 0.45 * r + 0.10 * g_in + 0.45 * b;
+                let dr = reflectance_gray(r, 1.5) as f64;
+                let dg = reflectance_gray(green, 1.5) as f64;
+                let db = reflectance_gray(b, 1.5) as f64;
+                let zenith = solar_zenith_deg(lat, lon, doy, hour, minute, second);
+                let w = ((95.0 - zenith) / (95.0 - 85.0)).clamp(0.0, 1.0);
+                (dr, dg, db, w)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+
+            let br = day_weight * day_r + (1.0 - day_weight) * night_rgb[0] as f64;
+            let bg = day_weight * day_g + (1.0 - day_weight) * night_rgb[1] as f64;
+            let bb = day_weight * day_b + (1.0 - day_weight) * night_rgb[2] as f64;
+
+            let o = idx * 4;
+            rgba[o] = br.clamp(0.0, 255.0).round() as u8;
+            rgba[o + 1] = bg.clamp(0.0, 255.0).round() as u8;
+            rgba[o + 2] = bb.clamp(0.0, 255.0).round() as u8;
+            rgba[o + 3] = 220;
+        }
+    }
+    RenderResult { rgba, out_size, bounds, sat_lon: round1(sat_lon) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

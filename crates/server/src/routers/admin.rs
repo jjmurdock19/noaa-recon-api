@@ -35,12 +35,12 @@ pub fn router() -> Router<AppState> {
         .route("/admin/cache/goes_nc", get(list_goes_nc_cache).delete(clear_goes_nc_cache))
         .route("/admin/cache/goes_nc/:filename", delete(delete_goes_nc_entry))
         .route("/admin/cache/goes_nc/:filename/info", get(get_goes_nc_info))
+        .route("/admin/self-update/status", get(self_update_status))
+        .route("/admin/self-update/check", post(self_update_check))
+        .route("/admin/self-update/apply", post(self_update_apply).get(self_update_job))
         // Jobs that depend on unported pieces:
         .route("/admin/prefetch", post(not_ported).get(not_ported))
         .route("/admin/archive-update/:archive", post(not_ported).get(not_ported))
-        .route("/admin/self-update/status", get(not_ported))
-        .route("/admin/self-update/apply", post(not_ported).get(not_ported))
-        .route("/admin/self-update/check", post(not_ported))
 }
 
 fn sat_cache(state: &AppState) -> ApiResult<ResultCache> {
@@ -172,6 +172,30 @@ fn default_max_bytes() -> u64 {
     65536
 }
 
+/// `logging::configure` uses `tracing_appender`'s daily rolling appender,
+/// which names files `app.log.YYYY-MM-DD` (no plain `app.log` ever exists).
+/// Pick the most recently modified `app.log*` file so today's rotation is
+/// always the one tailed.
+fn find_log_file(log_dir: &FsPath) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(log_dir).ok()?;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().starts_with("app.log") {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mt = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(bt, _)| mt > *bt).unwrap_or(true) {
+            best = Some((mt, e.path()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 async fn get_logs(
     State(state): State<AppState>,
     jar: SignedCookieJar,
@@ -179,10 +203,9 @@ async fn get_logs(
 ) -> ApiResult<Json<Value>> {
     auth::require_login(&jar)?;
     let max_bytes = q.max_bytes.clamp(1024, 1_000_000);
-    let log_file = state.paths.repo_root.join("logs").join("app.log");
-    if !log_file.exists() {
+    let Some(log_file) = find_log_file(&state.paths.repo_root.join("logs")) else {
         return Ok(Json(json!({ "text": "", "offset": 0, "reset": true })));
-    }
+    };
     let size = file_bytes(&log_file);
     let reset = q.offset > size || (q.offset == 0 && size > max_bytes);
     let start = if reset { size.saturating_sub(max_bytes) } else { q.offset };
@@ -319,11 +342,65 @@ async fn clear_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar
     Ok(Json(json!({ "status": "ok", "bytes_freed": before })))
 }
 
+// ── Self-update (pull latest code from git, rebuild if needed, restart) ───────
+// See services/self_update.rs for the git/restart mechanics. A background
+// task (main.rs, started at startup) periodically refreshes the cached check
+// below so the console can show an "update available" badge without the
+// operator having to click anything; actually pulling + restarting only ever
+// happens from the explicit apply endpoint.
+
+async fn self_update_status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    Ok(Json(json!({
+        "check": state.self_update.get_cached_check(),
+        "job": state.self_update.job.lock().unwrap().clone(),
+    })))
+}
+
+/// "Check now" button — bypasses the periodic timer for an immediate fetch.
+async fn self_update_check(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_superuser(&jar)?;
+    match crate::services::self_update::check_for_update(&state.paths.repo_root).await {
+        Ok(result) => {
+            state.self_update.set_cached_check(Some(result), None);
+            Ok(Json(state.self_update.get_cached_check()))
+        }
+        Err(e) => {
+            state.self_update.set_cached_check(None, Some(e.clone()));
+            Err(ApiError::bad_gateway(format!("Update check failed: {e}")))
+        }
+    }
+}
+
+async fn self_update_apply(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_superuser(&jar)?;
+    {
+        let mut job = state.self_update.job.lock().unwrap();
+        if crate::services::self_update::IN_PROGRESS_STATUSES.contains(&job["status"].as_str().unwrap_or("")) {
+            return Err(ApiError::conflict("An update is already in progress"));
+        }
+        *job = json!({
+            "status": "checking",
+            "started_at": Utc::now().to_rfc3339(),
+            "finished_at": Value::Null, "result": Value::Null, "error": Value::Null, "new_commit": Value::Null,
+        });
+    }
+    let repo_root = state.paths.repo_root.clone();
+    let su_state = state.self_update.clone();
+    tokio::spawn(crate::services::self_update::apply_update(repo_root, su_state));
+    Ok(Json(state.self_update.job.lock().unwrap().clone()))
+}
+
+async fn self_update_job(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    Ok(Json(state.self_update.job.lock().unwrap().clone()))
+}
+
 // ── Not-yet-ported jobs ───────────────────────────────────────────────────────
 async fn not_ported(jar: SignedCookieJar) -> ApiResult<Json<Value>> {
     auth::require_login(&jar)?;
     Err(ApiError::not_implemented(
-        "This console job (bulk prefetch / archive-update / self-update) isn't ported to the \
-         Rust build yet. Archive ingest is still run via the Python scripts; self-update via git.",
+        "This console job (bulk prefetch / archive-update) isn't ported to the Rust build yet. \
+         Archive ingest is still run via the Python scripts.",
     ))
 }
