@@ -418,7 +418,7 @@ async fn self_update_apply(
             "status": "checking",
             "started_at": Utc::now().to_rfc3339(),
             "finished_at": Value::Null, "result": Value::Null, "error": Value::Null, "new_commit": Value::Null,
-            "branch": q.branch,
+            "branch": q.branch, "build_log": "",
         });
     }
     let repo_root = state.paths.repo_root.clone();

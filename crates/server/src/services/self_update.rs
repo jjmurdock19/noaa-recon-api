@@ -1,5 +1,5 @@
-//! Self-update: pull the latest code from the git remote, rebuild if
-//! `Cargo.lock` changed, then restart. Port of `app/services/self_update.py`.
+//! Self-update: pull the latest code from the git remote, rebuild, then
+//! restart. Port of `app/services/self_update.py`.
 //!
 //! Runs entirely as the unprivileged service user (see
 //! deploy/noaa-recon-api.service equivalent written by install.sh) — no
@@ -22,15 +22,24 @@
 //! that touched `Cargo.lock`. This runs unconditionally after every pull.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 const REMOTE: &str = "origin";
+
+/// Cap on the in-memory build log (bytes) so a from-scratch build (which can
+/// run to tens of thousands of lines compiling netCDF/HDF5) doesn't grow the
+/// job state — and every 1.5s status-poll response — without bound. Keeps the
+/// most recent output, which is what matters for "is it still going" / "what
+/// broke".
+const BUILD_LOG_CAP: usize = 200_000;
 
 /// In-progress job statuses — mirrors Python's `_SELF_UPDATE_IN_PROGRESS_STATUSES`.
 pub const IN_PROGRESS_STATUSES: &[&str] = &["checking", "pulling", "building"];
@@ -155,8 +164,35 @@ fn set_status(job: &Mutex<Value>, status: &str) {
     job.lock().unwrap()["status"] = json!(status);
 }
 
-/// Pull + rebuild (if `Cargo.lock` changed), then exit so systemd restarts
-/// the process on the new binary. `target_branch`, if given and different
+/// Appends one line of `cargo build` output to the job's `build_log`,
+/// trimming from the front once it exceeds [`BUILD_LOG_CAP`]. The console
+/// polls the job (same 1.5s cadence as the rest of self-update) and renders
+/// this incrementally, same as the app-log terminal.
+fn append_build_log(job: &Mutex<Value>, line: &str) {
+    let mut j = job.lock().unwrap();
+    let mut log = j["build_log"].as_str().unwrap_or("").to_string();
+    log.push_str(line);
+    log.push('\n');
+    if log.len() > BUILD_LOG_CAP {
+        let cut = log.len() - BUILD_LOG_CAP;
+        let boundary = (cut..=log.len()).find(|&i| log.is_char_boundary(i)).unwrap_or(log.len());
+        log.drain(..boundary);
+    }
+    j["build_log"] = json!(log);
+}
+
+/// Reads `reader` line by line, appending each to the job's build log as it
+/// arrives — this is what makes the build "live" for the console rather than
+/// only visible after the whole `cargo build` finishes.
+async fn pump_build_log(reader: impl AsyncRead + Unpin, state: Arc<SelfUpdateState>) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        append_build_log(&state.job, &line);
+    }
+}
+
+/// Pull + rebuild, then exit so systemd restarts the process on the new
+/// binary. `target_branch`, if given and different
 /// from whatever's currently checked out, switches branches first (`git
 /// checkout` — same clean-working-tree requirement as the pull below, since
 /// checkout can't safely proceed over uncommitted changes either). Mutates
@@ -210,19 +246,33 @@ pub async fn apply_update(repo_root: PathBuf, state: std::sync::Arc<SelfUpdateSt
 
         // Always rebuild — the pulled commit may have changed .rs source with
         // no Cargo.lock diff at all, and a Rust binary won't pick that up
-        // just by restarting (see the module doc comment).
+        // just by restarting (see the module doc comment). stdout/stderr are
+        // piped and pumped into the job's build_log line by line as they're
+        // produced (rather than collected via `.output()` and only visible
+        // once the whole build finishes) so the console can show it live.
         set_status(&state.job, "building");
-        let fut = Command::new("cargo")
+        let mut child = Command::new("cargo")
             .args(["build", "--release", "-p", "noaa-recon-api"])
             .current_dir(&repo_root)
-            .output();
-        let output = timeout(Duration::from_secs(1800), fut)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to start cargo build: {e}"))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stdout_task = tokio::spawn(pump_build_log(stdout, state.clone()));
+        let stderr_task = tokio::spawn(pump_build_log(stderr, state.clone()));
+
+        let status = timeout(Duration::from_secs(1800), child.wait())
             .await
             .map_err(|_| "cargo build timed out".to_string())?
             .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: String = stderr.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        if !status.success() {
+            let log = state.job.lock().unwrap()["build_log"].as_str().unwrap_or("").to_string();
+            let tail: String = log.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
             return Err(format!("cargo build failed:\n{tail}"));
         }
 

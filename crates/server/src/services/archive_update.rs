@@ -95,6 +95,15 @@ impl ArchiveUpdateState {
 
 /// Starts the named archive's update job (if not already running) and returns
 /// its freshly-"running" snapshot. `None` for an unknown archive name.
+///
+/// Runs via `spawn_blocking` + `Handle::block_on` rather than a plain
+/// `tokio::spawn`: both `storms::run_ingest` and `recon_ingest::run_ingest`
+/// hold a `&rusqlite::Connection` (not `Sync`) across internal `.await`
+/// points, so the futures they return aren't `Send` — fine for the CLI path,
+/// which awaits them directly on the current task, but `tokio::spawn` needs
+/// `Send` because it may hand the future to a different worker thread.
+/// Driving the future to completion on one dedicated blocking-pool thread
+/// sidesteps that requirement entirely.
 pub fn start(state: &Arc<ArchiveUpdateState>, paths: &Arc<Paths>, archive: &str) -> Option<Value> {
     if !ArchiveUpdateState::is_known_archive(archive) {
         return None;
@@ -104,13 +113,17 @@ pub fn start(state: &Arc<ArchiveUpdateState>, paths: &Arc<Paths>, archive: &str)
         "storms" => {
             let state = state.clone();
             let storms_db = paths.storms_db.clone();
-            tokio::spawn(run_storms(state, storms_db));
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(run_storms(state, storms_db));
+            });
         }
         "recon_met" => {
             let state = state.clone();
             let recon_db = paths.recon_met_db.clone();
             let storms_db = paths.storms_db.clone();
-            tokio::spawn(run_recon(state, recon_db, storms_db));
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(run_recon(state, recon_db, storms_db));
+            });
         }
         _ => unreachable!(),
     }
