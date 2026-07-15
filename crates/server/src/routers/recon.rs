@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/recon/mission/:mission_id/download", get(download_mission_source))
         .route("/recon/:year", get(list_storms_for_year))
         // `*storm_name` (catch-all) mirrors FastAPI's `{storm_name:path}`: the
-        // "Training Flights / Research" bucket contains a literal "/".
+        // "Training / Research" bucket contains a literal "/".
         .route("/recon/:year/*storm_name", get(list_missions_for_storm))
 }
 

@@ -24,8 +24,8 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 const NC_TIMEOUT_SECS: u64 = 120;
 const MS_TO_KT: f64 = 1.94384;
 
-const TRAINING_BUCKET_NAME: &str = "Training Flights / Research";
-const LEGACY_TRAINING_BUCKET_NAMES: [&str; 1] = ["Unknown / Training"];
+const TRAINING_BUCKET_NAME: &str = "Training / Research";
+const LEGACY_TRAINING_BUCKET_NAMES: [&str; 2] = ["Unknown / Training", "Training Flights / Research"];
 const MANUAL_STORM_NAME_CORRECTIONS: [(&str, &str); 1] = [("20260616H1", TRAINING_BUCKET_NAME)];
 
 const MAX_STORM_MATCH_DISTANCE_KM: f64 = 500.0;

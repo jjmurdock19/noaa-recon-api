@@ -542,7 +542,7 @@ ingestion entry point (also a nightly systemd timer — see the README's
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/recon/years` | Every year with at least one archived mission. |
-| `GET /v1/recon/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. Unidentified flights (training, calibration, research) are grouped under `storm_name: "Training Flights / Research"` rather than one bucket per flight. |
+| `GET /v1/recon/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. Unidentified flights (training, calibration, research) are grouped under `storm_name: "Training / Research"` rather than one bucket per flight. |
 | `GET /v1/recon/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, flight_date, start_unix, end_unix, obs_count, source_url}[]`, ordered chronologically. |
 | `GET /v1/recon/mission/{mission_id}` | The mission's full decimated track — `mission_id` alone is enough to look it up (unique across every year/storm). Returns metadata plus `obs`: an array of `[unix_time, lat, lon, wind_kt, wind_dir, sfmr_kt, alt_m]` tuples (any field can be `null` if that sensor didn't report). Also includes `source_url`. |
 | `GET /v1/recon/mission/{mission_id}/download` | Streams NOAA's original full-resolution NetCDF file for this mission (600+ variables — attitude, airspeed, every raw sensor channel — not just the ~7 fields `/mission/{id}` decimates). Not a redirect: the bytes are proxied through this API with `Content-Type: application/x-netcdf`, since a redirect's success depends on the caller's HTTP client following it, which isn't guaranteed for every netCDF-consuming tool. |

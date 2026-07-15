@@ -3,6 +3,7 @@
 //! These are native-only (SQLite, HTTP, filesystem); the WASM-safe compute
 //! lives in `noaa-recon-core`. Ported incrementally.
 
+pub mod archive_update;
 pub mod cache;
 pub mod downloads;
 pub mod goes;

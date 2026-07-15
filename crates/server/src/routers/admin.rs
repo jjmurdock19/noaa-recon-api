@@ -1,7 +1,7 @@
 //! Port of `app/routers/admin.py` — console API: status, logs, cache browsing/
-//! deletion. Login/session live here too. The bulk-prefetch, archive-update, and
-//! self-update jobs depend on pieces not ported to Rust (ingest pipelines,
-//! self_update.py), so they return 501 for now.
+//! deletion. Login/session live here too. Archive-update and self-update jobs
+//! run as detached background tasks polled by the console; bulk-prefetch still
+//! depends on a piece not ported to Rust, so it returns 501 for now.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path as FsPath, PathBuf};
@@ -39,9 +39,9 @@ pub fn router() -> Router<AppState> {
         .route("/admin/self-update/branches", get(self_update_branches))
         .route("/admin/self-update/check", post(self_update_check))
         .route("/admin/self-update/apply", post(self_update_apply).get(self_update_job))
-        // Jobs that depend on unported pieces:
+        .route("/admin/archive-update/:archive", post(start_archive_update).get(get_archive_update))
+        // Bulk prefetch depends on a piece not ported to Rust yet:
         .route("/admin/prefetch", post(not_ported).get(not_ported))
-        .route("/admin/archive-update/:archive", post(not_ported).get(not_ported))
 }
 
 fn sat_cache(state: &AppState) -> ApiResult<ResultCache> {
@@ -430,6 +430,38 @@ async fn self_update_apply(
 async fn self_update_job(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
     auth::require_login(&jar)?;
     Ok(Json(state.self_update.job.lock().unwrap().clone()))
+}
+
+// ── Archive update (storm-track / recon-MET ingest) ──────────────────────────
+// See services/archive_update.rs — both ingests are incremental by construction
+// (skip missions/seasons already up to date), so "force update" only means
+// "run it now" rather than "rebuild the archive from scratch".
+
+async fn start_archive_update(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Path(archive): Path<String>,
+) -> ApiResult<Json<Value>> {
+    auth::require_superuser(&jar)?;
+    if state.archive_update.is_running(&archive) {
+        return Err(ApiError::conflict("An update for this archive is already in progress"));
+    }
+    let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive)
+        .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
+    Ok(Json(job))
+}
+
+async fn get_archive_update(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Path(archive): Path<String>,
+) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    let job = state
+        .archive_update
+        .job(&archive)
+        .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
+    Ok(Json(job))
 }
 
 // ── Not-yet-ported jobs ───────────────────────────────────────────────────────
