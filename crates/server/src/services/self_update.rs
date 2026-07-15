@@ -15,8 +15,11 @@
 //! instead of merging or discarding anything — see [`apply_update`].
 //!
 //! Rust variant note: Python's `pip install -e .` step becomes
-//! `cargo build --release -p noaa-recon-api` here, run only when
-//! `Cargo.lock` changed by the pull (mirrors checking `pyproject.toml`).
+//! `cargo build --release -p noaa-recon-api` here. Unlike Python — which
+//! re-interprets source on every restart, so a rebuild is only needed when
+//! `pyproject.toml`'s dependencies changed — a Rust binary embeds its source
+//! at compile time, so *any* pulled commit requires a rebuild, not just one
+//! that touched `Cargo.lock`. This runs unconditionally after every pull.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -30,7 +33,7 @@ use tokio::time::timeout;
 const REMOTE: &str = "origin";
 
 /// In-progress job statuses — mirrors Python's `_SELF_UPDATE_IN_PROGRESS_STATUSES`.
-pub const IN_PROGRESS_STATUSES: &[&str] = &["checking", "pulling", "installing_dependencies"];
+pub const IN_PROGRESS_STATUSES: &[&str] = &["checking", "pulling", "building"];
 
 /// Shared self-update state, held in `AppState`.
 pub struct SelfUpdateState {
@@ -202,27 +205,25 @@ pub async fn apply_update(repo_root: PathBuf, state: std::sync::Arc<SelfUpdateSt
         }
 
         set_status(&state.job, "pulling");
-        let lock_path = repo_root.join("Cargo.lock");
-        let old_lock = tokio::fs::read_to_string(&lock_path).await.unwrap_or_default();
         git(&repo_root, &["pull", "--ff-only", REMOTE, &branch], 60).await?;
         let new_commit = git(&repo_root, &["rev-parse", "HEAD"], 10).await?;
-        let new_lock = tokio::fs::read_to_string(&lock_path).await.unwrap_or_default();
 
-        if new_lock != old_lock {
-            set_status(&state.job, "installing_dependencies");
-            let fut = Command::new("cargo")
-                .args(["build", "--release", "-p", "noaa-recon-api"])
-                .current_dir(&repo_root)
-                .output();
-            let output = timeout(Duration::from_secs(1800), fut)
-                .await
-                .map_err(|_| "cargo build timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let tail: String = stderr.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
-                return Err(format!("cargo build failed:\n{tail}"));
-            }
+        // Always rebuild — the pulled commit may have changed .rs source with
+        // no Cargo.lock diff at all, and a Rust binary won't pick that up
+        // just by restarting (see the module doc comment).
+        set_status(&state.job, "building");
+        let fut = Command::new("cargo")
+            .args(["build", "--release", "-p", "noaa-recon-api"])
+            .current_dir(&repo_root)
+            .output();
+        let output = timeout(Duration::from_secs(1800), fut)
+            .await
+            .map_err(|_| "cargo build timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: String = stderr.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
+            return Err(format!("cargo build failed:\n{tail}"));
         }
 
         let mut j = state.job.lock().unwrap();

@@ -1302,7 +1302,7 @@ document.getElementById('clear-goesnc-btn').addEventListener('click', async () =
 // tree only) and deliberately exits so systemd relaunches uvicorn on the
 // new code. Both progress through /self-update/status, polled the same
 // way as the prefetch/archive-update jobs above.
-const SELF_UPDATE_IN_PROGRESS = ['checking', 'pulling', 'installing_dependencies', 'restarting'];
+const SELF_UPDATE_IN_PROGRESS = ['checking', 'pulling', 'building', 'restarting'];
 let selfUpdatePollTimer = null;
 let restartWaitTimer = null;
 
@@ -1386,7 +1386,7 @@ function renderSelfUpdate(data) {
         const switching = job.branch && job.branch !== selfUpdateCurrentBranch;
         statusEl.textContent = {
             checking: 'Checking…', pulling: switching ? `Switching to ${job.branch}…` : 'Pulling latest code…',
-            installing_dependencies: 'Installing dependencies…',
+            building: 'Building…',
         }[job.status];
         statusEl.className = 'status-text working';
         applyBtn.disabled = true;
