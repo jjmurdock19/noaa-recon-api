@@ -189,6 +189,13 @@
         <label for="inp-z">CAPPI altitude (km)</label>
         <input id="inp-z" type="number" step="0.5" min="0" max="18" value="2.0">
       </div>
+      <div class="field" id="field-3d-style" style="margin-top:8px">
+        <label for="sel-3d-style">3D rendering</label>
+        <select id="sel-3d-style">
+          <option value="raymarch">Volumetric (continuous, needs WebGL2)</option>
+          <option value="layered">Layered slices (compatibility fallback)</option>
+        </select>
+      </div>
       <button id="btn-load" style="margin-top:12px; width:100%">Plot sweep</button>
     </fieldset>
 
@@ -357,8 +364,8 @@ function distinct(arr) { return Array.from(new Set(arr)); }
 
 const VIEW_HINTS = {
   sweep: '2D sweep plots one horizontal CAPPI or the along-track vertical profile.',
-  volume: '3D volume renders every CAPPI level of an xy/xy_rel product as a stack of textured planes in real 3D space — drag to orbit, scroll to zoom. Only xy-family products have a level axis, so vertical profiles aren’t selectable here.',
-  composite: 'Composite flattens a mission into one image: "Altitude max-projection" collapses one analysis time’s whole level axis (like classic composite reflectivity); "Time mosaic" overlays one CAPPI level across every analysis time in the mission (use product=xy_rel so the storm-relative grid lines up across times).',
+  volume: '3D volume renders the full xy/xy_rel field as a continuous volumetric solid (GPU raymarched through every CAPPI level at once) — drag to orbit, scroll to zoom. Only xy-family products have a level axis, so vertical profiles aren’t selectable here.',
+  composite: 'Composite flattens a mission into one image: "Altitude max-projection" collapses one analysis time’s whole level axis (like classic composite reflectivity); "Time mosaic" aligns every analysis time by its storm center (ORIGIN_LATITUDE/LONGITUDE) and mosaics one CAPPI level into a single storm-spanning composite — works for either xy or xy_rel.',
 };
 
 function currentView() { return $('sel-view').value; }
@@ -410,6 +417,7 @@ function applyViewVisibility() {
   $('field-time').classList.toggle('hidden', !needsTime);
   const needsZ = (view === 'sweep' && !isVert) || (view === 'composite' && compositeMode === 'time');
   $('field-z').classList.toggle('hidden', !needsZ);
+  $('field-3d-style').classList.toggle('hidden', view !== 'volume');
 
   const labels = { sweep: 'Plot sweep', volume: 'Load 3D volume', composite: 'Load composite' };
   $('btn-load').textContent = labels[view] || 'Plot';
@@ -432,6 +440,9 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 
 // Maps a physical value to an [r,g,b,a] color using a Plotly-shaped
 // [[fraction, hex], ...] colorscale stop list plus its [zmin, zmax] domain.
+// Alpha scales with the normalized value itself (faint returns stay hazy,
+// strong returns approach opaque) so the raymarcher renders a solid-looking
+// core with soft edges rather than a uniform haze.
 function colorForValue(value, stops, zmin, zmax) {
   if (value == null || Number.isNaN(value)) return [0, 0, 0, 0];
   const t = zmax > zmin ? Math.min(1, Math.max(0, (value - zmin) / (zmax - zmin))) : 0;
@@ -443,7 +454,8 @@ function colorForValue(value, stops, zmin, zmax) {
   const localT = span > 0 ? (t - lo[0]) / span : 0;
   const [r1, g1, b1] = hexToRgb(lo[1]);
   const [r2, g2, b2] = hexToRgb(hi[1]);
-  return [Math.round(lerp(r1, r2, localT)), Math.round(lerp(g1, g2, localT)), Math.round(lerp(b1, b2, localT)), 235];
+  const alpha = Math.round(30 + 205 * t);
+  return [Math.round(lerp(r1, r2, localT)), Math.round(lerp(g1, g2, localT)), Math.round(lerp(b1, b2, localT)), alpha];
 }
 
 // ── 3D volume viewer (Three.js) ─────────────────────────────────────────
@@ -491,7 +503,9 @@ function clearThreeGroup() {
   }
 }
 
-// Builds one canvas-texture heatmap for a single level plane, data[yi][xi].
+// Builds one canvas-texture heatmap for a single level plane, data[yi][xi]
+// — used only by the layered-slices fallback (see VOLUME_VERTEX_SHADER for
+// the primary volumetric renderer).
 function levelTexture(dataPlane, ny, nx, stops, zmin, zmax) {
   const canvas = document.createElement('canvas');
   canvas.width = nx; canvas.height = ny;
@@ -513,30 +527,162 @@ function levelTexture(dataPlane, ny, nx, stops, zmin, zmax) {
   return tex;
 }
 
-function renderVolumeLegend(stops, zmin, zmax, units) {
-  const el = $('plot3d-legend');
-  const gradient = stops.map(([f, hex]) => `${hex} ${(f * 100).toFixed(0)}%`).join(', ');
-  el.innerHTML = `
-    <div>${zmax}</div>
-    <div style="width:14px; height:120px; border-radius:2px; background:linear-gradient(to top, ${gradient});"></div>
-    <div>${zmin}</div>
-    <div style="margin-top:2px;">${units}</div>
-  `;
+// ── Volumetric raymarch shader ──────────────────────────────────────────
+// Marches a ray through a unit box [-0.5,0.5]^3 sampling a 3D density
+// texture and front-to-back alpha-composites the result, so the storm
+// reads as one continuous solid instead of stacked flat sheets. Standard
+// technique (same shape as Three.js's own WebGL2 volume-rendering
+// examples): RawShaderMaterial + GLSL3 + sampler3D, rendered with
+// side=BackSide so the shader still runs correctly when the camera is
+// inside the box (common once a user zooms in).
+
+const VOLUME_VERTEX_SHADER = `
+precision highp float;
+uniform mat4 modelMatrix;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+uniform vec3 cameraPosition;
+in vec3 position;
+out vec3 vOrigin;
+out vec3 vDirection;
+void main() {
+  vOrigin = vec3(inverse(modelMatrix) * vec4(cameraPosition, 1.0));
+  vDirection = position - vOrigin;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const VOLUME_FRAGMENT_SHADER = `
+precision highp float;
+precision highp sampler3D;
+uniform sampler3D map;
+uniform float steps;
+uniform float alphaScale;
+in vec3 vOrigin;
+in vec3 vDirection;
+out vec4 outColor;
+
+vec2 hitBox(vec3 orig, vec3 dir) {
+  vec3 boxMin = vec3(-0.5);
+  vec3 boxMax = vec3(0.5);
+  vec3 invDir = 1.0 / dir;
+  vec3 tMinTmp = (boxMin - orig) * invDir;
+  vec3 tMaxTmp = (boxMax - orig) * invDir;
+  vec3 tMin = min(tMinTmp, tMaxTmp);
+  vec3 tMax = max(tMinTmp, tMaxTmp);
+  float t0 = max(tMin.x, max(tMin.y, tMin.z));
+  float t1 = min(tMax.x, min(tMax.y, tMax.z));
+  return vec2(max(t0, 0.0), t1);
 }
 
-function buildVolumeScene(vol) {
-  const { group, camera, controls } = initThree();
-  clearThreeGroup();
+void main() {
+  vec3 rayDir = normalize(vDirection);
+  vec2 bounds = hitBox(vOrigin, rayDir);
+  if (bounds.x >= bounds.y) discard;
 
-  const nx = vol.x.length, ny = vol.y.length;
+  vec3 p = vOrigin + bounds.x * rayDir;
+  float rayLength = bounds.y - bounds.x;
+  float delta = rayLength / steps;
+
+  vec4 accumulated = vec4(0.0);
+  for (float t = 0.0; t < rayLength; t += delta) {
+    vec3 texCoord = p + 0.5;
+    vec4 sampled = texture(map, texCoord);
+    float a = sampled.a * alphaScale;
+    accumulated.rgb += (1.0 - accumulated.a) * a * sampled.rgb;
+    accumulated.a += (1.0 - accumulated.a) * a;
+    if (accumulated.a >= 0.97) break;
+    p += rayDir * delta;
+  }
+
+  if (accumulated.a < 0.01) discard;
+  outColor = accumulated;
+}
+`;
+
+// Builds a nx*ny*nz RGBA density texture from vol.data[z][y][x] — no row
+// flip needed here (unlike the 2D canvas path): Data3DTexture samples
+// texel (0,0,0) directly with no flipY convention to fight.
+function buildVolumeTexture(vol) {
+  const nx = vol.x.length, ny = vol.y.length, nz = vol.levels_km.length;
+  const data = new Uint8Array(nx * ny * nz * 4);
+  let i = 0;
+  for (let z = 0; z < nz; z++) {
+    for (let y = 0; y < ny; y++) {
+      for (let x = 0; x < nx; x++) {
+        const [r, g, b, a] = colorForValue(vol.data[z][y][x], vol.colorscale, vol.zmin, vol.zmax);
+        data[i++] = r; data[i++] = g; data[i++] = b; data[i++] = a;
+      }
+    }
+  }
+  const tex = new THREE.Data3DTexture(data, nx, ny, nz);
+  tex.format = THREE.RGBAFormat;
+  tex.type = THREE.UnsignedByteType;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
+  tex.unpackAlignment = 1;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function volumeExtents(vol) {
   const xExtent = Math.max(...vol.x) - Math.min(...vol.x) || 1;
   const yExtent = Math.max(...vol.y) - Math.min(...vol.y) || 1;
-  const levels = vol.levels_km;
-  const zMin = Math.min(...levels), zMax = Math.max(...levels);
+  const zMin = Math.min(...vol.levels_km), zMax = Math.max(...vol.levels_km);
   const zSpan = Math.max(zMax - zMin, 1);
   // Vertical exaggeration: real CAPPI spacing (a few km) is tiny next to the
   // ~100+ km horizontal extent, so scale altitude into a comparable range.
   const zScale = (Math.max(xExtent, yExtent) * 0.6) / zSpan;
+  return { xExtent, yExtent, zMin, zMax, zSpan, zScale };
+}
+
+function buildRaymarchVolumeScene(vol) {
+  const { group, camera, controls } = initThree();
+  clearThreeGroup();
+
+  const tex = buildVolumeTexture(vol);
+  const { xExtent, yExtent, zSpan, zScale } = volumeExtents(vol);
+
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: {
+      map: { value: tex },
+      steps: { value: 200 },
+      alphaScale: { value: 1.6 },
+    },
+    vertexShader: VOLUME_VERTEX_SHADER,
+    fragmentShader: VOLUME_FRAGMENT_SHADER,
+    side: THREE.BackSide,
+    transparent: true,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.scale.set(xExtent, zSpan * zScale, yExtent);
+  group.add(mesh);
+
+  const axes = new THREE.AxesHelper(Math.max(xExtent, yExtent) / 2);
+  group.add(axes);
+
+  const dist = Math.max(xExtent, yExtent) * 1.4;
+  camera.position.set(dist, dist * 0.7, dist);
+  controls.target.set(0, 0, 0);
+  controls.update();
+
+  // Force shader compilation now (rather than letting it happen lazily
+  // inside the render loop) so a link/compile failure throws here, where
+  // buildVolumeScene's try/catch can actually fall back to layered slices.
+  three.renderer.compile(three.scene, camera);
+}
+
+function buildLayeredVolumeScene(vol) {
+  const { group, camera, controls } = initThree();
+  clearThreeGroup();
+
+  const nx = vol.x.length, ny = vol.y.length;
+  const { xExtent, yExtent, zMin, zScale } = volumeExtents(vol);
+  const levels = vol.levels_km;
 
   for (let li = 0; li < levels.length; li++) {
     const tex = levelTexture(vol.data[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
@@ -553,12 +699,50 @@ function buildVolumeScene(vol) {
 
   const dist = Math.max(xExtent, yExtent) * 1.4;
   camera.position.set(dist, dist * 0.7, dist);
+  const { zMax } = volumeExtents(vol);
   controls.target.set(0, ((zMax - zMin) * zScale) / 2, 0);
   controls.update();
+}
 
+function renderVolumeLegend(stops, zmin, zmax, units) {
+  const el = $('plot3d-legend');
+  const gradient = stops.map(([f, hex]) => `${hex} ${(f * 100).toFixed(0)}%`).join(', ');
+  el.innerHTML = `
+    <div>${zmax}</div>
+    <div style="width:14px; height:120px; border-radius:2px; background:linear-gradient(to top, ${gradient});"></div>
+    <div>${zmin}</div>
+    <div style="margin-top:2px;">${units}</div>
+  `;
+}
+
+function buildVolumeScene(vol) {
+  const { renderer } = initThree();
+  let style = $('sel-3d-style').value;
+  if (style === 'raymarch' && !renderer.capabilities.isWebGL2) {
+    console.warn('WebGL2 not available — volumetric raymarch needs sampler3D, falling back to layered slices.');
+    $('sel-3d-style').value = 'layered';
+    style = 'layered';
+  }
+  if (style === 'layered') {
+    buildLayeredVolumeScene(vol);
+  } else {
+    try {
+      buildRaymarchVolumeScene(vol);
+    } catch (e) {
+      // WebGL2/sampler3D not available, or a shader failed to compile on
+      // this GPU/driver — fall back to the always-supported layered view
+      // rather than leaving a blank canvas.
+      console.warn('Volumetric raymarch render failed, falling back to layered slices:', e);
+      $('sel-3d-style').value = 'layered';
+      buildLayeredVolumeScene(vol);
+      setStatus('error', 'Volumetric rendering isn\'t supported on this browser/GPU — showing layered slices instead.');
+    }
+  }
   renderVolumeLegend(vol.colorscale, vol.zmin, vol.zmax, vol.units);
   ensure3dSceneSized();
 }
+
+let lastVolume = null;
 
 async function plotVolume() {
   const missionId = $('sel-mission').value;
@@ -573,6 +757,7 @@ async function plotVolume() {
   setStatus('loading', 'Fetching + slicing the whole level axis (first request for a file downloads and caches it server-side, may take a few seconds)…');
   try {
     const vol = await getJSON(`/v1/tdr/volume?${params.toString()}`);
+    lastVolume = vol;
     buildVolumeScene(vol);
     const info = $('info-bar');
     info.style.display = '';
@@ -759,6 +944,7 @@ $('sel-view').addEventListener('change', populateProducts);
 $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
 $('sel-composite-mode').addEventListener('change', applyViewVisibility);
+$('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
 $('btn-load').addEventListener('click', () => {
   const view = currentView();
   if (view === 'volume') plotVolume();

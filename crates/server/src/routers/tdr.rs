@@ -287,13 +287,15 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
 struct CompositeQuery {
     mission_id: String,
     level: Option<String>,
-    /// `xy` or `xy_rel`. `xy_rel` (storm-relative, fixed grid) is strongly
-    /// recommended for `mode=time` — see the handler doc comment.
+    /// `xy` or `xy_rel` — either works for `mode=time` now that alignment is
+    /// done by georeferenced offset rather than requiring identical grids;
+    /// `xy_rel` is still the physically cleaner choice since its wind fields
+    /// already have storm motion removed.
     product: String,
     field: String,
     /// `altitude`: max-value projection across every CAPPI level at one
     /// analysis time. `time`: max-value mosaic of one CAPPI level across
-    /// every analysis time in the mission.
+    /// every analysis time in the mission, aligned by storm center.
     mode: String,
     /// Required for `mode=altitude`, ignored for `mode=time`.
     analysis_time: Option<String>,
@@ -307,13 +309,17 @@ struct CompositeQuery {
 ///
 /// - `mode=altitude`: collapses one analysis time's whole level axis into a
 ///   single "composite reflectivity"-style plane (max value per x/y column).
-/// - `mode=time`: collapses one CAPPI level across *every* analysis time in
-///   the mission into a single plane (max value per x/y across the whole
-///   pass), i.e. a track mosaic. Only sound on a fixed grid, so this reads
-///   `xy_rel` (storm-relative) files — plain `xy` files are centered on the
-///   storm's position *at that analysis time*, so pixel (x,y) means a
-///   different earth location in each file and a mosaic would silently
-///   overlay unrelated locations.
+/// - `mode=time`: builds one big storm-centered mosaic out of one CAPPI
+///   level across *every* analysis time in the mission. Each file's grid is
+///   centered on wherever the storm was *at that analysis time*, so pixel
+///   (x,y) means a different earth location file-to-file — this reads each
+///   file's `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE` global attrs, converts them
+///   to a local km offset from the first file's origin
+///   ([`noaa_recon_core::sweep::latlon_offset_km`]), and forward-scatters
+///   every sweep onto one shared output grid sized to the union of all of
+///   them ([`noaa_recon_core::sweep::geo_mosaic`]) — literally "take the
+///   centers, align them" into one storm-spanning composite, not just a
+///   same-cell overlay.
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
     let conn = tdr::get_connection(&state.paths.tdr_db)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
@@ -354,9 +360,10 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 )));
             }
             let requested_z = q.z.unwrap_or(2.0);
-            let mut planes = Vec::with_capacity(files.len());
-            let mut grid: Option<(Vec<f32>, Vec<f32>)> = None;
-            let mut times_used = Vec::with_capacity(files.len());
+
+            // Read every analysis time's slice first (need them all in hand
+            // before we know the reference origin to offset the rest from).
+            let mut slices = Vec::with_capacity(files.len());
             for file in &files {
                 let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
                 let nc_path = tdr_nc::fetch_and_cache(&cache_dir, &file.source_url, &cache_key)
@@ -367,32 +374,46 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     .await
                     .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
                     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-                match &grid {
-                    None => grid = Some((slice.x.clone(), slice.y.clone())),
-                    Some((gx, gy)) if *gx == slice.x && *gy == slice.y => {}
-                    Some(_) => {
-                        // Grid mismatch (most often a plain `xy` file, whose
-                        // grid recenters on the storm every analysis time) —
-                        // skip rather than silently overlay unrelated pixels.
-                        continue;
-                    }
-                }
-                times_used.push(file.analysis_time.clone());
-                planes.push(slice.data);
+                slices.push((file.analysis_time.clone(), slice));
             }
-            let Some((x, y)) = grid else {
-                return Err(ApiError::internal("no usable analysis times for this mosaic".to_string()));
-            };
-            if times_used.len() < 2 {
+
+            // Skip any file missing an ORIGIN_LATITUDE/LONGITUDE — no anchor
+            // to align it by, so silently including it would mean guessing.
+            let mut usable: Vec<_> =
+                slices.iter().filter(|(_, s)| s.origin_lat.is_some() && s.origin_lon.is_some()).collect();
+            if usable.len() < 2 {
                 return Err(ApiError::bad_request(format!(
-                    "Only {} of {} analysis time(s) shared a common grid — a time mosaic needs at least 2. \
-                     Try product=xy_rel (storm-relative, fixed grid) instead of plain xy.",
-                    times_used.len(),
-                    files.len()
+                    "Only {} of {} analysis time(s) had an ORIGIN_LATITUDE/LONGITUDE to align by — \
+                     a time mosaic needs at least 2.",
+                    usable.len(),
+                    slices.len()
                 )));
             }
-            let data = noaa_recon_core::sweep::max_composite(&planes);
-            (mission, level, x, y, data, json!({"z_km": requested_z, "analysis_times_used": times_used}))
+            usable.sort_by(|a, b| a.0.cmp(&b.0));
+            let (lat0, lon0) = (usable[0].1.origin_lat.unwrap(), usable[0].1.origin_lon.unwrap());
+
+            let times_used: Vec<String> = usable.iter().map(|(t, _)| t.clone()).collect();
+            let planes: Vec<noaa_recon_core::sweep::GeoPlane> = usable
+                .iter()
+                .map(|(_, s)| {
+                    let (offset_x_km, offset_y_km) =
+                        noaa_recon_core::sweep::latlon_offset_km(s.origin_lat.unwrap(), s.origin_lon.unwrap(), lat0, lon0);
+                    noaa_recon_core::sweep::GeoPlane { x: &s.x, y: &s.y, data: &s.data, offset_x_km, offset_y_km }
+                })
+                .collect();
+            let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes);
+            (
+                mission,
+                level,
+                mosaic.x,
+                mosaic.y,
+                mosaic.data,
+                json!({
+                    "z_km": requested_z,
+                    "analysis_times_used": times_used,
+                    "reference_origin": {"lat": lat0, "lon": lon0},
+                }),
+            )
         }
         other => {
             return Err(ApiError::bad_request(format!("Unknown mode '{other}' — expected 'altitude' or 'time'.")));

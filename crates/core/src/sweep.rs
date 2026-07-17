@@ -124,6 +124,100 @@ pub fn vertical_profile_slice(flat: &[f32], nradius: usize, nheight: usize, miss
     out
 }
 
+/// Approximate local flat-earth offset (km) of `(lat, lon)` relative to a
+/// reference `(lat0, lon0)` — accurate enough for aligning TDR sweeps
+/// separated by tens to a couple hundred km (a single mission's track),
+/// not meant for anything requiring true geodesic distance.
+pub fn latlon_offset_km(lat: f32, lon: f32, lat0: f32, lon0: f32) -> (f32, f32) {
+    const KM_PER_DEG_LAT: f32 = 110.574;
+    const KM_PER_DEG_LON_AT_EQUATOR: f32 = 111.320;
+    let km_per_deg_lon = KM_PER_DEG_LON_AT_EQUATOR * lat0.to_radians().cos();
+    let dx = (lon - lon0) * km_per_deg_lon;
+    let dy = (lat - lat0) * KM_PER_DEG_LAT;
+    (dx, dy)
+}
+
+/// One sweep to be placed into a [`geo_mosaic`] — its own grid plus how far
+/// (km) that grid's origin sits from the mosaic's shared reference point
+/// (see [`latlon_offset_km`]).
+pub struct GeoPlane<'a> {
+    pub x: &'a [f32],
+    pub y: &'a [f32],
+    /// `data[yi][xi]`, same orientation as [`cappi_slice`].
+    pub data: &'a [Vec<Option<f32>>],
+    pub offset_x_km: f32,
+    pub offset_y_km: f32,
+}
+
+pub struct Mosaic {
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+    /// `data[yi][xi]`.
+    pub data: Vec<Vec<Option<f32>>>,
+}
+
+/// Forward-scatters several storm-centered sweeps, each shifted by its own
+/// (lat,lon)-derived offset from a shared reference point, onto one shared
+/// output grid — the "align by storm center, build one composite" mosaic
+/// backing `GET /v1/tdr/composite?mode=time`. Where two sweeps land on the
+/// same output cell, keeps the max value (same "composite reflectivity"
+/// convention as [`max_projection`]/[`max_composite`]).
+///
+/// Assumes every plane shares the same grid spacing (true for TDR's fixed
+/// analysis resolution) — spacing is read from the first plane. Returns an
+/// empty mosaic if `planes` is empty.
+pub fn geo_mosaic(planes: &[GeoPlane]) -> Mosaic {
+    let Some(first) = planes.first() else {
+        return Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
+    };
+    let dx_spacing = if first.x.len() >= 2 { (first.x[1] - first.x[0]).abs() } else { 1.0 };
+    let dy_spacing = if first.y.len() >= 2 { (first.y[1] - first.y[0]).abs() } else { 1.0 };
+
+    let (mut gx_min, mut gx_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut gy_min, mut gy_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in planes {
+        for &x in p.x {
+            gx_min = gx_min.min(x + p.offset_x_km);
+            gx_max = gx_max.max(x + p.offset_x_km);
+        }
+        for &y in p.y {
+            gy_min = gy_min.min(y + p.offset_y_km);
+            gy_max = gy_max.max(y + p.offset_y_km);
+        }
+    }
+    if !gx_min.is_finite() || !gy_min.is_finite() {
+        return Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
+    }
+
+    let nx_out = (((gx_max - gx_min) / dx_spacing).round() as usize) + 1;
+    let ny_out = (((gy_max - gy_min) / dy_spacing).round() as usize) + 1;
+    let x_out: Vec<f32> = (0..nx_out).map(|i| gx_min + i as f32 * dx_spacing).collect();
+    let y_out: Vec<f32> = (0..ny_out).map(|i| gy_min + i as f32 * dy_spacing).collect();
+    let mut data_out = vec![vec![None; nx_out]; ny_out];
+
+    for p in planes {
+        for (yi, y) in p.y.iter().enumerate() {
+            for (xi, x) in p.x.iter().enumerate() {
+                let Some(v) = p.data[yi][xi] else { continue };
+                let shifted_x = x + p.offset_x_km;
+                let shifted_y = y + p.offset_y_km;
+                let out_xi = ((shifted_x - gx_min) / dx_spacing).round();
+                let out_yi = ((shifted_y - gy_min) / dy_spacing).round();
+                if out_xi < 0.0 || out_yi < 0.0 {
+                    continue;
+                }
+                let (out_xi, out_yi) = (out_xi as usize, out_yi as usize);
+                if out_xi >= nx_out || out_yi >= ny_out {
+                    continue;
+                }
+                data_out[out_yi][out_xi] = Some(data_out[out_yi][out_xi].map_or(v, |b: f32| b.max(v)));
+            }
+        }
+    }
+
+    Mosaic { x: x_out, y: y_out, data: data_out }
+}
+
 /// A Plotly-style `[[fraction, hex], ...]` colorscale plus the physical
 /// value domain it maps to (`zmin`/`zmax`) — mirrors the same
 /// stops-plus-domain shape `/v1/satellite/colortable` already returns, so a
@@ -246,6 +340,43 @@ mod tests {
         let b = vec![vec![Some(2.0), Some(5.0)], vec![None, Some(1.0)]];
         let out = max_composite(&[a, b]);
         assert_eq!(out, vec![vec![Some(2.0), Some(5.0)], vec![Some(3.0), Some(4.0)]]);
+    }
+
+    #[test]
+    fn latlon_offset_km_is_zero_at_reference_and_scales_with_distance() {
+        let (dx, dy) = latlon_offset_km(25.0, -80.0, 25.0, -80.0);
+        assert!((dx).abs() < 1e-4 && (dy).abs() < 1e-4);
+
+        // 1 degree of latitude north -> ~110.6 km north (positive dy).
+        let (dx, dy) = latlon_offset_km(26.0, -80.0, 25.0, -80.0);
+        assert!((dy - 110.574).abs() < 0.01);
+        assert!(dx.abs() < 1e-4);
+    }
+
+    #[test]
+    fn geo_mosaic_aligns_and_max_composites_shifted_planes() {
+        // Two 1x1 planes on a 1km grid, second shifted +1km in x.
+        let x = [0.0f32, 1.0];
+        let y = [0.0f32];
+        let a = vec![vec![Some(3.0), None]];
+        let b = vec![vec![Some(5.0), Some(9.0)]];
+        let planes = vec![
+            GeoPlane { x: &x, y: &y, data: &a, offset_x_km: 0.0, offset_y_km: 0.0 },
+            GeoPlane { x: &x, y: &y, data: &b, offset_x_km: 1.0, offset_y_km: 0.0 },
+        ];
+        let mosaic = geo_mosaic(&planes);
+        // Combined x extent: plane a covers [0,1], plane b (shifted) covers [1,2] -> [0,1,2].
+        assert_eq!(mosaic.x, vec![0.0, 1.0, 2.0]);
+        assert_eq!(mosaic.y, vec![0.0]);
+        // col0 (x=0): only a's x=0 -> 3.0. col1 (x=1): a's x=1 (missing) + b's x=0 (5.0) -> 5.0.
+        // col2 (x=2): only b's x=1 -> 9.0.
+        assert_eq!(mosaic.data[0], vec![Some(3.0), Some(5.0), Some(9.0)]);
+    }
+
+    #[test]
+    fn geo_mosaic_empty_input_returns_empty() {
+        let mosaic = geo_mosaic(&[]);
+        assert!(mosaic.x.is_empty() && mosaic.y.is_empty() && mosaic.data.is_empty());
     }
 
     #[test]
