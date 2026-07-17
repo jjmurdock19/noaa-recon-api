@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TDR Data Dashboard — noaa-recon-api</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Browse and plot NOAA Tail Doppler Radar (TDR) missions served by noaa-recon-api: CAPPI horizontal slices and along-track vertical profiles.">
+<script>
+(function () {
+    try {
+        var t = localStorage.getItem('tdr-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+})();
+</script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --font-primary: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-code: ui-monospace, "SF Mono", Consolas, monospace;
+    --bg: #141414; --bg-panel: #1c1c1c; --bg-input: #232323; --bg-hover: #272727;
+    --border: #3a3a3a; --border-strong: #4d4d4d;
+    --text: #e8e8e8; --text-muted: #a0a0a0; --text-faint: #707070; --text-heading: #f5f5f5;
+    --accent: #6b8caf; --accent-strong: #4f6f93; --accent-strong-hover: #3d5873;
+    --accent-soft-bg: #23313c; --accent-soft-border: #3d5873;
+    --error: #f87171; --error-soft-bg: #3a1414; --error-soft-border: #5c2323;
+    --btn-neutral-bg: #2e2e2e; --btn-neutral-border: #474747; --btn-neutral-hover: #3c3c3c; --btn-neutral-text: #d4d4d4;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f5f5f5; --bg-panel: #ffffff; --bg-input: #f0f0f0; --bg-hover: #ececec;
+      --border: #d9d9d9; --border-strong: #bdbdbd;
+      --text: #262626; --text-muted: #6b6b6b; --text-faint: #999999; --text-heading: #141414;
+      --accent: #3d5873; --accent-strong: #3d5873; --accent-strong-hover: #2e4459;
+      --accent-soft-bg: #e3ebf2; --accent-soft-border: #b7c9d8;
+      --error: #dc2626; --error-soft-bg: #fee2e2; --error-soft-border: #fecaca;
+      --btn-neutral-bg: #e8e8e8; --btn-neutral-border: #cccccc; --btn-neutral-hover: #d8d8d8; --btn-neutral-text: #333333;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #141414; --bg-panel: #1c1c1c; --bg-input: #232323; --bg-hover: #272727;
+    --border: #3a3a3a; --border-strong: #4d4d4d;
+    --text: #e8e8e8; --text-muted: #a0a0a0; --text-faint: #707070; --text-heading: #f5f5f5;
+    --accent: #6b8caf; --accent-strong: #4f6f93; --accent-strong-hover: #3d5873;
+    --accent-soft-bg: #23313c; --accent-soft-border: #3d5873;
+    --error: #f87171; --error-soft-bg: #3a1414; --error-soft-border: #5c2323;
+    --btn-neutral-bg: #2e2e2e; --btn-neutral-border: #474747; --btn-neutral-hover: #3c3c3c; --btn-neutral-text: #d4d4d4;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f5f5f5; --bg-panel: #ffffff; --bg-input: #f0f0f0; --bg-hover: #ececec;
+    --border: #d9d9d9; --border-strong: #bdbdbd;
+    --text: #262626; --text-muted: #6b6b6b; --text-faint: #999999; --text-heading: #141414;
+    --accent: #3d5873; --accent-strong: #3d5873; --accent-strong-hover: #2e4459;
+    --accent-soft-bg: #e3ebf2; --accent-soft-border: #b7c9d8;
+    --error: #dc2626; --error-soft-bg: #fee2e2; --error-soft-border: #fecaca;
+    --btn-neutral-bg: #e8e8e8; --btn-neutral-border: #cccccc; --btn-neutral-hover: #d8d8d8; --btn-neutral-text: #333333;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: var(--font-primary); font-size: 13px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg-panel);
+  }
+  header h1 { font-size: 15px; margin: 0; color: var(--text-heading); }
+  header .sub { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
+  header .right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  label { display: block; font-size: 11px; color: var(--text-muted); margin: 0 0 3px; }
+  input, select, button {
+    font-family: inherit; font-size: 12px; color: var(--text);
+    background: var(--bg-input); border: 1px solid var(--border-strong);
+    border-radius: 3px; padding: 6px 8px;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+  button {
+    background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--accent-strong-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.neutral { background: var(--btn-neutral-bg); border-color: var(--btn-neutral-border); color: var(--btn-neutral-text); }
+  button.neutral:hover { background: var(--btn-neutral-hover); }
+  #api-base { width: 260px; }
+
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 0; min-height: calc(100vh - 57px); }
+  #controls {
+    padding: 16px; border-right: 1px solid var(--border); background: var(--bg-panel);
+    display: flex; flex-direction: column; gap: 14px; overflow-y: auto;
+  }
+  .field { display: flex; flex-direction: column; }
+  .field select, .field input { width: 100%; }
+  .field.hidden { display: none; }
+  #plot-area { padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  #plot { flex: 1; min-height: 480px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-panel); }
+  #info-bar {
+    display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--text-muted);
+    padding: 8px 12px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px;
+  }
+  #info-bar b { color: var(--text-heading); }
+  #status {
+    font-size: 12px; padding: 8px 12px; border-radius: 4px; display: none;
+  }
+  #status.error {
+    display: block; background: var(--error-soft-bg); border: 1px solid var(--error-soft-border); color: var(--error);
+  }
+  #status.loading {
+    display: block; background: var(--accent-soft-bg); border: 1px solid var(--accent-soft-border); color: var(--accent);
+  }
+  .empty-state {
+    display: flex; align-items: center; justify-content: center; height: 100%;
+    color: var(--text-faint); font-size: 13px; text-align: center; padding: 40px;
+  }
+  fieldset { border: 1px solid var(--border); border-radius: 4px; padding: 10px 12px 12px; margin: 0; }
+  legend { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); padding: 0 4px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>TDR Data Dashboard</h1>
+    <div class="sub">Tail Doppler Radar missions from <span id="api-base-label"></span></div>
+  </div>
+  <div class="right">
+    <div class="field">
+      <label for="api-base">API base URL</label>
+      <input id="api-base" type="text" value="https://joshmurdock.net/api" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="api-token">API token (only if the deployment requires one)</label>
+      <div style="display:flex; gap:4px">
+        <input id="api-token" type="password" placeholder="Bearer token" spellcheck="false" autocomplete="off" style="width:200px">
+        <button class="neutral" id="token-toggle" type="button" title="Show/hide token">👁</button>
+      </div>
+    </div>
+    <button class="neutral" id="theme-toggle" title="Cycle theme">Theme</button>
+  </div>
+</header>
+
+<main>
+  <div id="controls">
+    <fieldset>
+      <legend>Mission</legend>
+      <div class="field"><label for="sel-year">Year</label><select id="sel-year"><option>Loading…</option></select></div>
+      <div class="field" style="margin-top:8px"><label for="sel-storm">Storm</label><select id="sel-storm" disabled><option>—</option></select></div>
+      <div class="field" style="margin-top:8px"><label for="sel-mission">Mission</label><select id="sel-mission" disabled><option>—</option></select></div>
+    </fieldset>
+
+    <fieldset id="fs-product" style="display:none">
+      <legend>Product</legend>
+      <div class="row">
+        <div class="field"><label for="sel-level">Level</label><select id="sel-level"></select></div>
+        <div class="field"><label for="sel-product">Product</label><select id="sel-product"></select></div>
+      </div>
+      <div class="field" style="margin-top:8px"><label for="sel-time">Analysis time (UTC)</label><select id="sel-time"></select></div>
+      <div class="field" style="margin-top:8px"><label for="sel-field">Field</label><select id="sel-field"></select></div>
+      <div class="field" id="field-z" style="margin-top:8px">
+        <label for="inp-z">CAPPI altitude (km)</label>
+        <input id="inp-z" type="number" step="0.5" min="0" max="18" value="2.0">
+      </div>
+      <button id="btn-load" style="margin-top:12px; width:100%">Plot sweep</button>
+    </fieldset>
+
+    <div style="font-size:11px; color:var(--text-faint); line-height:1.5;">
+      3D volumetric viewing isn't available yet — this dashboard plots one 2D
+      slice at a time (a horizontal CAPPI or the along-track vertical
+      profile). See the <a href="https://github.com/jjmurdock19/noaa-recon-api" target="_blank" rel="noopener">noaa-recon-api</a>
+      README for the raw-netCDF passthrough roadmap item.
+    </div>
+  </div>
+
+  <div id="plot-area">
+    <div id="status"></div>
+    <div id="info-bar" style="display:none"></div>
+    <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
+  </div>
+</main>
+
+<script>
+'use strict';
+
+const XY_FIELDS = [
+  ['reflectivity', 'Reflectivity (dBZ)'],
+  ['radial_wind', 'Radial wind'],
+  ['tangential_wind', 'Tangential wind'],
+  ['wind_speed', 'Wind speed'],
+  ['u', 'U (east-west wind)'],
+  ['v', 'V (north-south wind)'],
+  ['w', 'W (vertical velocity)'],
+  ['vort', 'Vorticity'],
+];
+const VERT_FIELDS = [
+  ['reflectivity', 'Reflectivity (dBZ)'],
+  ['radial_wind', 'Radial wind'],
+  ['tangential_wind', 'Tangential wind'],
+  ['wind_speed', 'Wind speed'],
+];
+
+const $ = (id) => document.getElementById(id);
+const apiBaseInput = $('api-base');
+const apiBaseLabel = $('api-base-label');
+const apiTokenInput = $('api-token');
+const statusEl = $('status');
+
+function apiBase() {
+  return apiBaseInput.value.trim().replace(/\/$/, '');
+}
+
+function setStatus(kind, msg) {
+  statusEl.className = kind || '';
+  statusEl.textContent = msg || '';
+}
+
+async function getJSON(path) {
+  const url = apiBase() + path;
+  const token = apiTokenInput.value.trim();
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const res = await fetch(url, { headers });
+  let body;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    let detail = (body && body.detail) ? body.detail : `HTTP ${res.status}`;
+    if (res.status === 401) detail += ' — check the API token field.';
+    throw new Error(detail);
+  }
+  return body;
+}
+
+function fillSelect(sel, items, placeholder) {
+  sel.innerHTML = '';
+  if (placeholder) {
+    const opt = document.createElement('option');
+    opt.textContent = placeholder;
+    opt.disabled = true;
+    opt.selected = true;
+    sel.appendChild(opt);
+  }
+  for (const it of items) {
+    const opt = document.createElement('option');
+    if (Array.isArray(it)) { opt.value = it[0]; opt.textContent = it[1]; }
+    else { opt.value = it; opt.textContent = it; }
+    sel.appendChild(opt);
+  }
+}
+
+// ── Cascading mission pickers ────────────────────────────────────────────
+
+async function loadYears() {
+  const selYear = $('sel-year');
+  fillSelect(selYear, [], 'Loading…');
+  try {
+    const data = await getJSON('/v1/tdr/years');
+    const years = (data.years || []).slice().sort((a, b) => b - a);
+    if (years.length === 0) { fillSelect(selYear, [], 'No years indexed yet'); return; }
+    fillSelect(selYear, years, 'Choose a year…');
+  } catch (e) {
+    fillSelect(selYear, [], 'Failed to load');
+    setStatus('error', `Couldn't reach ${apiBase()}: ${e.message}`);
+  }
+}
+
+async function loadStorms(year) {
+  const selStorm = $('sel-storm');
+  const selMission = $('sel-mission');
+  selMission.disabled = true;
+  fillSelect(selMission, [], '—');
+  selStorm.disabled = true;
+  fillSelect(selStorm, [], 'Loading…');
+  $('fs-product').style.display = 'none';
+  try {
+    const data = await getJSON(`/v1/tdr/${year}`);
+    const storms = (data.storms || []).slice().sort((a, b) => b.mission_count - a.mission_count);
+    fillSelect(selStorm, storms.map(s => [s.storm_name, `${s.storm_name} (${s.mission_count})`]), 'Choose a storm…');
+    selStorm.disabled = false;
+  } catch (e) {
+    fillSelect(selStorm, [], 'Failed to load');
+    setStatus('error', e.message);
+  }
+}
+
+async function loadMissions(year, stormName) {
+  const selMission = $('sel-mission');
+  selMission.disabled = true;
+  fillSelect(selMission, [], 'Loading…');
+  $('fs-product').style.display = 'none';
+  try {
+    const data = await getJSON(`/v1/tdr/${year}/${encodeURIComponent(stormName)}`);
+    const missions = data.missions || [];
+    fillSelect(selMission, missions.map(m => {
+      const levels = [m.has_level1b ? '1b' : null, m.has_level2 ? '2' : null].filter(Boolean).join('+');
+      return [m.mission_id, `${m.mission_id} — ${m.aircraft || 'unknown aircraft'} [${levels}]`];
+    }), 'Choose a mission…');
+    selMission.disabled = false;
+  } catch (e) {
+    fillSelect(selMission, [], 'Failed to load');
+    setStatus('error', e.message);
+  }
+}
+
+let missionFiles = []; // flat list of {level, product, format, analysis_time, storm_relative, fall_speed_removed}
+
+async function loadMissionFiles(missionId) {
+  $('fs-product').style.display = 'none';
+  try {
+    const data = await getJSON(`/v1/tdr/mission/${encodeURIComponent(missionId)}`);
+    missionFiles = (data.files || []).filter(f => f.format === 'nc' && (f.product === 'xy' || f.product.startsWith('xy_') || f.product.startsWith('vert_')));
+    if (missionFiles.length === 0) {
+      setStatus('error', `Mission ${missionId} has no plottable (netCDF) product files indexed.`);
+      return;
+    }
+    setStatus(null, '');
+    populateLevels();
+    $('fs-product').style.display = '';
+  } catch (e) {
+    setStatus('error', e.message);
+  }
+}
+
+function distinct(arr) { return Array.from(new Set(arr)); }
+
+function populateLevels() {
+  const levels = distinct(missionFiles.map(f => f.level)).sort(); // "1b" < "2"
+  const selLevel = $('sel-level');
+  const labels = { '1b': 'Level 1b (real-time)', '2': 'Level 2 (post-season, QC\'d)' };
+  fillSelect(selLevel, levels.map(l => [l, labels[l] || l]));
+  if (levels.includes('2')) selLevel.value = '2';
+  populateProducts();
+}
+
+function populateProducts() {
+  const level = $('sel-level').value;
+  const products = distinct(missionFiles.filter(f => f.level === level).map(f => f.product)).sort();
+  fillSelect($('sel-product'), products);
+  populateTimes();
+}
+
+function populateTimes() {
+  const level = $('sel-level').value;
+  const product = $('sel-product').value;
+  const times = distinct(missionFiles.filter(f => f.level === level && f.product === product).map(f => f.analysis_time)).sort();
+  fillSelect($('sel-time'), times);
+  populateFields();
+}
+
+function populateFields() {
+  const product = $('sel-product').value;
+  const isVert = product.startsWith('vert_');
+  fillSelect($('sel-field'), isVert ? VERT_FIELDS : XY_FIELDS);
+  $('field-z').classList.toggle('hidden', isVert);
+}
+
+// ── Plotting ─────────────────────────────────────────────────────────────
+
+async function plotSweep() {
+  const missionId = $('sel-mission').value;
+  const level = $('sel-level').value;
+  const product = $('sel-product').value;
+  const analysisTime = $('sel-time').value;
+  const field = $('sel-field').value;
+  const isVert = product.startsWith('vert_');
+  const btn = $('btn-load');
+
+  const params = new URLSearchParams({ mission_id: missionId, level, product, analysis_time: analysisTime, field });
+  if (!isVert) params.set('z', $('inp-z').value || '2.0');
+
+  btn.disabled = true;
+  setStatus('loading', 'Fetching + slicing (first request for a file downloads and caches it server-side, may take a few seconds)…');
+  try {
+    const sweep = await getJSON(`/v1/tdr/sweep?${params.toString()}`);
+    render(sweep, isVert);
+    setStatus(null, '');
+  } catch (e) {
+    setStatus('error', e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+let lastSweep = null;
+let lastIsVert = false;
+
+function render(sweep, isVert) {
+  lastSweep = sweep;
+  lastIsVert = isVert;
+  const info = $('info-bar');
+  info.style.display = '';
+  info.innerHTML = `
+    <span>Storm: <b>${sweep.storm_name || '—'}</b></span>
+    <span>Mission: <b>${sweep.mission_id}</b></span>
+    <span>Level: <b>${sweep.level}</b></span>
+    <span>Product: <b>${sweep.product}</b></span>
+    <span>Analysis time: <b>${sweep.analysis_time}Z</b></span>
+    <span>Field: <b>${sweep.field}</b> (${sweep.units})</span>
+    ${sweep.z_km != null ? `<span>Altitude: <b>${sweep.z_km} km</b></span>` : ''}
+    ${sweep.origin_lat != null ? `<span>Origin: <b>${sweep.origin_lat.toFixed(2)}, ${sweep.origin_lon.toFixed(2)}</b></span>` : ''}
+  `;
+
+  const trace = {
+    type: 'heatmap',
+    x: sweep.x,
+    y: sweep.y,
+    z: sweep.data,
+    zmin: sweep.zmin,
+    zmax: sweep.zmax,
+    colorscale: sweep.colorscale,
+    colorbar: { title: { text: sweep.units, side: 'right' } },
+    hovertemplate: isVert
+      ? 'radius %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + sweep.units + '<extra></extra>'
+      : 'x %{x:.0f} km<br>y %{y:.0f} km<br>%{z:.1f} ' + sweep.units + '<extra></extra>',
+  };
+
+  const isDark = getEffectiveTheme() === 'dark';
+  const fg = isDark ? '#e8e8e8' : '#262626';
+  const grid = isDark ? '#3a3a3a' : '#d9d9d9';
+  const paper = isDark ? '#1c1c1c' : '#ffffff';
+
+  const layout = {
+    paper_bgcolor: paper,
+    plot_bgcolor: paper,
+    font: { color: fg, family: 'inherit', size: 12 },
+    margin: { l: 60, r: 20, t: 10, b: 50 },
+    xaxis: {
+      title: isVert ? 'Along-track radius (km)' : 'km E/W of storm center',
+      gridcolor: grid, zerolinecolor: grid,
+    },
+    yaxis: {
+      title: isVert ? 'Height (km)' : 'km N/S of storm center',
+      gridcolor: grid, zerolinecolor: grid,
+      scaleanchor: isVert ? undefined : 'x',
+    },
+  };
+
+  Plotly.newPlot('plot', [trace], layout, { responsive: true, displaylogo: false });
+}
+
+// ── Theme toggle (auto -> dark -> light -> auto) ─────────────────────────
+
+function getEffectiveTheme() {
+  const explicit = document.documentElement.getAttribute('data-theme');
+  if (explicit) return explicit;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function cycleTheme() {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : current === 'light' ? null : 'dark';
+  if (next) document.documentElement.setAttribute('data-theme', next);
+  else document.documentElement.removeAttribute('data-theme');
+  try { localStorage.setItem('tdr-theme', next || 'auto'); } catch (e) {}
+  if (lastSweep) render(lastSweep, lastIsVert);
+}
+
+// ── Wiring ────────────────────────────────────────────────────────────────
+
+$('theme-toggle').addEventListener('click', cycleTheme);
+
+apiBaseInput.addEventListener('change', () => {
+  try { localStorage.setItem('tdr-api-base', apiBaseInput.value); } catch (e) {}
+  apiBaseLabel.textContent = apiBase();
+  loadYears();
+});
+
+apiTokenInput.addEventListener('change', () => {
+  try {
+    if (apiTokenInput.value) localStorage.setItem('tdr-api-token', apiTokenInput.value);
+    else localStorage.removeItem('tdr-api-token');
+  } catch (e) {}
+});
+
+$('token-toggle').addEventListener('click', () => {
+  apiTokenInput.type = apiTokenInput.type === 'password' ? 'text' : 'password';
+});
+
+$('sel-year').addEventListener('change', (e) => loadStorms(e.target.value));
+$('sel-storm').addEventListener('change', (e) => loadMissions($('sel-year').value, e.target.value));
+$('sel-mission').addEventListener('change', (e) => loadMissionFiles(e.target.value));
+$('sel-level').addEventListener('change', populateProducts);
+$('sel-product').addEventListener('change', populateTimes);
+$('btn-load').addEventListener('click', plotSweep);
+
+(function init() {
+  try {
+    const savedBase = localStorage.getItem('tdr-api-base');
+    if (savedBase) apiBaseInput.value = savedBase;
+    const savedToken = localStorage.getItem('tdr-api-token');
+    if (savedToken) apiTokenInput.value = savedToken;
+  } catch (e) {}
+  apiBaseLabel.textContent = apiBase();
+  loadYears();
+})();
+</script>
+</body>
+</html>

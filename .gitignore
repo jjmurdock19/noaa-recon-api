@@ -10,6 +10,3 @@ data/
 .DS_Store
 admin_credentials.json
 auth_config.json
-
-# Built-in Dashboard for testing TDR
-clients/tdr-dashboard
