@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::auth::{self, Session};
 use crate::error::{ApiError, ApiResult};
 use crate::services::cache::ResultCache;
-use crate::services::{goes, recon_met, storms, tokens};
+use crate::services::{goes, recon_met, storms, tdr, tokens};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -140,10 +140,13 @@ async fn status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResul
     let storm_count: i64 = storms_conn.query_row("SELECT COUNT(*) FROM storms", [], |r| r.get(0))?;
     let recon_conn = recon_met::get_connection(&state.paths.recon_met_db)?;
     let mission_count: i64 = recon_conn.query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))?;
+    let tdr_conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let tdr_mission_count: i64 = tdr_conn.query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))?;
 
     let storms_bytes = file_bytes(&state.paths.storms_db);
     let recon_bytes = file_bytes(&state.paths.recon_met_db);
-    let db_total = storms_bytes + recon_bytes;
+    let tdr_bytes = file_bytes(&state.paths.tdr_db);
+    let db_total = storms_bytes + recon_bytes + tdr_bytes;
 
     Ok(Json(json!({
         "healthy": true,
@@ -155,6 +158,7 @@ async fn status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResul
         "databases": {
             "storms": { "bytes": storms_bytes, "storm_count": storm_count },
             "recon_met": { "bytes": recon_bytes, "mission_count": mission_count },
+            "tdr": { "bytes": tdr_bytes, "mission_count": tdr_mission_count },
             "total_bytes": db_total,
         },
         "grand_total_bytes": cache_total + db_total,

@@ -438,6 +438,10 @@
           <button class="primary-btn" id="reconmet-update-btn">Force update: Recon MET</button>
           <span class="status-text" id="reconmet-update-status"></span>
         </div>
+        <div class="row">
+          <button class="primary-btn" id="tdr-update-btn">Force update: TDR</button>
+          <span class="status-text" id="tdr-update-status"></span>
+        </div>
 
         <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
@@ -961,6 +965,7 @@ async function refreshStatus() {
         ['Raw netCDF', `${data.cache.goes_nc.file_count} files`, fmtBytes(data.cache.goes_nc.bytes)],
         ['Storm tracks DB', `${data.databases.storms.storm_count} storms`, fmtBytes(data.databases.storms.bytes)],
         ['Recon MET DB', `${data.databases.recon_met.mission_count} missions`, fmtBytes(data.databases.recon_met.bytes)],
+        ['TDR DB', `${data.databases.tdr.mission_count} missions`, fmtBytes(data.databases.tdr.bytes)],
         ['Grand total', '', fmtBytes(data.grand_total_bytes)],
     ];
     document.getElementById('status-cards').innerHTML = cards.map(([label, sub, value]) => `
@@ -973,6 +978,7 @@ async function refreshStatus() {
     const dbCards = [
         ['Storm tracks', `${data.databases.storms.storm_count} storms`, fmtBytes(data.databases.storms.bytes)],
         ['Recon MET missions', `${data.databases.recon_met.mission_count} missions`, fmtBytes(data.databases.recon_met.bytes)],
+        ['TDR missions', `${data.databases.tdr.mission_count} missions`, fmtBytes(data.databases.tdr.bytes)],
     ];
     document.getElementById('db-stat-cards').innerHTML = dbCards.map(([label, sub, value]) => `
         <div class="stat-card">
@@ -1780,6 +1786,11 @@ function fmtArchiveSummary(archive, summary) {
     if (archive === 'storms') {
         return `${summary.total_storms} storms total`;
     }
+    if (archive === 'tdr') {
+        return `${summary.ingested_level1b} L1b + ${summary.ingested_level2} L2 ingested, ` +
+            `${summary.skipped} unchanged, ${summary.errors} errors, ` +
+            `${summary.total_missions} missions / ${summary.total_files} files total`;
+    }
     return `${summary.ingested} ingested, ${summary.skipped} unchanged, ${summary.errors} errors, ${summary.total_missions} missions total`;
 }
 
@@ -1834,6 +1845,9 @@ document.getElementById('storms-update-btn').addEventListener('click', () => {
 });
 document.getElementById('reconmet-update-btn').addEventListener('click', () => {
     startArchiveUpdate('recon_met', 'reconmet-update-btn', 'reconmet-update-status');
+});
+document.getElementById('tdr-update-btn').addEventListener('click', () => {
+    startArchiveUpdate('tdr', 'tdr-update-btn', 'tdr-update-status');
 });
 
 // ── Database viewer — browse storms/recon MET by year -> storm ─────────

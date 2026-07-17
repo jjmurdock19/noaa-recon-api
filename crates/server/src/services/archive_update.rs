@@ -1,16 +1,19 @@
 //! Backs the console's "Force update: Storm Tracks" / "Force update: Recon
-//! MET" buttons — runs the already-ported `storms::run_ingest` /
-//! `recon_ingest::run_ingest` as a detached background job and exposes its
-//! status for polling, the same job-state pattern as `self_update`.
+//! MET" / "Force update: TDR" buttons — runs the already-ported
+//! `storms::run_ingest` / `recon_ingest::run_ingest` / `tdr_ingest::run_ingest`
+//! as a detached background job and exposes its status for polling, the same
+//! job-state pattern as `self_update`.
 //!
 //! "Force" refers only to bypassing the *console's own* re-click guard
-//! (`is_running`) — it does not mean "reprocess everything". Both ingest
+//! (`is_running`) — it does not mean "reprocess everything". All three ingest
 //! functions are already incremental: `recon_ingest::harvest_mission` skips a
-//! mission whose `nc_version` hasn't changed, and `storms::ingest_atcf_season`
-//! only fetches seasons after `max_year_for_basin`. This module always calls
-//! them with `force: false`, matching the CLI's default (`ingest-recon`
-//! without `--force`); a full reprocess is only ever a deliberate `--force`
-//! CLI run, never a console click.
+//! mission whose `nc_version` hasn't changed, `storms::ingest_atcf_season`
+//! only fetches seasons after `max_year_for_basin`, and `tdr_ingest` skips a
+//! mission already indexed at the requested level unless forced. This module
+//! always calls them with `force: false` and (for recon/tdr) `years: None`,
+//! matching each CLI's default (`ingest-recon`/`ingest-tdr` with no
+//! `--force`/`--full`); a full reprocess or deep historical backfill is only
+//! ever a deliberate CLI run, never a console click.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,15 +33,20 @@ fn idle_job() -> Value {
 }
 
 /// Shared archive-update job state, held in `AppState`. One slot per archive
-/// (`storms`, `recon_met`) so the two updates can run independently.
+/// (`storms`, `recon_met`, `tdr`) so updates can run independently.
 pub struct ArchiveUpdateState {
     storms: Mutex<Value>,
     recon_met: Mutex<Value>,
+    tdr: Mutex<Value>,
 }
 
 impl Default for ArchiveUpdateState {
     fn default() -> Self {
-        Self { storms: Mutex::new(idle_job()), recon_met: Mutex::new(idle_job()) }
+        Self {
+            storms: Mutex::new(idle_job()),
+            recon_met: Mutex::new(idle_job()),
+            tdr: Mutex::new(idle_job()),
+        }
     }
 }
 
@@ -47,12 +55,13 @@ impl ArchiveUpdateState {
         match archive {
             "storms" => Some(&self.storms),
             "recon_met" => Some(&self.recon_met),
+            "tdr" => Some(&self.tdr),
             _ => None,
         }
     }
 
     fn is_known_archive(archive: &str) -> bool {
-        matches!(archive, "storms" | "recon_met")
+        matches!(archive, "storms" | "recon_met" | "tdr")
     }
 
     pub fn job(&self, archive: &str) -> Option<Value> {
@@ -125,6 +134,14 @@ pub fn start(state: &Arc<ArchiveUpdateState>, paths: &Arc<Paths>, archive: &str)
                 tokio::runtime::Handle::current().block_on(run_recon(state, recon_db, storms_db));
             });
         }
+        "tdr" => {
+            let state = state.clone();
+            let tdr_db = paths.tdr_db.clone();
+            let recon_db = paths.recon_met_db.clone();
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(run_tdr(state, tdr_db, recon_db));
+            });
+        }
         _ => unreachable!(),
     }
     Some(snapshot)
@@ -140,4 +157,15 @@ async fn run_recon(state: Arc<ArchiveUpdateState>, recon_db: PathBuf, storms_db:
         .await
         .map_err(|e| e.to_string());
     state.finish("recon_met", result);
+}
+
+/// `years: None` defaults to [current-1, current] — same shallow-ingest
+/// convention as the CLI's `ingest-tdr` with no `--years`/`--full`. A deeper
+/// historical backfill is a deliberate `ingest-tdr --full` CLI run, not a
+/// console click — see the module doc comment.
+async fn run_tdr(state: Arc<ArchiveUpdateState>, tdr_db: PathBuf, recon_db: PathBuf) {
+    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, &recon_db, None, false)
+        .await
+        .map_err(|e| e.to_string());
+    state.finish("tdr", result);
 }
