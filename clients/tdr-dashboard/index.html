@@ -164,7 +164,7 @@
     </fieldset>
 
     <fieldset id="fs-product" style="display:none">
-      <legend>Product</legend>
+      <legend>Product <button type="button" id="product-help-btn" class="neutral" title="What do these products mean?" style="padding:1px 8px; margin-left:4px; border-radius:50%; font-weight:bold;">?</button></legend>
       <div class="field"><label for="sel-view">View</label>
         <select id="sel-view">
           <option value="sweep">2D sweep (CAPPI / vertical profile)</option>
@@ -196,6 +196,10 @@
           <option value="layered">Layered slices (compatibility fallback)</option>
         </select>
       </div>
+      <div class="field" id="field-smoothing" style="margin-top:8px">
+        <label for="inp-smoothing">Smoothing (<span id="smoothing-value">0</span> passes)</label>
+        <input id="inp-smoothing" type="range" min="0" max="3" step="1" value="0" style="width:100%;">
+      </div>
       <button id="btn-load" style="margin-top:12px; width:100%">Plot sweep</button>
     </fieldset>
 
@@ -210,10 +214,51 @@
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
     <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
       <canvas id="plot3d-canvas" style="width:100%; height:100%; display:block;"></canvas>
-      <div id="plot3d-legend" style="position:absolute; top:10px; right:10px; display:flex; flex-direction:column; align-items:center; gap:4px; background:rgba(0,0,0,0.35); border-radius:4px; padding:8px 6px; font-size:10px; color:#fff;"></div>
+      <div id="plot3d-legend" style="position:absolute; top:10px; right:10px; display:flex; flex-direction:column; align-items:center; gap:4px; background:rgba(20,20,20,0.7); border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:10px 8px; font-size:10px; color:#fff;"></div>
+      <div id="opacity-editor-panel" style="position:absolute; bottom:12px; left:12px; background:rgba(20,20,20,0.82); border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:10px; font-size:11px; color:#f0f0f0; width:280px; box-shadow:0 2px 10px rgba(0,0,0,0.4);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-weight:600;">Transparency table</span>
+          <button type="button" id="opacity-reset-btn" class="neutral" style="padding:2px 8px; font-size:10px;">Reset</button>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <div style="writing-mode:vertical-rl; transform:rotate(180deg); font-size:9px; color:#aaa; text-align:center; padding:2px 0;">opacity</div>
+          <div style="flex:1;">
+            <canvas id="opacity-editor-canvas" width="270" height="110" style="display:block; width:100%; height:110px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:3px; cursor:crosshair; touch-action:none;"></canvas>
+            <div style="display:flex; justify-content:space-between; color:#999; margin-top:3px; font-size:9px;">
+              <span id="opacity-min-label">low value</span>
+              <span style="color:#777;">value →</span>
+              <span id="opacity-max-label">high value</span>
+            </div>
+          </div>
+        </div>
+        <div style="font-size:9px; color:#888; margin-top:2px;">Drag the dots to change how opaque each value renders — pull the low end down to see through weak returns into the core.</div>
+        <label style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+          <span style="white-space:nowrap; font-size:10px;">Overall opacity</span>
+          <input type="range" id="opacity-overall" min="0.1" max="3" step="0.05" value="1.6" style="flex:1;">
+        </label>
+      </div>
+    </div>
+    <div id="satellite-panel" style="display:none; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); padding:12px;">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <b style="font-size:12px;">Satellite overlay</b>
+        <span style="font-size:11px; color:var(--text-muted);">GOES Band 13 (Clean IR), centered on the storm at the plotted time</span>
+        <button id="btn-load-satellite" class="neutral" style="margin-left:auto;">Load Band 13 image</button>
+      </div>
+      <div id="satellite-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
+      <img id="satellite-img" style="display:none; margin-top:8px; max-width:100%; border-radius:4px; border:1px solid var(--border);">
     </div>
   </div>
 </main>
+
+<div id="help-modal-backdrop" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100; align-items:center; justify-content:center;">
+  <div id="help-modal" style="background:var(--bg-panel); border:1px solid var(--border); border-radius:6px; max-width:640px; width:92%; max-height:80vh; overflow-y:auto; padding:20px 24px; box-shadow:0 8px 30px rgba(0,0,0,0.4);">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <h2 style="margin:0; font-size:16px; color:var(--text-heading);">TDR products explained</h2>
+      <button type="button" id="help-modal-close" class="neutral" style="padding:4px 10px;">Close</button>
+    </div>
+    <div style="font-size:12px; line-height:1.6; color:var(--text);" id="help-modal-body"></div>
+  </div>
+</div>
 
 <script type="module">
 'use strict';
@@ -368,6 +413,51 @@ const VIEW_HINTS = {
   composite: 'Composite flattens a mission into one image: "Altitude max-projection" collapses one analysis time’s whole level axis (like classic composite reflectivity); "Time mosaic" aligns every analysis time by its storm center (ORIGIN_LATITUDE/LONGITUDE) and mosaics one CAPPI level into a single storm-spanning composite — works for either xy or xy_rel.',
 };
 
+// ── Product help modal ───────────────────────────────────────────────────
+
+const PRODUCT_HELP_HTML = `
+<p><b>xy</b> — the horizontal Cartesian analysis grid: reflectivity and Doppler-derived
+wind fields (u, v, w, vorticity, wind speed, radial/tangential wind) on a fixed x/y grid
+at multiple CAPPI altitude levels. Centered on the storm's position <i>at that specific
+analysis time</i>, so the grid's earth location shifts from one analysis time to the next
+as the storm moves. This is what powers the 2D CAPPI slice and the 3D volume view.</p>
+<p><b>xy_rel</b> — the storm-relative version of <b>xy</b>: wind fields have the storm's
+own translational motion subtracted out, isolating the storm's internal circulation from
+its movement across the map. Recommended for the "time mosaic" composite, since removing
+storm motion from the wind fields is physically the cleaner choice when combining many
+analysis times (though both work — the mosaic aligns by each file's actual origin
+coordinates either way).</p>
+<p><b>vert_inbound / vert_outbound</b> — a single vertical cross-section (radius vs.
+height) along the aircraft's inbound or outbound leg through the storm center. This is
+what the 2D "vertical profile" view plots. There's no altitude axis here, so these
+aren't selectable for the 3D volume view or the altitude-composite mode.</p>
+<p><b>_rel suffix</b> (on vert products) — same idea as xy_rel: storm motion removed
+from the wind fields.</p>
+<p><b>_fall suffix</b> — fall-speed (the precipitation's own terminal velocity) removed
+from the vertical-velocity field, isolating actual air motion (updrafts/downdrafts) from
+the radar's raw Doppler vertical velocity, which otherwise conflates the two.</p>
+<p><b>Level 1b vs. Level 2</b> — Level 1b is real-time data as processed during the
+flight, available immediately. Level 2 is the post-season, quality-controlled reanalysis
+— prefer it when a mission has both.</p>
+<p><b>CAPPI altitude</b> — picks one horizontal slice at a specific altitude out of the
+xy volume, for the 2D sweep view.</p>
+<p><b>Composite — altitude max-projection</b> — collapses one analysis time's whole
+altitude column into one image (the classic "composite reflectivity" convention: the
+max value at each x/y point across every level).</p>
+<p><b>Composite — time mosaic</b> — aligns every analysis time in the mission by its
+storm center and mosaics one altitude level into a single image spanning the whole
+flight track, not just one sweep's footprint.</p>
+`;
+
+function openHelpModal() {
+  $('help-modal-body').innerHTML = PRODUCT_HELP_HTML;
+  $('help-modal-backdrop').style.display = 'flex';
+}
+
+function closeHelpModal() {
+  $('help-modal-backdrop').style.display = 'none';
+}
+
 function currentView() { return $('sel-view').value; }
 
 function isVolumeCapableProduct(product) { return product === 'xy' || product.startsWith('xy_'); }
@@ -418,6 +508,7 @@ function applyViewVisibility() {
   const needsZ = (view === 'sweep' && !isVert) || (view === 'composite' && compositeMode === 'time');
   $('field-z').classList.toggle('hidden', !needsZ);
   $('field-3d-style').classList.toggle('hidden', view !== 'volume');
+  $('field-smoothing').classList.toggle('hidden', view !== 'volume');
 
   const labels = { sweep: 'Plot sweep', volume: 'Load 3D volume', composite: 'Load composite' };
   $('btn-load').textContent = labels[view] || 'Plot';
@@ -438,14 +529,16 @@ function hexToRgb(hex) {
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
-// Maps a physical value to an [r,g,b,a] color using a Plotly-shaped
-// [[fraction, hex], ...] colorscale stop list plus its [zmin, zmax] domain.
-// Alpha scales with the normalized value itself (faint returns stay hazy,
-// strong returns approach opaque) so the raymarcher renders a solid-looking
-// core with soft edges rather than a uniform haze.
-function colorForValue(value, stops, zmin, zmax) {
-  if (value == null || Number.isNaN(value)) return [0, 0, 0, 0];
-  const t = zmax > zmin ? Math.min(1, Math.max(0, (value - zmin) / (zmax - zmin))) : 0;
+// Normalized [0,1] position of `value` within [zmin, zmax], or null for
+// missing data.
+function normalizeT(value, zmin, zmax) {
+  if (value == null || Number.isNaN(value)) return null;
+  return zmax > zmin ? Math.min(1, Math.max(0, (value - zmin) / (zmax - zmin))) : 0;
+}
+
+// Interpolates a Plotly-shaped [[fraction, hex], ...] colorscale at
+// normalized position `t` -> [r,g,b] (0-255 each).
+function interpolateColorRgb(t, stops) {
   let lo = stops[0], hi = stops[stops.length - 1];
   for (let i = 0; i < stops.length - 1; i++) {
     if (t >= stops[i][0] && t <= stops[i + 1][0]) { lo = stops[i]; hi = stops[i + 1]; break; }
@@ -454,8 +547,17 @@ function colorForValue(value, stops, zmin, zmax) {
   const localT = span > 0 ? (t - lo[0]) / span : 0;
   const [r1, g1, b1] = hexToRgb(lo[1]);
   const [r2, g2, b2] = hexToRgb(hi[1]);
-  const alpha = Math.round(30 + 205 * t);
-  return [Math.round(lerp(r1, r2, localT)), Math.round(lerp(g1, g2, localT)), Math.round(lerp(b1, b2, localT)), alpha];
+  return [Math.round(lerp(r1, r2, localT)), Math.round(lerp(g1, g2, localT)), Math.round(lerp(b1, b2, localT))];
+}
+
+// Maps a physical value to an [r,g,b,a] color — used only by the
+// layered-slices fallback, which bakes a fixed value->opacity ramp straight
+// into each level's texture (no live transfer-function editing there).
+function colorForValue(value, stops, zmin, zmax) {
+  const t = normalizeT(value, zmin, zmax);
+  if (t == null) return [0, 0, 0, 0];
+  const [r, g, b] = interpolateColorRgb(t, stops);
+  return [r, g, b, Math.round(30 + 205 * t)];
 }
 
 // ── 3D volume viewer (Three.js) ─────────────────────────────────────────
@@ -555,7 +657,9 @@ void main() {
 const VOLUME_FRAGMENT_SHADER = `
 precision highp float;
 precision highp sampler3D;
+precision highp sampler2D;
 uniform sampler3D map;
+uniform sampler2D opacityLUT;
 uniform float steps;
 uniform float alphaScale;
 in vec3 vOrigin;
@@ -588,10 +692,17 @@ void main() {
   for (float t = 0.0; t < rayLength; t += delta) {
     vec3 texCoord = p + 0.5;
     vec4 sampled = texture(map, texCoord);
-    float a = sampled.a * alphaScale;
-    accumulated.rgb += (1.0 - accumulated.a) * a * sampled.rgb;
-    accumulated.a += (1.0 - accumulated.a) * a;
-    if (accumulated.a >= 0.97) break;
+    // sampled.a encodes "no data" (0.0) or a shifted-by-one normalized
+    // value (1..255)/255 -> recovers to raw t in [0,1]. Opacity itself
+    // comes from the user-editable transfer-function LUT, not from this
+    // texture, so dragging the table doesn't require rebuilding the volume.
+    if (sampled.a > 0.001) {
+      float rawT = (sampled.a * 255.0 - 1.0) / 254.0;
+      float a = texture(opacityLUT, vec2(rawT, 0.5)).r * alphaScale;
+      accumulated.rgb += (1.0 - accumulated.a) * a * sampled.rgb;
+      accumulated.a += (1.0 - accumulated.a) * a;
+      if (accumulated.a >= 0.97) break;
+    }
     p += rayDir * delta;
   }
 
@@ -600,22 +711,103 @@ void main() {
 }
 `;
 
-// Builds a nx*ny*nz RGBA density texture from vol.data[z][y][x] — no row
-// flip needed here (unlike the 2D canvas path): Data3DTexture samples
-// texel (0,0,0) directly with no flipY convention to fight.
-function buildVolumeTexture(vol) {
-  const nx = vol.x.length, ny = vol.y.length, nz = vol.levels_km.length;
-  const data = new Uint8Array(nx * ny * nz * 4);
+// Builds the density texture from vol.data[level][y][x]. RGB is the field's
+// color (from the colorscale); alpha is *not* baked-in opacity — it encodes
+// the value's normalized position (0=no data, else 1..255 -> t in [0,1]) so
+// the transfer-function table can be dragged live without rebuilding this
+// texture (only the small opacityLUT texture needs to change).
+//
+// Axis mapping matters here: the box mesh is scaled so local X=east-west,
+// local Y=altitude (up), local Z=north-south (see buildRaymarchVolumeScene).
+// Data3DTexture(data, width, height, depth) samples texCoord.x against
+// `width`, .y against `height`, .z against `depth` — so the texture must be
+// built (nx, nz, ny), NOT (nx, ny, nz), or altitude and north-south swap
+// (this was the "sideways" bug: altitude got mapped to the depth axis and
+// north-south to the height axis).
+// Separable neighbor-average smoothing over the volume's (level, y, x) grid.
+// Each pass averages only over the *valid* (non-missing) neighbors within
+// `radius` along one axis at a time (x, then y, then level) — this both
+// smooths blocky/noisy CAPPI cells and mildly fills small single-cell gaps
+// (since a missing cell can still average in from valid neighbors), without
+// inventing data far from anything actually observed. Returns a new
+// data[level][y][x] array in the same shape as vol.data; radius=0 returns
+// vol.data unchanged.
+function smoothVolume(vol, radius) {
+  if (!radius) return vol.data;
+  const nz = vol.levels_km.length, ny = vol.y.length, nx = vol.x.length;
+  const n = nz * ny * nx;
+  let buf = new Float32Array(n);
   let i = 0;
   for (let z = 0; z < nz; z++) {
     for (let y = 0; y < ny; y++) {
       for (let x = 0; x < nx; x++) {
-        const [r, g, b, a] = colorForValue(vol.data[z][y][x], vol.colorscale, vol.zmin, vol.zmax);
-        data[i++] = r; data[i++] = g; data[i++] = b; data[i++] = a;
+        const v = vol.data[z][y][x];
+        buf[i++] = v == null ? NaN : v;
       }
     }
   }
-  const tex = new THREE.Data3DTexture(data, nx, ny, nz);
+
+  function passAxis(src, axis) {
+    const out = new Float32Array(n);
+    const stride = axis === 'x' ? 1 : axis === 'y' ? nx : nx * ny;
+    const size = axis === 'x' ? nx : axis === 'y' ? ny : nz;
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        for (let x = 0; x < nx; x++) {
+          const base = (z * ny + y) * nx + x;
+          const idxAlong = axis === 'x' ? x : axis === 'y' ? y : z;
+          let sum = 0, count = 0;
+          for (let d = -radius; d <= radius; d++) {
+            const j = idxAlong + d;
+            if (j < 0 || j >= size) continue;
+            const v = src[base + d * stride];
+            if (!Number.isNaN(v)) { sum += v; count++; }
+          }
+          out[base] = count > 0 ? sum / count : NaN;
+        }
+      }
+    }
+    return out;
+  }
+
+  buf = passAxis(buf, 'x');
+  buf = passAxis(buf, 'y');
+  buf = passAxis(buf, 'z');
+
+  const out = [];
+  let k = 0;
+  for (let z = 0; z < nz; z++) {
+    const plane = [];
+    for (let y = 0; y < ny; y++) {
+      const row = new Array(nx);
+      for (let x = 0; x < nx; x++) {
+        const v = buf[k++];
+        row[x] = Number.isNaN(v) ? null : v;
+      }
+      plane.push(row);
+    }
+    out.push(plane);
+  }
+  return out;
+}
+
+function buildVolumeTexture(vol, dataOverride) {
+  const nx = vol.x.length, ny = vol.y.length, nz = vol.levels_km.length;
+  const volData = dataOverride || vol.data;
+  const data = new Uint8Array(nx * nz * ny * 4);
+  let i = 0;
+  for (let ns = 0; ns < ny; ns++) {        // depth axis   -> north-south
+    for (let alt = 0; alt < nz; alt++) {   // height axis  -> altitude
+      for (let ew = 0; ew < nx; ew++) {    // width axis   -> east-west
+        const value = volData[alt][ns][ew];
+        const t = normalizeT(value, vol.zmin, vol.zmax);
+        const [r, g, b] = t == null ? [0, 0, 0] : interpolateColorRgb(t, vol.colorscale);
+        data[i++] = r; data[i++] = g; data[i++] = b;
+        data[i++] = t == null ? 0 : Math.max(1, Math.min(255, Math.round(1 + t * 254)));
+      }
+    }
+  }
+  const tex = new THREE.Data3DTexture(data, nx, nz, ny);
   tex.format = THREE.RGBAFormat;
   tex.type = THREE.UnsignedByteType;
   tex.minFilter = THREE.LinearFilter;
@@ -637,20 +829,78 @@ function volumeExtents(vol) {
   return { xExtent, yExtent, zMin, zMax, zSpan, zScale };
 }
 
+// ── Orientation helpers (bounding wireframe + axis labels) ─────────────
+// Both scene builders share the same world convention: X = the data's x
+// (E/W of storm center, km), Z = the data's y (N/S of storm center, km),
+// Y = altitude, spanning [0, heightWorld] — added after the "sideways" bug
+// made it clear a bare AxesHelper alone wasn't enough to orient by.
+
+function makeTextSprite(text) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 200; canvas.height = 48;
+  const ctx = canvas.getContext('2d');
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 100, 24);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
+  const sprite = new THREE.Sprite(mat);
+  const scale = Math.max(1, canvas.width / 10);
+  sprite.scale.set(scale, scale * (canvas.height / canvas.width), 1);
+  return sprite;
+}
+
+function addOrientationHelpers(group, xExtent, yExtent, heightWorld) {
+  const boxGeo = new THREE.BoxGeometry(xExtent, heightWorld, yExtent);
+  const wireframe = new THREE.LineSegments(
+    new THREE.EdgesGeometry(boxGeo),
+    new THREE.LineBasicMaterial({ color: 0x8899aa, transparent: true, opacity: 0.5 }),
+  );
+  wireframe.position.y = heightWorld / 2;
+  group.add(wireframe);
+
+  const labelX = makeTextSprite('E/W (km)');
+  labelX.position.set(xExtent / 2 + Math.max(xExtent, yExtent) * 0.08, 0, 0);
+  group.add(labelX);
+
+  const labelZ = makeTextSprite('N/S (km)');
+  labelZ.position.set(0, 0, yExtent / 2 + Math.max(xExtent, yExtent) * 0.08);
+  group.add(labelZ);
+
+  const labelY = makeTextSprite('Altitude (km)');
+  labelY.position.set(0, heightWorld + Math.max(xExtent, yExtent) * 0.06, 0);
+  group.add(labelY);
+}
+
+function frameCamera(camera, controls, xExtent, yExtent, heightWorld) {
+  const dist = Math.max(xExtent, yExtent, heightWorld) * 1.5;
+  camera.position.set(dist, dist * 0.55 + heightWorld * 0.5, dist);
+  controls.target.set(0, heightWorld / 2, 0);
+  controls.update();
+}
+
+let currentVolumeMaterial = null;
+
 function buildRaymarchVolumeScene(vol) {
   const { group, camera, controls } = initThree();
   clearThreeGroup();
+  currentVolumeMaterial = null;
 
-  const tex = buildVolumeTexture(vol);
+  const radius = parseInt($('inp-smoothing').value, 10) || 0;
+  const tex = buildVolumeTexture(vol, radius ? smoothVolume(vol, radius) : null);
   const { xExtent, yExtent, zSpan, zScale } = volumeExtents(vol);
+  const heightWorld = zSpan * zScale;
 
   const geometry = new THREE.BoxGeometry(1, 1, 1);
   const material = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
     uniforms: {
       map: { value: tex },
-      steps: { value: 200 },
-      alphaScale: { value: 1.6 },
+      opacityLUT: { value: buildOpacityLUT() },
+      steps: { value: 220 },
+      alphaScale: { value: parseFloat($('opacity-overall').value) },
     },
     vertexShader: VOLUME_VERTEX_SHADER,
     fragmentShader: VOLUME_FRAGMENT_SHADER,
@@ -658,17 +908,17 @@ function buildRaymarchVolumeScene(vol) {
     transparent: true,
     depthWrite: false,
   });
+  currentVolumeMaterial = material;
   const mesh = new THREE.Mesh(geometry, material);
-  mesh.scale.set(xExtent, zSpan * zScale, yExtent);
+  mesh.scale.set(xExtent, heightWorld, yExtent);
+  // Box is centered at local origin; lift it so it spans y=[0, heightWorld]
+  // — same "floor at 0" convention as the layered fallback, so switching
+  // between the two doesn't also relocate the volume.
+  mesh.position.y = heightWorld / 2;
   group.add(mesh);
 
-  const axes = new THREE.AxesHelper(Math.max(xExtent, yExtent) / 2);
-  group.add(axes);
-
-  const dist = Math.max(xExtent, yExtent) * 1.4;
-  camera.position.set(dist, dist * 0.7, dist);
-  controls.target.set(0, 0, 0);
-  controls.update();
+  addOrientationHelpers(group, xExtent, yExtent, heightWorld);
+  frameCamera(camera, controls, xExtent, yExtent, heightWorld);
 
   // Force shader compilation now (rather than letting it happen lazily
   // inside the render loop) so a link/compile failure throws here, where
@@ -679,13 +929,17 @@ function buildRaymarchVolumeScene(vol) {
 function buildLayeredVolumeScene(vol) {
   const { group, camera, controls } = initThree();
   clearThreeGroup();
+  currentVolumeMaterial = null;
 
   const nx = vol.x.length, ny = vol.y.length;
-  const { xExtent, yExtent, zMin, zScale } = volumeExtents(vol);
+  const { xExtent, yExtent, zMin, zMax, zScale } = volumeExtents(vol);
+  const heightWorld = (zMax - zMin) * zScale;
   const levels = vol.levels_km;
+  const radius = parseInt($('inp-smoothing').value, 10) || 0;
+  const volData = radius ? smoothVolume(vol, radius) : vol.data;
 
   for (let li = 0; li < levels.length; li++) {
-    const tex = levelTexture(vol.data[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
+    const tex = levelTexture(volData[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
     const geo = new THREE.PlaneGeometry(xExtent, yExtent);
     const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
     const mesh = new THREE.Mesh(geo, mat);
@@ -694,14 +948,166 @@ function buildLayeredVolumeScene(vol) {
     group.add(mesh);
   }
 
-  const axes = new THREE.AxesHelper(Math.max(xExtent, yExtent) / 2);
-  group.add(axes);
+  addOrientationHelpers(group, xExtent, yExtent, heightWorld);
+  frameCamera(camera, controls, xExtent, yExtent, heightWorld);
+}
 
-  const dist = Math.max(xExtent, yExtent) * 1.4;
-  camera.position.set(dist, dist * 0.7, dist);
-  const { zMax } = volumeExtents(vol);
-  controls.target.set(0, ((zMax - zMin) * zScale) / 2, 0);
-  controls.update();
+// ── Opacity transfer-function editor ("transparency table") ────────────
+// A small draggable value->opacity curve (5 fixed x positions, vertically
+// draggable) baked into a 256x1 lookup texture the raymarch shader samples
+// per-voxel. Editing it doesn't rebuild the (multi-MB) density texture —
+// only this tiny LUT changes — so dragging is instant.
+
+const DEFAULT_OPACITY_POINTS = [
+  { t: 0.0, o: 0.03 },
+  { t: 0.25, o: 0.08 },
+  { t: 0.5, o: 0.22 },
+  { t: 0.75, o: 0.55 },
+  { t: 1.0, o: 0.9 },
+];
+
+let opacityPoints = DEFAULT_OPACITY_POINTS.map((p) => ({ ...p }));
+let opacityLUTTexture = null;
+
+function opacityAt(t) {
+  const pts = opacityPoints;
+  if (t <= pts[0].t) return pts[0].o;
+  if (t >= pts[pts.length - 1].t) return pts[pts.length - 1].o;
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (t >= pts[i].t && t <= pts[i + 1].t) {
+      const span = pts[i + 1].t - pts[i].t;
+      const localT = span > 0 ? (t - pts[i].t) / span : 0;
+      return lerp(pts[i].o, pts[i + 1].o, localT);
+    }
+  }
+  return 0;
+}
+
+function buildOpacityLUT() {
+  const data = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) data[i] = Math.round(opacityAt(i / 255) * 255);
+  if (!opacityLUTTexture) {
+    opacityLUTTexture = new THREE.DataTexture(data, 256, 1, THREE.RedFormat, THREE.UnsignedByteType);
+    opacityLUTTexture.minFilter = THREE.LinearFilter;
+    opacityLUTTexture.magFilter = THREE.LinearFilter;
+    opacityLUTTexture.wrapS = THREE.ClampToEdgeWrapping;
+  } else {
+    opacityLUTTexture.image.data.set(data);
+  }
+  opacityLUTTexture.needsUpdate = true;
+  return opacityLUTTexture;
+}
+
+function updateOpacityEditorValueLabels() {
+  const minEl = $('opacity-min-label'), maxEl = $('opacity-max-label');
+  if (lastVolume) {
+    minEl.textContent = `${lastVolume.zmin} ${lastVolume.units}`;
+    maxEl.textContent = `${lastVolume.zmax} ${lastVolume.units}`;
+  } else {
+    minEl.textContent = 'low value';
+    maxEl.textContent = 'high value';
+  }
+}
+
+function drawOpacityEditor() {
+  const canvas = $('opacity-editor-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1;
+  for (let gx = 0; gx <= 4; gx++) {
+    const x = Math.round((gx / 4) * w) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let gy = 0; gy <= 4; gy++) {
+    const y = Math.round((gy / 4) * h) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  // Filled area under the curve so the shape reads as "how much opacity",
+  // not just an abstract line.
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, 'rgba(107,140,175,0.75)');
+  grad.addColorStop(1, 'rgba(107,140,175,0.08)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  for (let i = 0; i <= 100; i++) {
+    const t = i / 100;
+    ctx.lineTo(t * w, h - opacityAt(t) * h);
+  }
+  ctx.lineTo(w, h);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = '#8fb3d9';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i <= 100; i++) {
+    const t = i / 100;
+    const x = t * w, y = h - opacityAt(t) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  opacityPoints.forEach((p, i) => {
+    const x = p.t * w, y = h - p.o * h;
+    const active = i === draggingOpacityPoint;
+    ctx.beginPath();
+    ctx.arc(x, y, active ? 7 : 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = active ? '#ffd479' : '#e8e8e8';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.stroke();
+  });
+
+  updateOpacityEditorValueLabels();
+}
+
+function refreshOpacityLUT() {
+  buildOpacityLUT();
+  drawOpacityEditor();
+  // The LUT texture object itself doesn't change (only its data), and it's
+  // already referenced by the live material's uniform, so no scene rebuild
+  // is needed — the next animate() frame just picks up the new texels.
+}
+
+let draggingOpacityPoint = null;
+
+function opacityEditorPointFromEvent(e) {
+  const canvas = $('opacity-editor-canvas');
+  const rect = canvas.getBoundingClientRect();
+  return {
+    mx: ((e.clientX - rect.left) / rect.width) * canvas.width,
+    my: ((e.clientY - rect.top) / rect.height) * canvas.height,
+    canvas,
+  };
+}
+
+function opacityEditorPointerDown(e) {
+  const { mx, my, canvas } = opacityEditorPointFromEvent(e);
+  let best = -1, bestDist = Infinity;
+  opacityPoints.forEach((p, i) => {
+    const d = Math.hypot(mx - p.t * canvas.width, my - (canvas.height - p.o * canvas.height));
+    if (d < bestDist) { bestDist = d; best = i; }
+  });
+  draggingOpacityPoint = best;
+  opacityEditorPointerMove(e);
+}
+
+function opacityEditorPointerMove(e) {
+  if (draggingOpacityPoint == null) return;
+  const { my, canvas } = opacityEditorPointFromEvent(e);
+  opacityPoints[draggingOpacityPoint].o = Math.min(1, Math.max(0, 1 - my / canvas.height));
+  refreshOpacityLUT();
+}
+
+function opacityEditorPointerUp() {
+  draggingOpacityPoint = null;
+  drawOpacityEditor();
 }
 
 function renderVolumeLegend(stops, zmin, zmax, units) {
@@ -739,10 +1145,77 @@ function buildVolumeScene(vol) {
     }
   }
   renderVolumeLegend(vol.colorscale, vol.zmin, vol.zmax, vol.units);
+  drawOpacityEditor();
   ensure3dSceneSized();
 }
 
 let lastVolume = null;
+
+// ── Satellite overlay (GOES Band 13, centered on the storm) ─────────────
+
+function missionDateStr(missionId) {
+  const d = missionId.slice(0, 8); // mission_id = YYYYMMDDAI...
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+}
+
+function isoTimeFor(missionId, hhmm) {
+  return `${missionDateStr(missionId)}T${hhmm.slice(0, 2)}:${hhmm.slice(2, 4)}:00Z`;
+}
+
+let currentGeoContext = null;
+
+// Called after every successful sweep/volume/composite load. Needs an
+// origin (lat/lon) and an analysis time to place a satellite fetch — a
+// vertical-profile sweep has neither (no CAPPI grid, no single origin), so
+// this just hides the panel in that case rather than guessing.
+function updateGeoContext({ mission_id, origin_lat, origin_lon, x, y, analysisTime }) {
+  if (origin_lat == null || origin_lon == null || !analysisTime || !mission_id) {
+    currentGeoContext = null;
+  } else {
+    const widthKm = Math.max(Math.max(...x) - Math.min(...x), Math.max(...y) - Math.min(...y), 50) * 1.3;
+    currentGeoContext = { lat: origin_lat, lon: origin_lon, isoTime: isoTimeFor(mission_id, analysisTime), widthKm };
+  }
+  $('satellite-panel').style.display = currentGeoContext ? '' : 'none';
+  $('satellite-img').style.display = 'none';
+  $('satellite-status').textContent = '';
+}
+
+async function loadSatelliteImage() {
+  if (!currentGeoContext) return;
+  const btn = $('btn-load-satellite');
+  const statusEl = $('satellite-status');
+  const img = $('satellite-img');
+  img.style.display = 'none';
+  btn.disabled = true;
+  statusEl.textContent = 'Requesting GOES Band 13 scan…';
+  try {
+    const { lat, lon, isoTime, widthKm } = currentGeoContext;
+    const params = new URLSearchParams({
+      time: isoTime,
+      band: '13',
+      center: `${lat},${lon}`,
+      dims: String(Math.round(widthKm)),
+      unit: 'km',
+    });
+    let resp = await getJSON(`/v1/satellite/tile?${params.toString()}`);
+    let attempts = 0;
+    while (resp.status && resp.status !== 'ready' && resp.status !== 'error' && attempts < 30) {
+      statusEl.textContent = `Rendering… (${resp.status})`;
+      await new Promise((r) => setTimeout(r, 2000));
+      resp = await getJSON(`/v1/satellite/status/${encodeURIComponent(resp.key)}`);
+      attempts++;
+    }
+    if (resp.status === 'error') throw new Error(resp.message || 'satellite render failed');
+    if (resp.status !== 'ready') throw new Error('Timed out waiting for the satellite image to render.');
+    img.src = apiBase() + resp.png_url;
+    img.style.display = '';
+    statusEl.textContent = `${resp.satellite || 'GOES'} Band 13, scan ${resp.scan_start || ''}`.trim();
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 async function plotVolume() {
   const missionId = $('sel-mission').value;
@@ -769,6 +1242,10 @@ async function plotVolume() {
       <span>Field: <b>${vol.field}</b> (${vol.units})</span>
       <span>Levels: <b>${vol.levels_km.length}</b> (${Math.min(...vol.levels_km)}–${Math.max(...vol.levels_km)} km)</span>
     `;
+    updateGeoContext({
+      mission_id: vol.mission_id, origin_lat: vol.origin_lat, origin_lon: vol.origin_lon,
+      x: vol.x, y: vol.y, analysisTime: vol.analysis_time,
+    });
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -807,6 +1284,13 @@ async function plotComposite() {
       <span>Field: <b>${comp.field}</b> (${comp.units})</span>
       ${detail}
     `;
+    const analysisTimeForGeo = mode === 'altitude'
+      ? comp.detail.analysis_time
+      : comp.detail.analysis_times_used[Math.floor(comp.detail.analysis_times_used.length / 2)];
+    updateGeoContext({
+      mission_id: comp.mission_id, origin_lat: comp.origin_lat, origin_lon: comp.origin_lon,
+      x: comp.x, y: comp.y, analysisTime: analysisTimeForGeo,
+    });
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -834,6 +1318,10 @@ async function plotSweep() {
   try {
     const sweep = await getJSON(`/v1/tdr/sweep?${params.toString()}`);
     render(sweep, isVert);
+    updateGeoContext({
+      mission_id: sweep.mission_id, origin_lat: sweep.origin_lat, origin_lon: sweep.origin_lon,
+      x: sweep.x, y: sweep.y, analysisTime: sweep.analysis_time,
+    });
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -945,6 +1433,34 @@ $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
 $('sel-composite-mode').addEventListener('change', applyViewVisibility);
 $('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
+$('inp-smoothing').addEventListener('input', (e) => {
+  $('smoothing-value').textContent = e.target.value;
+  if (lastVolume) buildVolumeScene(lastVolume);
+});
+
+$('product-help-btn').addEventListener('click', openHelpModal);
+$('help-modal-close').addEventListener('click', closeHelpModal);
+$('help-modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'help-modal-backdrop') closeHelpModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHelpModal(); });
+
+$('btn-load-satellite').addEventListener('click', loadSatelliteImage);
+
+const opacityCanvas = $('opacity-editor-canvas');
+opacityCanvas.addEventListener('pointerdown', (e) => {
+  opacityCanvas.setPointerCapture(e.pointerId);
+  opacityEditorPointerDown(e);
+});
+opacityCanvas.addEventListener('pointermove', opacityEditorPointerMove);
+opacityCanvas.addEventListener('pointerup', opacityEditorPointerUp);
+opacityCanvas.addEventListener('pointercancel', opacityEditorPointerUp);
+$('opacity-reset-btn').addEventListener('click', () => {
+  opacityPoints = DEFAULT_OPACITY_POINTS.map((p) => ({ ...p }));
+  refreshOpacityLUT();
+});
+$('opacity-overall').addEventListener('input', (e) => {
+  if (currentVolumeMaterial) currentVolumeMaterial.uniforms.alphaScale.value = parseFloat(e.target.value);
+});
+
 $('btn-load').addEventListener('click', () => {
   const view = currentView();
   if (view === 'volume') plotVolume();
@@ -961,6 +1477,7 @@ $('btn-load').addEventListener('click', () => {
   } catch (e) {}
   apiBaseLabel.textContent = apiBase();
   loadYears();
+  drawOpacityEditor();
 })();
 </script>
 </body>

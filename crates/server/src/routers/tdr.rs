@@ -324,7 +324,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
     let conn = tdr::get_connection(&state.paths.tdr_db)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
 
-    let (mission, level, x, y, data, detail) = match q.mode.as_str() {
+    let (mission, level, x, y, data, detail, origin) = match q.mode.as_str() {
         "altitude" => {
             let analysis_time = q.analysis_time.clone().ok_or_else(|| {
                 ApiError::bad_request("mode=altitude requires analysis_time".to_string())
@@ -340,7 +340,8 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 .await
                 .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
                 .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            (mission, level, slice.x, slice.y, slice.data, json!({"analysis_time": analysis_time}))
+            let origin = slice.origin_lat.zip(slice.origin_lon);
+            (mission, level, slice.x, slice.y, slice.data, json!({"analysis_time": analysis_time}), origin)
         }
         "time" => {
             if !q.product.starts_with("xy") {
@@ -413,6 +414,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     "analysis_times_used": times_used,
                     "reference_origin": {"lat": lat0, "lon": lon0},
                 }),
+                Some((lat0, lon0)),
             )
         }
         other => {
@@ -434,6 +436,8 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
         "x": x,
         "y": y,
         "data": data_out,
+        "origin_lat": origin.map(|(la, _)| la),
+        "origin_lon": origin.map(|(_, lo)| lo),
         "colorscale": cs.stops,
         "zmin": cs.zmin,
         "zmax": cs.zmax,
