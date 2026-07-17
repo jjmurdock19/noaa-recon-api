@@ -167,6 +167,24 @@ pub fn get_mission_files(conn: &Connection, mission_id: &str) -> rusqlite::Resul
     rows.collect()
 }
 
+/// Every analysis_time's netCDF file for one (mission, level, product) —
+/// used by `GET /v1/tdr/composite?mode=time` to mosaic a CAPPI level across
+/// a mission's whole timeline. Sorted by `analysis_time` so callers get a
+/// deterministic, chronological composite order.
+pub fn find_files_for_product(
+    conn: &Connection,
+    mission_id: &str,
+    level: &str,
+    product: &str,
+) -> rusqlite::Result<Vec<FileRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM files WHERE mission_id = ?1 AND level = ?2 AND product = ?3 AND format = 'nc' \
+         ORDER BY analysis_time",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![mission_id, level, product], FileRecord::from_row)?;
+    rows.collect()
+}
+
 /// One exact (mission, level, product, analysis_time, format) file record —
 /// used by `GET /v1/tdr/sweep` to resolve the source URL to fetch/cache.
 pub fn find_file(

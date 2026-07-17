@@ -441,16 +441,35 @@ async fn self_update_job(State(state): State<AppState>, jar: SignedCookieJar) ->
 // (skip missions/seasons already up to date), so "force update" only means
 // "run it now" rather than "rebuild the archive from scratch".
 
+#[derive(Deserialize)]
+struct ArchiveUpdateQuery {
+    /// Comma-separated years (e.g. `2015,2016,2017`) — only meaningful for
+    /// the `tdr` archive (see `services/archive_update.rs`), reaching further
+    /// back than the default shallow (current-1, current) ingest window.
+    /// Ignored for other archives.
+    years: Option<String>,
+}
+
 async fn start_archive_update(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     Path(archive): Path<String>,
+    Query(q): Query<ArchiveUpdateQuery>,
 ) -> ApiResult<Json<Value>> {
     auth::require_superuser(&jar)?;
     if state.archive_update.is_running(&archive) {
         return Err(ApiError::conflict("An update for this archive is already in progress"));
     }
-    let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive)
+    let years = q
+        .years
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|y| y.trim().parse::<i64>().map_err(|_| ApiError::bad_request(format!("Invalid year: '{y}'"))))
+                .collect::<ApiResult<Vec<i64>>>()
+        })
+        .transpose()?;
+    let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive, years)
         .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
     Ok(Json(job))
 }

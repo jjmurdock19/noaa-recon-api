@@ -105,6 +105,13 @@ impl ArchiveUpdateState {
 /// Starts the named archive's update job (if not already running) and returns
 /// its freshly-"running" snapshot. `None` for an unknown archive name.
 ///
+/// `years` lets a console click reach further back than the default
+/// shallow (current-1, current) window for the `tdr` archive specifically —
+/// see the module doc comment on why this is still opt-in, deliberate, and
+/// separate from the plain "force update" button. Ignored for `storms`
+/// (which has no year concept) and `recon_met` (not exposed in the console
+/// UI yet, though `recon_ingest::run_ingest` does support it).
+///
 /// Runs via `spawn_blocking` + `Handle::block_on` rather than a plain
 /// `tokio::spawn`: both `storms::run_ingest` and `recon_ingest::run_ingest`
 /// hold a `&rusqlite::Connection` (not `Sync`) across internal `.await`
@@ -113,7 +120,12 @@ impl ArchiveUpdateState {
 /// `Send` because it may hand the future to a different worker thread.
 /// Driving the future to completion on one dedicated blocking-pool thread
 /// sidesteps that requirement entirely.
-pub fn start(state: &Arc<ArchiveUpdateState>, paths: &Arc<Paths>, archive: &str) -> Option<Value> {
+pub fn start(
+    state: &Arc<ArchiveUpdateState>,
+    paths: &Arc<Paths>,
+    archive: &str,
+    years: Option<Vec<i64>>,
+) -> Option<Value> {
     if !ArchiveUpdateState::is_known_archive(archive) {
         return None;
     }
@@ -139,7 +151,7 @@ pub fn start(state: &Arc<ArchiveUpdateState>, paths: &Arc<Paths>, archive: &str)
             let tdr_db = paths.tdr_db.clone();
             let recon_db = paths.recon_met_db.clone();
             tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current().block_on(run_tdr(state, tdr_db, recon_db));
+                tokio::runtime::Handle::current().block_on(run_tdr(state, tdr_db, recon_db, years));
             });
         }
         _ => unreachable!(),
@@ -160,11 +172,12 @@ async fn run_recon(state: Arc<ArchiveUpdateState>, recon_db: PathBuf, storms_db:
 }
 
 /// `years: None` defaults to [current-1, current] — same shallow-ingest
-/// convention as the CLI's `ingest-tdr` with no `--years`/`--full`. A deeper
-/// historical backfill is a deliberate `ingest-tdr --full` CLI run, not a
-/// console click — see the module doc comment.
-async fn run_tdr(state: Arc<ArchiveUpdateState>, tdr_db: PathBuf, recon_db: PathBuf) {
-    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, &recon_db, None, false)
+/// convention as the CLI's `ingest-tdr` with no `--years`/`--full`. Passing
+/// an explicit `years` (from the console's backfill control) reaches further
+/// back, same as `ingest-tdr --years`. `force` is always `false` here —
+/// still just "run it now", not "reprocess everything already indexed".
+async fn run_tdr(state: Arc<ArchiveUpdateState>, tdr_db: PathBuf, recon_db: PathBuf, years: Option<Vec<i64>>) {
+    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, &recon_db, years, false)
         .await
         .map_err(|e| e.to_string());
     state.finish("tdr", result);

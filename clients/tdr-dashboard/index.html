@@ -14,6 +14,14 @@
 })();
 </script>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.159.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.159.0/examples/jsm/"
+  }
+}
+</script>
 <style>
   :root {
     color-scheme: dark;
@@ -157,11 +165,25 @@
 
     <fieldset id="fs-product" style="display:none">
       <legend>Product</legend>
-      <div class="row">
+      <div class="field"><label for="sel-view">View</label>
+        <select id="sel-view">
+          <option value="sweep">2D sweep (CAPPI / vertical profile)</option>
+          <option value="volume">3D volume</option>
+          <option value="composite">Composite</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px">
         <div class="field"><label for="sel-level">Level</label><select id="sel-level"></select></div>
         <div class="field"><label for="sel-product">Product</label><select id="sel-product"></select></div>
       </div>
-      <div class="field" style="margin-top:8px"><label for="sel-time">Analysis time (UTC)</label><select id="sel-time"></select></div>
+      <div class="field" id="field-composite-mode" style="margin-top:8px">
+        <label for="sel-composite-mode">Composite mode</label>
+        <select id="sel-composite-mode">
+          <option value="altitude">Altitude max-projection (one time, all levels)</option>
+          <option value="time">Time mosaic (one level, whole mission)</option>
+        </select>
+      </div>
+      <div class="field" id="field-time" style="margin-top:8px"><label for="sel-time">Analysis time (UTC)</label><select id="sel-time"></select></div>
       <div class="field" style="margin-top:8px"><label for="sel-field">Field</label><select id="sel-field"></select></div>
       <div class="field" id="field-z" style="margin-top:8px">
         <label for="inp-z">CAPPI altitude (km)</label>
@@ -170,11 +192,8 @@
       <button id="btn-load" style="margin-top:12px; width:100%">Plot sweep</button>
     </fieldset>
 
-    <div style="font-size:11px; color:var(--text-faint); line-height:1.5;">
-      3D volumetric viewing isn't available yet — this dashboard plots one 2D
-      slice at a time (a horizontal CAPPI or the along-track vertical
-      profile). See the <a href="https://github.com/jjmurdock19/noaa-recon-api" target="_blank" rel="noopener">noaa-recon-api</a>
-      README for the raw-netCDF passthrough roadmap item.
+    <div id="view-hint" style="font-size:11px; color:var(--text-faint); line-height:1.5;">
+      2D sweep plots one horizontal CAPPI or the along-track vertical profile.
     </div>
   </div>
 
@@ -182,11 +201,18 @@
     <div id="status"></div>
     <div id="info-bar" style="display:none"></div>
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
+    <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
+      <canvas id="plot3d-canvas" style="width:100%; height:100%; display:block;"></canvas>
+      <div id="plot3d-legend" style="position:absolute; top:10px; right:10px; display:flex; flex-direction:column; align-items:center; gap:4px; background:rgba(0,0,0,0.35); border-radius:4px; padding:8px 6px; font-size:10px; color:#fff;"></div>
+    </div>
   </div>
 </main>
 
-<script>
+<script type="module">
 'use strict';
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const XY_FIELDS = [
   ['reflectivity', 'Reflectivity (dBZ)'],
@@ -327,6 +353,18 @@ async function loadMissionFiles(missionId) {
 
 function distinct(arr) { return Array.from(new Set(arr)); }
 
+// ── View mode (2D sweep / 3D volume / composite) ────────────────────────
+
+const VIEW_HINTS = {
+  sweep: '2D sweep plots one horizontal CAPPI or the along-track vertical profile.',
+  volume: '3D volume renders every CAPPI level of an xy/xy_rel product as a stack of textured planes in real 3D space — drag to orbit, scroll to zoom. Only xy-family products have a level axis, so vertical profiles aren’t selectable here.',
+  composite: 'Composite flattens a mission into one image: "Altitude max-projection" collapses one analysis time’s whole level axis (like classic composite reflectivity); "Time mosaic" overlays one CAPPI level across every analysis time in the mission (use product=xy_rel so the storm-relative grid lines up across times).',
+};
+
+function currentView() { return $('sel-view').value; }
+
+function isVolumeCapableProduct(product) { return product === 'xy' || product.startsWith('xy_'); }
+
 function populateLevels() {
   const levels = distinct(missionFiles.map(f => f.level)).sort(); // "1b" < "2"
   const selLevel = $('sel-level');
@@ -338,7 +376,9 @@ function populateLevels() {
 
 function populateProducts() {
   const level = $('sel-level').value;
-  const products = distinct(missionFiles.filter(f => f.level === level).map(f => f.product)).sort();
+  const view = currentView();
+  let products = distinct(missionFiles.filter(f => f.level === level).map(f => f.product)).sort();
+  if (view !== 'sweep') products = products.filter(isVolumeCapableProduct);
   fillSelect($('sel-product'), products);
   populateTimes();
 }
@@ -352,10 +392,242 @@ function populateTimes() {
 }
 
 function populateFields() {
-  const product = $('sel-product').value;
-  const isVert = product.startsWith('vert_');
+  const product = $('sel-product').value || '';
+  const view = currentView();
+  const isVert = view === 'sweep' && product.startsWith('vert_');
   fillSelect($('sel-field'), isVert ? VERT_FIELDS : XY_FIELDS);
-  $('field-z').classList.toggle('hidden', isVert);
+  applyViewVisibility();
+}
+
+function applyViewVisibility() {
+  const view = currentView();
+  const product = $('sel-product').value || '';
+  const isVert = view === 'sweep' && product.startsWith('vert_');
+  const compositeMode = $('sel-composite-mode').value;
+
+  $('field-composite-mode').classList.toggle('hidden', view !== 'composite');
+  const needsTime = view === 'sweep' || (view === 'composite' && compositeMode === 'altitude') || view === 'volume';
+  $('field-time').classList.toggle('hidden', !needsTime);
+  const needsZ = (view === 'sweep' && !isVert) || (view === 'composite' && compositeMode === 'time');
+  $('field-z').classList.toggle('hidden', !needsZ);
+
+  const labels = { sweep: 'Plot sweep', volume: 'Load 3D volume', composite: 'Load composite' };
+  $('btn-load').textContent = labels[view] || 'Plot';
+  $('view-hint').textContent = VIEW_HINTS[view] || '';
+
+  const showPlotly = view === 'sweep' || view === 'composite';
+  $('plot').style.display = showPlotly ? '' : 'none';
+  $('plot3d').style.display = view === 'volume' ? 'flex' : 'none';
+  if (view === 'volume') requestAnimationFrame(ensure3dSceneSized);
+}
+
+// ── Colorscale interpolation (shared by the 3D volume viewer) ──────────────
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// Maps a physical value to an [r,g,b,a] color using a Plotly-shaped
+// [[fraction, hex], ...] colorscale stop list plus its [zmin, zmax] domain.
+function colorForValue(value, stops, zmin, zmax) {
+  if (value == null || Number.isNaN(value)) return [0, 0, 0, 0];
+  const t = zmax > zmin ? Math.min(1, Math.max(0, (value - zmin) / (zmax - zmin))) : 0;
+  let lo = stops[0], hi = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (t >= stops[i][0] && t <= stops[i + 1][0]) { lo = stops[i]; hi = stops[i + 1]; break; }
+  }
+  const span = hi[0] - lo[0];
+  const localT = span > 0 ? (t - lo[0]) / span : 0;
+  const [r1, g1, b1] = hexToRgb(lo[1]);
+  const [r2, g2, b2] = hexToRgb(hi[1]);
+  return [Math.round(lerp(r1, r2, localT)), Math.round(lerp(g1, g2, localT)), Math.round(lerp(b1, b2, localT)), 235];
+}
+
+// ── 3D volume viewer (Three.js) ─────────────────────────────────────────
+
+let three = null; // { renderer, scene, camera, controls, group }
+
+function initThree() {
+  if (three) return three;
+  const canvas = $('plot3d-canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  const group = new THREE.Group();
+  scene.add(group);
+  three = { renderer, scene, camera, controls, group };
+  (function animate() {
+    requestAnimationFrame(animate);
+    if ($('plot3d').style.display === 'none') return;
+    controls.update();
+    renderer.render(scene, camera);
+  })();
+  window.addEventListener('resize', ensure3dSceneSized);
+  return three;
+}
+
+function ensure3dSceneSized() {
+  if (!three) return;
+  const el = $('plot3d');
+  const w = el.clientWidth || 1, h = el.clientHeight || 1;
+  three.renderer.setSize(w, h, false);
+  three.camera.aspect = w / h;
+  three.camera.updateProjectionMatrix();
+}
+
+function clearThreeGroup() {
+  if (!three) return;
+  for (const child of [...three.group.children]) {
+    three.group.remove(child);
+    child.geometry?.dispose();
+    child.material?.map?.dispose();
+    child.material?.dispose();
+  }
+}
+
+// Builds one canvas-texture heatmap for a single level plane, data[yi][xi].
+function levelTexture(dataPlane, ny, nx, stops, zmin, zmax) {
+  const canvas = document.createElement('canvas');
+  canvas.width = nx; canvas.height = ny;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(nx, ny);
+  for (let yi = 0; yi < ny; yi++) {
+    for (let xi = 0; xi < nx; xi++) {
+      // Flip row order: netCDF y is south-up, canvas rows are top-down.
+      const srcRow = ny - 1 - yi;
+      const [r, g, b, a] = colorForValue(dataPlane[srcRow][xi], stops, zmin, zmax);
+      const p = (yi * nx + xi) * 4;
+      img.data[p] = r; img.data[p + 1] = g; img.data[p + 2] = b; img.data[p + 3] = a;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.NearestFilter;
+  return tex;
+}
+
+function renderVolumeLegend(stops, zmin, zmax, units) {
+  const el = $('plot3d-legend');
+  const gradient = stops.map(([f, hex]) => `${hex} ${(f * 100).toFixed(0)}%`).join(', ');
+  el.innerHTML = `
+    <div>${zmax}</div>
+    <div style="width:14px; height:120px; border-radius:2px; background:linear-gradient(to top, ${gradient});"></div>
+    <div>${zmin}</div>
+    <div style="margin-top:2px;">${units}</div>
+  `;
+}
+
+function buildVolumeScene(vol) {
+  const { group, camera, controls } = initThree();
+  clearThreeGroup();
+
+  const nx = vol.x.length, ny = vol.y.length;
+  const xExtent = Math.max(...vol.x) - Math.min(...vol.x) || 1;
+  const yExtent = Math.max(...vol.y) - Math.min(...vol.y) || 1;
+  const levels = vol.levels_km;
+  const zMin = Math.min(...levels), zMax = Math.max(...levels);
+  const zSpan = Math.max(zMax - zMin, 1);
+  // Vertical exaggeration: real CAPPI spacing (a few km) is tiny next to the
+  // ~100+ km horizontal extent, so scale altitude into a comparable range.
+  const zScale = (Math.max(xExtent, yExtent) * 0.6) / zSpan;
+
+  for (let li = 0; li < levels.length; li++) {
+    const tex = levelTexture(vol.data[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
+    const geo = new THREE.PlaneGeometry(xExtent, yExtent);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.y = (levels[li] - zMin) * zScale;
+    group.add(mesh);
+  }
+
+  const axes = new THREE.AxesHelper(Math.max(xExtent, yExtent) / 2);
+  group.add(axes);
+
+  const dist = Math.max(xExtent, yExtent) * 1.4;
+  camera.position.set(dist, dist * 0.7, dist);
+  controls.target.set(0, ((zMax - zMin) * zScale) / 2, 0);
+  controls.update();
+
+  renderVolumeLegend(vol.colorscale, vol.zmin, vol.zmax, vol.units);
+  ensure3dSceneSized();
+}
+
+async function plotVolume() {
+  const missionId = $('sel-mission').value;
+  const level = $('sel-level').value;
+  const product = $('sel-product').value;
+  const analysisTime = $('sel-time').value;
+  const field = $('sel-field').value;
+  const btn = $('btn-load');
+
+  const params = new URLSearchParams({ mission_id: missionId, level, product, analysis_time: analysisTime, field });
+  btn.disabled = true;
+  setStatus('loading', 'Fetching + slicing the whole level axis (first request for a file downloads and caches it server-side, may take a few seconds)…');
+  try {
+    const vol = await getJSON(`/v1/tdr/volume?${params.toString()}`);
+    buildVolumeScene(vol);
+    const info = $('info-bar');
+    info.style.display = '';
+    info.innerHTML = `
+      <span>Storm: <b>${vol.storm_name || '—'}</b></span>
+      <span>Mission: <b>${vol.mission_id}</b></span>
+      <span>Product: <b>${vol.product}</b></span>
+      <span>Analysis time: <b>${vol.analysis_time}Z</b></span>
+      <span>Field: <b>${vol.field}</b> (${vol.units})</span>
+      <span>Levels: <b>${vol.levels_km.length}</b> (${Math.min(...vol.levels_km)}–${Math.max(...vol.levels_km)} km)</span>
+    `;
+    setStatus(null, '');
+  } catch (e) {
+    setStatus('error', e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function plotComposite() {
+  const missionId = $('sel-mission').value;
+  const level = $('sel-level').value;
+  const product = $('sel-product').value;
+  const field = $('sel-field').value;
+  const mode = $('sel-composite-mode').value;
+  const btn = $('btn-load');
+
+  const params = new URLSearchParams({ mission_id: missionId, level, product, field, mode });
+  if (mode === 'altitude') params.set('analysis_time', $('sel-time').value);
+  else params.set('z', $('inp-z').value || '2.0');
+
+  btn.disabled = true;
+  setStatus('loading', mode === 'time'
+    ? 'Fetching every analysis time and mosaicking one level (may take a while for a long mission)…'
+    : 'Fetching + collapsing the level axis…');
+  try {
+    const comp = await getJSON(`/v1/tdr/composite?${params.toString()}`);
+    render(comp, false);
+    const info = $('info-bar');
+    const detail = mode === 'altitude'
+      ? `<span>Analysis time: <b>${comp.detail.analysis_time}Z</b></span>`
+      : `<span>Level: <b>${comp.detail.z_km} km</b></span><span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>`;
+    info.innerHTML = `
+      <span>Storm: <b>${comp.storm_name || '—'}</b></span>
+      <span>Mission: <b>${comp.mission_id}</b></span>
+      <span>Mode: <b>${mode === 'altitude' ? 'Altitude max-projection' : 'Time mosaic'}</b></span>
+      <span>Field: <b>${comp.field}</b> (${comp.units})</span>
+      ${detail}
+    `;
+    setStatus(null, '');
+  } catch (e) {
+    setStatus('error', e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── Plotting ─────────────────────────────────────────────────────────────
@@ -483,9 +755,16 @@ $('token-toggle').addEventListener('click', () => {
 $('sel-year').addEventListener('change', (e) => loadStorms(e.target.value));
 $('sel-storm').addEventListener('change', (e) => loadMissions($('sel-year').value, e.target.value));
 $('sel-mission').addEventListener('change', (e) => loadMissionFiles(e.target.value));
+$('sel-view').addEventListener('change', populateProducts);
 $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
-$('btn-load').addEventListener('click', plotSweep);
+$('sel-composite-mode').addEventListener('change', applyViewVisibility);
+$('btn-load').addEventListener('click', () => {
+  const view = currentView();
+  if (view === 'volume') plotVolume();
+  else if (view === 'composite') plotComposite();
+  else plotSweep();
+});
 
 (function init() {
   try {

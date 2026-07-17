@@ -64,11 +64,108 @@ pub struct FieldSlice {
     /// vertical profile.
     pub y: Vec<f32>,
     pub data: Vec<Vec<Option<f32>>>,
-    /// Resolved CAPPI altitude (xy product only — `None` for a vertical profile).
+    /// Resolved CAPPI altitude (xy product only — `None` for a vertical
+    /// profile or an altitude composite, which spans every level).
     pub z_km: Option<f32>,
     pub origin_lat: Option<f32>,
     pub origin_lon: Option<f32>,
     pub storm_name_attr: Option<String>,
+}
+
+/// Every CAPPI plane of an `xy`/`xy_rel` volume, for genuine 3D rendering —
+/// same grid/origin/attrs as [`FieldSlice`] but `data[level_idx][yi][xi]`
+/// plus the actual `levels` (km) each plane sits at.
+pub struct FieldVolume {
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+    pub levels: Vec<f32>,
+    pub data: Vec<Vec<Vec<Option<f32>>>>,
+    pub origin_lat: Option<f32>,
+    pub origin_lon: Option<f32>,
+    pub storm_name_attr: Option<String>,
+}
+
+/// Shared open+validate+read step for `xy`/`xy_rel` volume files — used by
+/// [`read_xy_slice`], [`read_xy_volume`], and [`read_xy_altitude_composite`]
+/// so the three only differ in what they do with `flat`.
+struct XyVolumeRaw {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    levels: Vec<f32>,
+    flat: Vec<f32>,
+    missing: f32,
+    origin_lat: Option<f32>,
+    origin_lon: Option<f32>,
+    storm_name_attr: Option<String>,
+}
+
+fn read_xy_volume_raw(path: &Path, field: &str) -> anyhow::Result<XyVolumeRaw> {
+    let var_name = resolve_var_name(XY_FIELD_VARS, field)
+        .ok_or_else(|| anyhow::anyhow!("unknown xy field '{field}', expected one of {:?}", xy_field_names()))?;
+
+    let _guard = nc_lock();
+    let ds = netcdf::open(path)?;
+    if ds.variable("x").is_none() || ds.variable("y").is_none() || ds.variable("LATITUDE").is_none() {
+        anyhow::bail!(
+            "this xy.nc file isn't the post-2021 Cartesian x/y + LATITUDE/LONGITUDE schema this \
+             endpoint supports (see the AOML TDR README's 2021 gridding-change note) — pre-2021 \
+             lat/lon-gridded files aren't handled yet"
+        );
+    }
+
+    let x: Vec<f32> = ds.variable("x").unwrap().get_values(..)?;
+    let y: Vec<f32> = ds.variable("y").unwrap().get_values(..)?;
+    let levels: Vec<f32> = ds
+        .variable("level")
+        .ok_or_else(|| anyhow::anyhow!("missing 'level' variable"))?
+        .get_values(..)?;
+
+    let field_var = ds.variable(var_name).ok_or_else(|| anyhow::anyhow!("missing '{var_name}' variable"))?;
+    let missing = missing_value(&field_var);
+    let flat: Vec<f32> = field_var.get_values(..)?;
+
+    Ok(XyVolumeRaw {
+        x,
+        y,
+        levels,
+        flat,
+        missing,
+        origin_lat: global_attr_f32(&ds, "ORIGIN_LATITUDE"),
+        origin_lon: global_attr_f32(&ds, "ORIGIN_LONGITUDE"),
+        storm_name_attr: storm_name_attr(&ds),
+    })
+}
+
+/// Reads one field's *entire* volume (every CAPPI level, not just one) from
+/// an `xy`/`xy_rel` file — backs `GET /v1/tdr/volume` for 3D rendering.
+pub fn read_xy_volume(path: &Path, field: &str) -> anyhow::Result<FieldVolume> {
+    let raw = read_xy_volume_raw(path, field)?;
+    let data = sweep::xy_volume(&raw.flat, raw.x.len(), raw.y.len(), raw.levels.len(), raw.missing);
+    Ok(FieldVolume {
+        x: raw.x,
+        y: raw.y,
+        levels: raw.levels,
+        data,
+        origin_lat: raw.origin_lat,
+        origin_lon: raw.origin_lon,
+        storm_name_attr: raw.storm_name_attr,
+    })
+}
+
+/// Max-value projection across every CAPPI level at one analysis time — the
+/// "altitude" composite mode of `GET /v1/tdr/composite`.
+pub fn read_xy_altitude_composite(path: &Path, field: &str) -> anyhow::Result<FieldSlice> {
+    let raw = read_xy_volume_raw(path, field)?;
+    let data = sweep::max_projection(&raw.flat, raw.x.len(), raw.y.len(), raw.levels.len(), raw.missing);
+    Ok(FieldSlice {
+        x: raw.x,
+        y: raw.y,
+        data,
+        z_km: None,
+        origin_lat: raw.origin_lat,
+        origin_lon: raw.origin_lon,
+        storm_name_attr: raw.storm_name_attr,
+    })
 }
 
 /// Downloads + gunzips one product file into the cache dir if not already
@@ -146,42 +243,19 @@ fn storm_name_attr(ds: &netcdf::File) -> Option<String> {
 /// `LATITUDE` variables) rather than guessing at that schema's layout —
 /// see the README's TDR roadmap entry for why that's out of scope for now.
 pub fn read_xy_slice(path: &Path, field: &str, requested_z_km: Option<f32>) -> anyhow::Result<FieldSlice> {
-    let var_name = resolve_var_name(XY_FIELD_VARS, field)
-        .ok_or_else(|| anyhow::anyhow!("unknown xy field '{field}', expected one of {:?}", xy_field_names()))?;
-
-    let _guard = nc_lock();
-    let ds = netcdf::open(path)?;
-    if ds.variable("x").is_none() || ds.variable("y").is_none() || ds.variable("LATITUDE").is_none() {
-        anyhow::bail!(
-            "this xy.nc file isn't the post-2021 Cartesian x/y + LATITUDE/LONGITUDE schema this \
-             endpoint supports (see the AOML TDR README's 2021 gridding-change note) — pre-2021 \
-             lat/lon-gridded files aren't handled yet"
-        );
-    }
-
-    let x: Vec<f32> = ds.variable("x").unwrap().get_values(..)?;
-    let y: Vec<f32> = ds.variable("y").unwrap().get_values(..)?;
-    let levels: Vec<f32> = ds
-        .variable("level")
-        .ok_or_else(|| anyhow::anyhow!("missing 'level' variable"))?
-        .get_values(..)?;
-
-    let field_var = ds.variable(var_name).ok_or_else(|| anyhow::anyhow!("missing '{var_name}' variable"))?;
-    let missing = missing_value(&field_var);
-    let flat: Vec<f32> = field_var.get_values(..)?;
-
-    let level_idx = sweep::nearest_index(&levels, requested_z_km.unwrap_or(2.0));
-    let z_km = levels[level_idx];
-    let data = sweep::cappi_slice(&flat, x.len(), y.len(), levels.len(), level_idx, missing);
+    let raw = read_xy_volume_raw(path, field)?;
+    let level_idx = sweep::nearest_index(&raw.levels, requested_z_km.unwrap_or(2.0));
+    let z_km = raw.levels[level_idx];
+    let data = sweep::cappi_slice(&raw.flat, raw.x.len(), raw.y.len(), raw.levels.len(), level_idx, raw.missing);
 
     Ok(FieldSlice {
-        x,
-        y,
+        x: raw.x,
+        y: raw.y,
         data,
         z_km: Some(z_km),
-        origin_lat: global_attr_f32(&ds, "ORIGIN_LATITUDE"),
-        origin_lon: global_attr_f32(&ds, "ORIGIN_LONGITUDE"),
-        storm_name_attr: storm_name_attr(&ds),
+        origin_lat: raw.origin_lat,
+        origin_lon: raw.origin_lon,
+        storm_name_attr: raw.storm_name_attr,
     })
 }
 

@@ -55,6 +55,58 @@ pub fn cappi_slice(flat: &[f32], nx: usize, ny: usize, nlevel: usize, level_idx:
     out
 }
 
+/// The full `(level, y, x)` volume from a flattened `(x, y, level, time=1)`
+/// array — every CAPPI plane, not just one, for a genuine 3D view.
+/// `out[level_idx][yi][xi]`, same missing-value masking as [`cappi_slice`].
+pub fn xy_volume(flat: &[f32], nx: usize, ny: usize, nlevel: usize, missing: f32) -> Vec<Vec<Vec<Option<f32>>>> {
+    (0..nlevel).map(|level_idx| cappi_slice(flat, nx, ny, nlevel, level_idx, missing)).collect()
+}
+
+/// Max-value projection across the `level` axis of a flattened `(x, y,
+/// level, time=1)` array — a "composite reflectivity"-style flattening of
+/// the whole altitude column into one horizontal plane, ignoring missing
+/// values at any given level. Returns `data[yi][xi]`, same orientation as
+/// [`cappi_slice`]. `None` only where every level is missing at that (x,y).
+pub fn max_projection(flat: &[f32], nx: usize, ny: usize, nlevel: usize, missing: f32) -> Vec<Vec<Option<f32>>> {
+    let mut out = vec![vec![None; nx]; ny];
+    for xi in 0..nx {
+        for yi in 0..ny {
+            let mut best: Option<f32> = None;
+            for level_idx in 0..nlevel {
+                let idx = (xi * ny + yi) * nlevel + level_idx;
+                let v = flat.get(idx).copied().unwrap_or(f32::NAN);
+                if is_missing(v, missing) {
+                    continue;
+                }
+                best = Some(best.map_or(v, |b| b.max(v)));
+            }
+            out[yi][xi] = best;
+        }
+    }
+    out
+}
+
+/// Pixel-wise max across several already-sliced `(y, x)` planes sharing the
+/// same grid — used to mosaic one CAPPI level across a mission's whole
+/// timeline (see `GET /v1/tdr/composite?mode=time`). All `planes` must have
+/// identical dimensions; the caller is responsible for grid-compatibility
+/// (same `x`/`y` coordinate arrays) since this function only sees values.
+pub fn max_composite(planes: &[Vec<Vec<Option<f32>>>]) -> Vec<Vec<Option<f32>>> {
+    let Some(first) = planes.first() else { return Vec::new() };
+    let (ny, nx) = (first.len(), first.first().map_or(0, |r| r.len()));
+    let mut out = vec![vec![None; nx]; ny];
+    for plane in planes {
+        for yi in 0..ny {
+            for xi in 0..nx {
+                if let Some(v) = plane[yi][xi] {
+                    out[yi][xi] = Some(out[yi][xi].map_or(v, |b: f32| b.max(v)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The `(radius, height)` plane from a flattened `(radius, heading=1,
 /// height, time=1)` array. Returns `data[zi][ri]` (height rows, radius
 /// columns) so a Plotly heatmap plots height bottom-up along `y` and
@@ -164,6 +216,36 @@ mod tests {
         assert_eq!(out[0], vec![Some(0.0), Some(10.0)]);
         assert_eq!(out[1], vec![Some(1.0), Some(11.0)]);
         assert_eq!(out[2], vec![Some(2.0), Some(12.0)]);
+    }
+
+    #[test]
+    fn xy_volume_returns_every_level_in_cappi_orientation() {
+        let flat = vec![0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0];
+        let vol = xy_volume(&flat, 2, 2, 2, -999.9);
+        assert_eq!(vol.len(), 2);
+        assert_eq!(vol[0], cappi_slice(&flat, 2, 2, 2, 0, -999.9));
+        assert_eq!(vol[1], cappi_slice(&flat, 2, 2, 2, 1, -999.9));
+    }
+
+    #[test]
+    fn max_projection_takes_max_across_levels_and_skips_missing() {
+        // nx=1, ny=1, nlevel=3: values 5, -999.9 (missing), 8 at that pixel.
+        let flat = vec![5.0, -999.9, 8.0];
+        let out = max_projection(&flat, 1, 1, 3, -999.9);
+        assert_eq!(out[0][0], Some(8.0));
+
+        // Every level missing -> None.
+        let all_missing = vec![-999.9, -999.9];
+        let out = max_projection(&all_missing, 1, 1, 2, -999.9);
+        assert_eq!(out[0][0], None);
+    }
+
+    #[test]
+    fn max_composite_merges_planes_pixelwise() {
+        let a = vec![vec![Some(1.0), None], vec![Some(3.0), Some(4.0)]];
+        let b = vec![vec![Some(2.0), Some(5.0)], vec![None, Some(1.0)]];
+        let out = max_composite(&[a, b]);
+        assert_eq!(out, vec![vec![Some(2.0), Some(5.0)], vec![Some(3.0), Some(4.0)]]);
     }
 
     #[test]

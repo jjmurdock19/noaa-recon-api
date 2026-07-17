@@ -442,6 +442,14 @@
           <button class="primary-btn" id="tdr-update-btn">Force update: TDR</button>
           <span class="status-text" id="tdr-update-status"></span>
         </div>
+        <div class="row" style="margin-top:6px;">
+          <div class="field-group">
+            <span class="field-label">TDR backfill years (e.g. 2015-2018 or 2015,2017)</span>
+            <input type="text" id="tdr-backfill-years" placeholder="first-last or comma list" style="width:220px">
+          </div>
+          <button class="primary-btn" id="tdr-backfill-btn" title="Crawl only the given years — same incremental, non-destructive ingest as Force update, just reaching further back than the default last-2-years window">Backfill TDR years</button>
+          <span class="status-text" id="tdr-backfill-status"></span>
+        </div>
 
         <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
@@ -1816,13 +1824,14 @@ function pollArchiveUpdate(archive, btn, statusEl) {
     }, 3000);
 }
 
-function startArchiveUpdate(archive, btnId, statusId) {
+function startArchiveUpdate(archive, btnId, statusId, years) {
     const btn = document.getElementById(btnId);
     const statusEl = document.getElementById(statusId);
     btn.disabled = true;
     statusEl.textContent = 'Starting…';
     statusEl.className = 'status-text working';
-    api(`/v1/admin/archive-update/${archive}`, { method: 'POST' })
+    const qs = years ? `?years=${encodeURIComponent(years)}` : '';
+    api(`/v1/admin/archive-update/${archive}${qs}`, { method: 'POST' })
         .then(async (res) => {
             if (!res.ok) {
                 const err = await res.json();
@@ -1840,6 +1849,22 @@ function startArchiveUpdate(archive, btnId, statusId) {
         });
 }
 
+// A plain "YYYY-YYYY" range or comma list -> the API's comma-separated
+// years param (e.g. "2015-2018" -> "2015,2016,2017,2018").
+function parseYearsInput(raw) {
+    const s = (raw || '').trim();
+    if (!s) return null;
+    const range = s.match(/^(\d{4})\s*-\s*(\d{4})$/);
+    if (range) {
+        const [a, b] = [parseInt(range[1], 10), parseInt(range[2], 10)];
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        const years = [];
+        for (let y = lo; y <= hi; y++) years.push(y);
+        return years.join(',');
+    }
+    return s.split(',').map(y => y.trim()).filter(Boolean).join(',');
+}
+
 document.getElementById('storms-update-btn').addEventListener('click', () => {
     startArchiveUpdate('storms', 'storms-update-btn', 'storms-update-status');
 });
@@ -1848,6 +1873,16 @@ document.getElementById('reconmet-update-btn').addEventListener('click', () => {
 });
 document.getElementById('tdr-update-btn').addEventListener('click', () => {
     startArchiveUpdate('tdr', 'tdr-update-btn', 'tdr-update-status');
+});
+document.getElementById('tdr-backfill-btn').addEventListener('click', () => {
+    const statusEl = document.getElementById('tdr-backfill-status');
+    const years = parseYearsInput(document.getElementById('tdr-backfill-years').value);
+    if (!years) {
+        statusEl.textContent = 'Enter a year range (e.g. 2015-2018) first.';
+        statusEl.className = 'status-text err';
+        return;
+    }
+    startArchiveUpdate('tdr', 'tdr-backfill-btn', 'tdr-backfill-status', years);
 });
 
 // ── Database viewer — browse storms/recon MET by year -> storm ─────────
