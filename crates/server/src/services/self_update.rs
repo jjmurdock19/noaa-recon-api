@@ -164,6 +164,52 @@ fn set_status(job: &Mutex<Value>, status: &str) {
     job.lock().unwrap()["status"] = json!(status);
 }
 
+/// GCC >= 14 raises permerrors on netCDF-C's older source; install.sh's
+/// `build_rust()` sets the same downgrade for the exact same reason. Only
+/// matters if a rebuild needs to recompile netCDF-C/HDF5 from scratch (a
+/// clean checkout, or a Cargo.lock change pulling in a new C dependency) —
+/// harmless to set unconditionally otherwise.
+const NETCDF_CFLAGS: &str = "-Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration";
+
+/// Resolves cargo's absolute path — mirroring `install.sh`'s `_cargo_bin()`.
+/// `install.sh` installs the toolchain with `rustup ... --no-modify-path`
+/// *specifically* because a systemd-run service's PATH never includes
+/// `~/.cargo/bin` (see its own comment: "$HOME isn't reliable under `sudo
+/// -u`"), and resolves the absolute path for its own build step accordingly.
+/// A bare `Command::new("cargo")` here would therefore fail with "No such
+/// file or directory" on **every** deployment that followed this project's
+/// own installer, not just a misconfigured one — this must resolve the same
+/// way, not rely on PATH. Falls back to bare `"cargo"` only if no home
+/// directory can be determined at all, so a manual dev shell where `cargo`
+/// really is on PATH still works.
+fn cargo_bin() -> PathBuf {
+    resolve_cargo_bin(cargo_home_dir())
+}
+
+fn cargo_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cargo")))
+}
+
+/// Pure resolution logic, split out from [`cargo_bin`] so it's testable
+/// without mutating process-global env vars.
+fn resolve_cargo_bin(cargo_home: Option<PathBuf>) -> PathBuf {
+    let exe_name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    match cargo_home {
+        Some(home) => {
+            let candidate = home.join("bin").join(exe_name);
+            if candidate.is_file() {
+                candidate
+            } else {
+                PathBuf::from("cargo")
+            }
+        }
+        None => PathBuf::from("cargo"),
+    }
+}
+
 /// Appends one line of `cargo build` output to the job's `build_log`,
 /// trimming from the front once it exceeds [`BUILD_LOG_CAP`]. The console
 /// polls the job (same 1.5s cadence as the rest of self-update) and renders
@@ -251,13 +297,22 @@ pub async fn apply_update(repo_root: PathBuf, state: std::sync::Arc<SelfUpdateSt
         // produced (rather than collected via `.output()` and only visible
         // once the whole build finishes) so the console can show it live.
         set_status(&state.job, "building");
-        let mut child = Command::new("cargo")
+        let cargo_path = cargo_bin();
+        let mut child = Command::new(&cargo_path)
             .args(["build", "--release", "-p", "noaa-recon-api"])
             .current_dir(&repo_root)
+            .env("CFLAGS", NETCDF_CFLAGS)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("failed to start cargo build: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "failed to start cargo build (tried '{}'): {e}. Is rustup installed for this \
+                     process's user? See install.sh's _cargo_bin()/build_rust() for how the \
+                     installer resolves this same path.",
+                    cargo_path.display()
+                )
+            })?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_task = tokio::spawn(pump_build_log(stdout, state.clone()));
@@ -303,5 +358,38 @@ pub async fn apply_update(repo_root: PathBuf, state: std::sync::Arc<SelfUpdateSt
         // that was just pulled.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_cargo_under_a_real_cargo_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+        std::fs::write(bin_dir.join(exe_name), b"").unwrap();
+
+        let resolved = resolve_cargo_bin(Some(tmp.path().to_path_buf()));
+        assert_eq!(resolved, bin_dir.join(exe_name));
+    }
+
+    #[test]
+    fn falls_back_to_bare_cargo_when_not_found_at_the_resolved_home() {
+        // A CARGO_HOME that doesn't actually contain a cargo binary (e.g. the
+        // rustup install genuinely isn't there) must fall back to a bare
+        // "cargo" PATH lookup rather than pointing at a file that doesn't
+        // exist — this is the last-resort "manual dev shell" case.
+        let tmp = tempfile::tempdir().unwrap();
+        let resolved = resolve_cargo_bin(Some(tmp.path().to_path_buf()));
+        assert_eq!(resolved, PathBuf::from("cargo"));
+    }
+
+    #[test]
+    fn falls_back_to_bare_cargo_with_no_home_at_all() {
+        assert_eq!(resolve_cargo_bin(None), PathBuf::from("cargo"));
     }
 }
