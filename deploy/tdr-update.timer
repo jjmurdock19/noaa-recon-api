@@ -1,0 +1,18 @@
+# See tdr-update.service for install instructions — install both files
+# together, then enable/start only the .timer (it pulls in the .service
+# each time it fires).
+#
+# Fires 15 minutes after recon-met-update (03:45) and 15 minutes before
+# goes-nc-cache-cleanup (04:15), so the three nightly crawls don't compete
+# for network/CPU at the same instant. Cheap relative to the other two —
+# this only crawls directory listings and indexes file metadata, it never
+# downloads a netCDF file (see services/tdr_ingest.rs).
+[Unit]
+Description=Nightly trigger for tdr-update.service
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

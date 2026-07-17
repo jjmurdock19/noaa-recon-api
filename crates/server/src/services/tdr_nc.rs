@@ -1,0 +1,229 @@
+//! TDR netCDF fetch + decode — the server-side half of `GET /v1/tdr/sweep`
+//! (the pure slicing math lives in `noaa_recon_core::sweep`, WASM-safe).
+//!
+//! Unlike `tdr_ingest.rs`, this module *does* download a file — but only the
+//! one file a real request actually asks for, lazily on first request,
+//! cached under `cache/tdr_nc/` forever after. Same on-demand-cache
+//! principle as `cache/goes_nc/` in `goes.rs`, just without that module's
+//! job/poll ceremony: a `.gz` here is a few MB at most (an `xy.nc.gz` is
+//! ~5-7MB, `vert_*.nc.gz` under 150KB), much smaller than GOES's ~25MB S3
+//! fetches or the recon archive's ~85MB full-resolution downloads — and the
+//! recon archive's own `/mission/{id}/download` streams synchronously with
+//! no job/poll wrapper either, for the same reason. Revisit if a slower
+//! decode/slice step gets added later.
+
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+
+use noaa_recon_core::sweep;
+
+use crate::services::goes::nc_lock;
+
+const DEFAULT_MISSING: f32 = -999.9;
+
+/// xy-volume field name -> netCDF variable name (all dims `x,y,level,time`).
+const XY_FIELD_VARS: &[(&str, &str)] = &[
+    ("reflectivity", "REFLECTIVITY"),
+    ("radial_wind", "RADIAL_WIND"),
+    ("tangential_wind", "TANGENTIAL_WIND"),
+    ("u", "U"),
+    ("v", "V"),
+    ("w", "W"),
+    ("vort", "VORT"),
+    ("wind_speed", "WIND_SPEED"),
+];
+
+/// Vertical-profile field name -> netCDF variable name (all dims
+/// `radius,heading,height,time`) — note the mixed-case variable names here,
+/// genuinely different from the xy volume's all-caps convention (both
+/// confirmed against real files, not a typo).
+const VERT_FIELD_VARS: &[(&str, &str)] = &[
+    ("reflectivity", "REFLECTIVITY"),
+    ("radial_wind", "Radial_wind"),
+    ("tangential_wind", "Tangential_Wind"),
+    ("wind_speed", "Wind_Speed"),
+];
+
+pub fn xy_field_names() -> Vec<&'static str> {
+    XY_FIELD_VARS.iter().map(|(k, _)| *k).collect()
+}
+
+pub fn vert_field_names() -> Vec<&'static str> {
+    VERT_FIELD_VARS.iter().map(|(k, _)| *k).collect()
+}
+
+fn resolve_var_name(table: &[(&'static str, &'static str)], field: &str) -> Option<&'static str> {
+    table.iter().find(|(k, _)| *k == field).map(|(_, v)| *v)
+}
+
+pub struct FieldSlice {
+    /// Column coordinate: km-from-origin for an xy CAPPI, along-track radius
+    /// (km) for a vertical profile.
+    pub x: Vec<f32>,
+    /// Row coordinate: km-from-origin for an xy CAPPI, height (km) for a
+    /// vertical profile.
+    pub y: Vec<f32>,
+    pub data: Vec<Vec<Option<f32>>>,
+    /// Resolved CAPPI altitude (xy product only — `None` for a vertical profile).
+    pub z_km: Option<f32>,
+    pub origin_lat: Option<f32>,
+    pub origin_lon: Option<f32>,
+    pub storm_name_attr: Option<String>,
+}
+
+/// Downloads + gunzips one product file into the cache dir if not already
+/// there. `cache_key` should uniquely identify (mission_id, level, product,
+/// analysis_time) — see `routers/tdr.rs`.
+pub async fn fetch_and_cache(cache_dir: &Path, source_url: &str, cache_key: &str) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir)?;
+    let dest = cache_dir.join(format!("{cache_key}.nc"));
+    if dest.exists() {
+        return Ok(dest);
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("noaa-recon-api/0.1")
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let bytes = client.get(source_url).send().await?.error_for_status()?.bytes().await?;
+
+    let decompressed = if source_url.ends_with(".gz") {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out)?;
+        out
+    } else {
+        bytes.to_vec()
+    };
+
+    // Write under a unique temp name then rename (atomic on the same
+    // filesystem) so a concurrent request for the same key never observes a
+    // partially-written file.
+    let tmp = cache_dir.join(format!("{cache_key}.{}.part", std::process::id()));
+    std::fs::write(&tmp, &decompressed)?;
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
+}
+
+fn var_attr_f32(var: &netcdf::Variable, name: &str) -> Option<f32> {
+    use netcdf::AttributeValue::*;
+    match var.attribute_value(name)?.ok()? {
+        Float(v) => Some(v),
+        Double(v) => Some(v as f32),
+        Int(v) => Some(v as f32),
+        Short(v) => Some(v as f32),
+        _ => None,
+    }
+}
+
+fn missing_value(var: &netcdf::Variable) -> f32 {
+    var_attr_f32(var, "missing_value").or_else(|| var_attr_f32(var, "_FillValue")).unwrap_or(DEFAULT_MISSING)
+}
+
+fn global_attr_f32(ds: &netcdf::File, name: &str) -> Option<f32> {
+    use netcdf::AttributeValue::*;
+    match ds.attribute(name)?.value().ok()? {
+        Float(v) => Some(v),
+        Double(v) => Some(v as f32),
+        _ => None,
+    }
+}
+
+fn global_attr_str(ds: &netcdf::File, name: &str) -> Option<String> {
+    match ds.attribute(name)?.value().ok()? {
+        netcdf::AttributeValue::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn storm_name_attr(ds: &netcdf::File) -> Option<String> {
+    global_attr_str(ds, "STORM NAME").or_else(|| global_attr_str(ds, "STMNAME"))
+}
+
+/// Reads one field from an `xy`/`xy_rel` volume file and slices out the
+/// CAPPI plane nearest `requested_z_km` (default 2.0km — above the lowest
+/// level, which the AOML TDR README warns isn't representative of the
+/// surface). Errors on a pre-2021 lat/lon-gridded file (no `x`/`y`/
+/// `LATITUDE` variables) rather than guessing at that schema's layout —
+/// see the README's TDR roadmap entry for why that's out of scope for now.
+pub fn read_xy_slice(path: &Path, field: &str, requested_z_km: Option<f32>) -> anyhow::Result<FieldSlice> {
+    let var_name = resolve_var_name(XY_FIELD_VARS, field)
+        .ok_or_else(|| anyhow::anyhow!("unknown xy field '{field}', expected one of {:?}", xy_field_names()))?;
+
+    let _guard = nc_lock();
+    let ds = netcdf::open(path)?;
+    if ds.variable("x").is_none() || ds.variable("y").is_none() || ds.variable("LATITUDE").is_none() {
+        anyhow::bail!(
+            "this xy.nc file isn't the post-2021 Cartesian x/y + LATITUDE/LONGITUDE schema this \
+             endpoint supports (see the AOML TDR README's 2021 gridding-change note) — pre-2021 \
+             lat/lon-gridded files aren't handled yet"
+        );
+    }
+
+    let x: Vec<f32> = ds.variable("x").unwrap().get_values(..)?;
+    let y: Vec<f32> = ds.variable("y").unwrap().get_values(..)?;
+    let levels: Vec<f32> = ds
+        .variable("level")
+        .ok_or_else(|| anyhow::anyhow!("missing 'level' variable"))?
+        .get_values(..)?;
+
+    let field_var = ds.variable(var_name).ok_or_else(|| anyhow::anyhow!("missing '{var_name}' variable"))?;
+    let missing = missing_value(&field_var);
+    let flat: Vec<f32> = field_var.get_values(..)?;
+
+    let level_idx = sweep::nearest_index(&levels, requested_z_km.unwrap_or(2.0));
+    let z_km = levels[level_idx];
+    let data = sweep::cappi_slice(&flat, x.len(), y.len(), levels.len(), level_idx, missing);
+
+    Ok(FieldSlice {
+        x,
+        y,
+        data,
+        z_km: Some(z_km),
+        origin_lat: global_attr_f32(&ds, "ORIGIN_LATITUDE"),
+        origin_lon: global_attr_f32(&ds, "ORIGIN_LONGITUDE"),
+        storm_name_attr: storm_name_attr(&ds),
+    })
+}
+
+/// Reads one field from a `vert_inbound`/`vert_outbound` profile file (any
+/// `_rel`/`_fall` variant) — the whole file already is the 2D (radius,
+/// height) slice, no level selection needed. Errors if the file doesn't
+/// have exactly one heading (this endpoint has only been verified against
+/// single-azimuth profiles).
+pub fn read_vert_slice(path: &Path, field: &str) -> anyhow::Result<FieldSlice> {
+    let var_name = resolve_var_name(VERT_FIELD_VARS, field).ok_or_else(|| {
+        anyhow::anyhow!("unknown vertical-profile field '{field}', expected one of {:?}", vert_field_names())
+    })?;
+
+    let _guard = nc_lock();
+    let ds = netcdf::open(path)?;
+    let heading_len = ds.dimensions().find(|d| d.name() == "heading").map(|d| d.len());
+    if heading_len != Some(1) {
+        anyhow::bail!("expected a single-heading vertical profile (heading dim = 1), got {heading_len:?}");
+    }
+
+    let radius: Vec<f32> = ds
+        .variable("radius")
+        .ok_or_else(|| anyhow::anyhow!("missing 'radius' variable"))?
+        .get_values(..)?;
+    let height: Vec<f32> = ds
+        .variable("height")
+        .ok_or_else(|| anyhow::anyhow!("missing 'height' variable"))?
+        .get_values(..)?;
+
+    let field_var = ds.variable(var_name).ok_or_else(|| anyhow::anyhow!("missing '{var_name}' variable"))?;
+    let missing = missing_value(&field_var);
+    let flat: Vec<f32> = field_var.get_values(..)?;
+
+    let data = sweep::vertical_profile_slice(&flat, radius.len(), height.len(), missing);
+
+    Ok(FieldSlice {
+        x: radius,
+        y: height,
+        data,
+        z_km: None,
+        origin_lat: None,
+        origin_lon: None,
+        storm_name_attr: storm_name_attr(&ds),
+    })
+}

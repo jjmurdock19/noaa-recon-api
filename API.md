@@ -58,8 +58,11 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | `GET /v1/recon/{year}/{storm_name}` | 🟢 Live |
 | `GET /v1/recon/mission/{mission_id}` | 🟢 Live |
 | `GET /v1/recon/mission/{mission_id}/download` | 🟢 Live |
-| `GET /v1/tdr/missions` | 🟡 Planned |
-| `GET /v1/tdr/sweep` | 🟡 Planned |
+| `GET /v1/tdr/years` | 🟢 Live |
+| `GET /v1/tdr/{year}` | 🟢 Live |
+| `GET /v1/tdr/{year}/{storm_name}` | 🟢 Live |
+| `GET /v1/tdr/mission/{mission_id}` | 🟢 Live |
+| `GET /v1/tdr/sweep` | 🟢 Live (post-2021 Cartesian-grid files only — see below) |
 | `GET /v1/raw/netcdf` | 🟡 Planned |
 | `GET /demo/netcdf-three/` (static 3D client) | 🟢 Live (sample data only until raw passthrough ships) |
 | `GET /` (admin console) + `/v1/admin/*` | 🟢 Live (login required, see README) |
@@ -564,17 +567,126 @@ curl -o mission.nc "https://joshmurdock.net/api/v1/recon/mission/20240630I1/down
 
 ---
 
-## `GET /v1/tdr/missions` 🟡 / `GET /v1/tdr/sweep` 🟡
+## `GET /v1/tdr/*` 🟢 — Tail Doppler Radar (TDR) archive
 
-Not implemented yet — both return `501` today. Planned shape (subject to
-change until implemented): `sweep` will mirror the response shape the
-hurricanes site's `js/tdr-archive.js` already consumes from a third-party
-API (TC-Atlas) — a storm-relative grid (`x`/`y` in km from storm center),
-a `data` 2D array, and a Plotly-style `colorscale` — so the same client
-rendering code can be pointed at this API once it ships. See
-[`app/services/tdr.py`](app/services/tdr.py) for the in-progress design
-(mission crawler over NOAA's raw archive, no manifest exists today so a
-local index has to be built).
+A local index of NOAA's Tail Doppler Radar mission archive — built the same
+way as the recon MET archive (no manifest exists upstream, so
+[`crates/server/src/services/tdr_ingest.rs`](crates/server/src/services/tdr_ingest.rs)
+crawls the directory listings), but across **two source levels** with
+different hosts and QC lineage:
+
+- **Level 1b** — real-time products generated on the aircraft during the
+  flight, at `seb.omao.noaa.gov/pub/flight/radar/{mission_id}/`. Available
+  as soon as a mission lands; no storm name in the path.
+- **Level 2** — the same file shapes, reprocessed on the ground after the
+  season with better QC, at
+  `www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level2/{year}/{storm_slug}/{mission_id}/`.
+  Only available months after a storm, but the storm name is part of the
+  path itself.
+
+A mission can appear at either level, both, or (rarely) neither yet.
+`mission_id` (`YYYYMMDDAI`) uses the exact same scheme as the recon MET
+archive's mission IDs — see "Recon MET archive" above — so storm-name
+resolution piggybacks on whatever that archive already reconciled for the
+same ID rather than re-deriving it from scratch; a Level 2 directory name is
+the fallback, then "Unknown".
+
+This phase only indexes file **metadata** (mission → product → source URL)
+— it never downloads a netCDF file. Actual decode/slice rendering
+(`GET /v1/tdr/sweep` below) is a follow-up phase.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/tdr/years` | Every year with at least one indexed TDR mission. |
+| `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. Missions not yet reconciled to a storm are grouped under `storm_name: "Unknown"`. |
+| `GET /v1/tdr/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, has_level1b, has_level2}[]`. |
+| `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., file_count, files: [{level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}]}`. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). |
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/2024/Beryl"
+# {"year":2024,"storm_name":"Beryl","missions":[
+#   {"mission_id":"20240630I1","aircraft":"NOAA 43 (Miss Piggy)","tail_num":"N43",
+#    "has_level1b":true,"has_level2":true}, ...]}
+```
+
+## `GET /v1/tdr/sweep` 🟢
+
+Fetches one indexed product file (lazily, cached under `cache/tdr_nc/` on
+first request — see `services/tdr_nc.rs`), decodes it, and slices out a
+single 2D plane: a horizontal CAPPI for an `xy`/`xy_rel` volume, or the
+whole `(radius, height)` grid for a `vert_inbound`/`vert_outbound` profile
+(those files are already 2D — no level selection needed). Response shape
+mirrors the hurricanes site's `js/tdr-archive.js` (originally built against
+a third-party API, TC-Atlas): a storm-relative grid (`x`/`y` in km), a
+`data` 2D array, and a Plotly-style `colorscale` — the same client
+rendering code works against either source.
+
+**Verified against the post-2021 Cartesian grid schema only** (`x`/`y`
+dims + 2D `LATITUDE`/`LONGITUDE`, per the AOML TDR README's 2021
+gridding-change note). A pre-2021 file (regularly-spaced lat/lon grid,
+`lats`/`lons` 1D variables) returns `400` rather than guessing at that
+schema's layout — nobody has inspected a real one yet.
+
+### Query parameters
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `mission_id` | string | *required* | e.g. `20240630I1`. |
+| `product` | string | *required* | `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall` — see `GET /v1/tdr/mission/{id}` for what a given mission actually has. |
+| `analysis_time` | string | *required* | `HHMM`, matching one of the mission's indexed analysis times. |
+| `field` | string | *required* | `xy`/`xy_rel`: `reflectivity`, `radial_wind`, `tangential_wind`, `u`, `v`, `w`, `vort`, `wind_speed`. `vert_*`: `reflectivity`, `radial_wind`, `tangential_wind`, `wind_speed`. |
+| `level` | string | resolved | `1b` or `2` (which source level's file to read). Defaults to `2` if that mission has a Level 2 file, else `1b`. |
+| `z` | float | `2.0` | `xy`/`xy_rel` only — CAPPI altitude in km, snapped to the nearest actual analysis level (echoed back as `z_km`). Ignored for `vert_*` (no level axis). |
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&z=2.0"
+```
+
+```json
+{
+  "mission_id": "20240630I1",
+  "storm_name": "BERYL",
+  "level": "2",
+  "product": "xy",
+  "analysis_time": "1201",
+  "field": "reflectivity",
+  "z_km": 2.0,
+  "x": [-249.0, -247.0, "...", 249.0],
+  "y": [-249.0, -247.0, "...", 249.0],
+  "data": [["...250x250 values, null where no data..."]],
+  "colorscale": [[0.0, "#04e9e7"], ["...", "..."], [1.0, "#ffffff"]],
+  "zmin": 0.0,
+  "zmax": 70.0,
+  "units": "dBZ",
+  "origin_lat": 10.53,
+  "origin_lon": -53.96
+}
+```
+
+- `x`/`y` are km from the grid origin (`origin_lat`/`origin_lon`, the storm
+  center at analysis time) for an `xy` product, or along-track radius (`x`)
+  and height (`y`) in km for a `vert_*` product — `z_km`/`origin_lat`/
+  `origin_lon` are `null` in that case, since a vertical profile has no
+  level axis or fixed grid origin.
+- `data[row][col]` — for `xy`, row indexes `y` and col indexes `x` (a
+  north-up map); for `vert_*`, row indexes `y`/height and col indexes
+  `x`/radius (a bottom-up cross-section). A cell is `null` wherever the
+  source file's `missing_value` sentinel (commonly `-999.9`, not
+  `_FillValue`) appears — no radar coverage at that point.
+- `colorscale`/`zmin`/`zmax` are a **suggested** default (reflectivity gets
+  the common green→yellow→red→magenta radar convention; every wind field
+  except `wind_speed` gets a blue-white-red diverging scale since sign is
+  physically meaningful — inbound vs outbound, updraft vs downdraft).
+  Nothing stops a client from ignoring them and supplying its own.
+
+### Error responses
+
+- `404` — unknown `mission_id`, or no file on record for the given
+  `level`/`product`/`analysis_time` (check `GET /v1/tdr/mission/{id}` for
+  what's actually indexed).
+- `400` — unknown `field` for the given `product`, or a pre-2021
+  lat/lon-gridded file (unsupported schema — see above).
+- `502` — the upstream NOAA host couldn't be reached to fetch the source file.
 
 ---
 

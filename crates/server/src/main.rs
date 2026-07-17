@@ -52,9 +52,10 @@ async fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("ingest-storms") => return cmd_ingest_storms(&paths).await,
         Some("ingest-recon") => return cmd_ingest_recon(&paths, &args).await,
+        Some("ingest-tdr") => return cmd_ingest_tdr(&paths, &args).await,
         Some("clean-nc-cache") => return cmd_clean_nc_cache(&paths, &args),
         Some("--help" | "-h") => {
-            eprintln!("usage: noaa-recon-api [ingest-storms | ingest-recon [--years Y,Y] [--force] | clean-nc-cache [--max-age-hours N]]\n  (no subcommand: run the HTTP server)");
+            eprintln!("usage: noaa-recon-api [ingest-storms | ingest-recon [--years Y,Y] [--force] | ingest-tdr [--years Y,Y] [--force] | clean-nc-cache [--max-age-hours N]]\n  (no subcommand: run the HTTP server)");
             return Ok(());
         }
         Some(other) => anyhow::bail!("unknown subcommand '{other}' (try --help)"),
@@ -202,6 +203,41 @@ async fn cmd_ingest_recon(paths: &Paths, args: &[String]) -> anyhow::Result<()> 
     println!("Ingesting recon MET archive (crawl + netCDF + reconcile)...");
     let summary =
         services::recon_ingest::run_ingest(&paths.recon_met_db, &paths.storms_db, years, force).await?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+/// `ingest-tdr` subcommand — crawls both TDR source hosts (Level 1b + Level 2)
+/// and builds/refreshes `data/tdr.sqlite`. Same `--years`/`--full`/`--force`
+/// shape as `ingest-recon` — see services/tdr_ingest.rs for the crawl itself.
+async fn cmd_ingest_tdr(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
+    use chrono::Datelike;
+    let mut years: Option<Vec<i64>> = None;
+    let mut force = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--years" => {
+                years = args.get(i + 1).map(|s| {
+                    s.split(',').filter_map(|y| y.trim().parse::<i64>().ok()).collect()
+                });
+                i += 2;
+            }
+            // --full: every season since the archive's first year (2011).
+            "--full" => {
+                let now = chrono::Utc::now().year() as i64;
+                years = Some((2011..=now).collect());
+                i += 1;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    println!("Ingesting TDR archive (crawl Level 1b + Level 2, build local index)...");
+    let summary = services::tdr_ingest::run_ingest(&paths.tdr_db, &paths.recon_met_db, years, force).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }

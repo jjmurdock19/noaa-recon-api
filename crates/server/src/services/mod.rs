@@ -13,4 +13,7 @@ pub mod recon_met;
 pub mod self_update;
 pub mod stats;
 pub mod storms;
+pub mod tdr;
+pub mod tdr_ingest;
+pub mod tdr_nc;
 pub mod tokens;

@@ -17,6 +17,7 @@ pub mod colormap;
 pub mod models;
 pub mod project; // Web-Mercator + geostationary geometry (abi_to_latlon)
 pub mod render; // array -> RGBA (gap-fill, smooth, colorize)
+pub mod sweep; // TDR sweep slicing (CAPPI / vertical-profile plane extraction)
 
 // The netCDF/HDF5 decode itself stays in crates/server (needs the C library);
 // the render pipeline above takes decoded arrays as input, so it stays WASM-safe

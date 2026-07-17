@@ -15,6 +15,7 @@ pub struct Paths {
     pub data_root: PathBuf,
     pub storms_db: PathBuf,
     pub recon_met_db: PathBuf,
+    pub tdr_db: PathBuf,
     pub auth_db: PathBuf,
 }
 
@@ -35,6 +36,7 @@ impl Paths {
         Ok(Self {
             storms_db: data_root.join("storms.sqlite"),
             recon_met_db: data_root.join("recon_met.sqlite"),
+            tdr_db: data_root.join("tdr.sqlite"),
             auth_db: data_root.join("auth.sqlite"),
             repo_root,
             cache_root,

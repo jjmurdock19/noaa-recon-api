@@ -189,10 +189,13 @@ Python-specific ones).
 
 
 **Status:** Undergoing active development. Storm tracks, the recon archive
-(read *and* ingest), and single-band IR satellite tiles (bands 7/9/13) are
-fully implemented and verified against live NOAA data on this branch.
-Reflectance-band tiles (2/3/5), the composite products, and TDR data are
-still in the works (`501 Not Implemented`) — see "Roadmap" below.
+(read *and* ingest), single-band IR satellite tiles (bands 7/9/13), and the
+full TDR pipeline (mission/file index, ingest, and sweep slice rendering)
+are fully implemented and verified against live NOAA data on this branch.
+Reflectance-band tiles (2/3/5) and the composite products are still in the
+works, along with the raw-netCDF passthrough (`501 Not Implemented`) — see
+"Roadmap" below. TDR sweep rendering only covers the post-2021 Cartesian
+grid schema so far — see "TDR archive" below.
 
 ## Sources
 
@@ -228,13 +231,22 @@ SFMR surface wind, altitude) to ~7 fields for quick plotting, and
 full-resolution file (600+ variables) unmodified, straight from that same
 archive.
 
-**TDR (planned, not yet implemented)** — same host as the recon archive,
-[`seb.omao.noaa.gov/pub/acdata`](https://seb.omao.noaa.gov/pub/acdata/), but
-targeting the per-instrument Tail Doppler Radar `.tar.gz` bundles in each
-mission directory rather than the MET NetCDF file. See
-`crates/server/src/routers/tdr.rs` for the current stub and the Roadmap
-below for what's missing (there's no manifest, so it needs a crawler over
-the mission-directory listing).
+**Tail Doppler Radar (TDR)** — two hosts, two QC lineages, same file-naming
+convention (see the AOML "Guide to the TDR dataset" this was built
+against): **Level 1b** (real-time, in-season) at
+[`seb.omao.noaa.gov/pub/flight/radar`](https://seb.omao.noaa.gov/pub/flight/radar/),
+flat mission directories with no manifest; **Level 2** (post-season, QC'd)
+at
+[`www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level2`](https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level2/),
+organized `{year}/{storm_slug}/{mission_id}/`. This project indexes the
+gridded analysis products from both (3D `xy` volumes, `vert_inbound`/
+`vert_outbound` profiles, and their `_rel`/`_fall` variants) — not the raw
+Level 1a Doppler sweeps, which would require reimplementing HRD's
+variational Doppler synthesis algorithm rather than just serving already-
+synthesized data. See `crates/server/src/services/tdr_ingest.rs` for the
+crawler (no manifest exists at either host, so it walks the directory
+listings the same way the recon MET crawler does) and "TDR archive" below
+for ingest details.
 
 ## Imagery Processing
 
@@ -393,15 +405,16 @@ flowchart LR
 
     subgraph "noaa-recon-api (Rust / axum)"
         D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
-        E["/v1/tdr/* (planned)"]
+        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
         H["crates/server services/goes.rs<br/>(decode + S3 fetch)"]
-        K["crates/core render.rs/colormap.rs<br/>(WASM-safe: projection + colorize)"]
+        K["crates/core render.rs/colormap.rs/sweep.rs<br/>(WASM-safe: projection + colorize + slicing)"]
+        L["services/tdr_ingest.rs<br/>(crawl + index, no downloads)<br/>services/tdr_nc.rs (fetch + slice, on demand)"]
     end
 
     I[(NOAA S3<br/>noaa-goes16/17/18/19)]
-    J[(NOAA TDR archive<br/>seb.omao.noaa.gov, planned)]
+    J[(NOAA TDR archive<br/>seb.omao.noaa.gov + aoml.noaa.gov)]
 
     A & B -->|HTTP, CORS open| D
     C -.->|planned| F
@@ -409,7 +422,9 @@ flowchart LR
     G --> H
     H --> K
     H -->|public bucket, no auth| I
-    E -.-> J
+    A & B --> E
+    E --> L
+    L -->|directory-listing crawl| J
 ```
 
 ## Request flow (satellite tile)
@@ -518,6 +533,12 @@ without further attention:
 Then install both nightly timers (details in the two sections below) so
 each archive keeps itself current going forward without manual re-runs.
 
+`GET /v1/tdr/*` is a separate archive (`data/tdr.sqlite`, `ingest-tdr`) —
+not yet wired into `install.sh`'s automatic setup, so build and time it by
+hand for now (see "TDR archive" below); it's lighter than the recon
+backfill since it only indexes file metadata, never downloads a netCDF
+file.
+
 ### Storm archive updates
 
 `data/storms.sqlite` (the `GET /v1/storms/*` backing store) is populated by
@@ -576,6 +597,40 @@ Fires nightly at 03:45 (30 minutes after the storm archive timer, so the
 two crawls don't compete for network/CPU at the same instant);
 `Persistent=true` for the same missed-run-catches-up-on-boot behavior.
 Also visible in Cockpit's Services page (search "recon-met-update").
+
+### TDR archive
+
+`data/tdr.sqlite` (the `GET /v1/tdr/*` backing store) is populated by the
+`ingest-tdr` subcommand — see
+[`crates/server/src/services/tdr_ingest.rs`](crates/server/src/services/tdr_ingest.rs)
+for the Level 1b + Level 2 crawler. Unlike the recon MET archive, this
+phase never downloads a netCDF file — it only indexes mission → product →
+source-URL metadata (a mission can have a dozen multi-MB analysis grids;
+bulk-downloading all of them during ingest would be exactly the kind of
+server load this project avoids). Run it manually any time:
+
+```bash
+./target/release/noaa-recon-api ingest-tdr                    # current + previous year (nightly default)
+./target/release/noaa-recon-api ingest-tdr --full              # every year since 2011 — see the recon warning above
+./target/release/noaa-recon-api ingest-tdr --years 2024        # one year only
+./target/release/noaa-recon-api ingest-tdr --force              # re-crawl a mission's file listing even if already indexed
+```
+
+Idempotent: a mission already indexed at a given level is skipped (no HTTP
+request against its file listing) unless `--force`, so a nightly re-run
+only does real work for new missions. Install the nightly timer the same
+way:
+
+```bash
+sudo cp deploy/tdr-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tdr-update.timer
+```
+
+Fires nightly at 04:00 (between the recon MET timer at 03:45 and the GOES
+cache-cleanup timer at 04:15); `Persistent=true` for the same missed-run-
+catches-up-on-boot behavior. Also visible in Cockpit's Services page
+(search "tdr-update").
 
 ### GOES netCDF cache cleanup
 
@@ -741,6 +796,12 @@ crates/
                                    (paint_project, "Real bugs" #3), NaN gap-fill, NaN-aware smoothing,
                                    colorize -> RGBA. render_full_disk()/render_bbox() are the two
                                    entry points; the server calls these with an already-decoded array.
+      sweep.rs                       TDR sweep slicing for GET /v1/tdr/sweep: cappi_slice() (one
+                                   x/y plane from a flattened x,y,level,time array),
+                                   vertical_profile_slice() (the radius/height plane from a vert_* file),
+                                   and colorscale_for_field() (dBZ / wind-speed / diverging-wind
+                                   defaults). Pure index math + a lookup table, no I/O — tdr_nc.rs
+                                   in the server crate does the netCDF decode and hands it a flat array.
   server/                       noaa-recon-api — the axum binary; every native/C dependency lives here
     src/
       main.rs                      Entry point: with no args, boots the HTTP server (CORS, request-
@@ -771,7 +832,10 @@ crates/
         admin_tokens.rs                Token CRUD, login-log, usage-log, auth-config toggle.
         storms.rs / recon.rs           Read-path routers (the ingest logic lives in services/, called
                                    from main.rs's subcommand dispatch, not from these routers).
-        tdr.rs / raw.rs                 501 stubs, same messages as the Python branch.
+        tdr.rs                         Mission/file discovery (years/:year/mission, same
+                                   ingest-logic-lives-in-services/ split as storms.rs/recon.rs) AND
+                                   /tdr/sweep (fetch/cache -> tdr_nc.rs -> slice -> JSON). All live.
+        raw.rs                          501 stub, same message as the Python branch.
         health.rs
       services/
         tokens.rs                       Token/account store backing both auth mechanisms — data/
@@ -787,6 +851,18 @@ crates/
                                    decode, PDF storm-name extraction (pdf-extract crate), and the full
                                    haversine-track-matching reconciliation layer that figures out which
                                    storm each mission actually flew. Called by `ingest-recon`.
+        tdr.rs                          tdr.sqlite READ path only (GET /v1/tdr/*).
+        tdr_ingest.rs                     tdr.sqlite ingest: crawls both TDR hosts (Level 1b + Level 2,
+                                   no manifest at either) and indexes file metadata only — never
+                                   downloads a netCDF file. Storm-name resolution piggybacks on
+                                   recon_met.sqlite where possible, since TDR and recon MET mission_ids
+                                   use the identical YYYYMMDDAI scheme. Called by `ingest-tdr`.
+        tdr_nc.rs                         GET /v1/tdr/sweep's fetch/decode half: downloads + gunzips one
+                                   indexed product file lazily on first request (cached under
+                                   cache/tdr_nc/, same on-demand pattern as goes.rs's cache/goes_nc/,
+                                   just without its job/poll ceremony — these files are far smaller),
+                                   then reads the requested field and hands the flat array to
+                                   crates/core's sweep.rs for the actual slicing.
         goes.rs                          S3 list/fetch (reqwest + quick-xml) + netCDF decode (the
                                    netcdf crate — mask/scale handling is manual, unlike netCDF4-python;
                                    see RUST.md's "critical decode gotcha") + PNG encode, single-band and
@@ -955,19 +1031,30 @@ this branch — axum has no auto-generated docs UI to misconfigure.*
    means sourcing (or building) a city-lights raster and implementing real
    atmospheric correction — a substantially bigger lift than the rest of
    this project's rendering pipeline.
-7. **TDR**: crawl `https://seb.omao.noaa.gov/pub/acdata/{year}/` for
-   `YYYYMMDD[N|I|H]#/` mission directories (no manifest exists — build a
-   local index, e.g. SQLite), download/extract the `.tar.gz` bundles in each
-   mission's `RADAR_TDR/`, parse the raw netCDF sweeps (variable/dimension
-   layout not yet inspected from a real file as of this writing), and
-   render to a storm-relative grid + Plotly-colorscale shape matching
-   whatever the intended downstream client expects.
+7. **TDR sweep rendering — pre-2021 schema** (`GET /v1/tdr/sweep`): the
+   post-2021 Cartesian grid schema (`x`/`y` dims + 2D `LATITUDE`/
+   `LONGITUDE`) is fully implemented and verified against real `xy`/
+   `vert_inbound`/`vert_outbound` files — see `services/tdr_nc.rs` and
+   `crates/core/src/sweep.rs`. What's left: the AOML TDR README documents a
+   2021 gridding-change break — pre-2021 files are regularly-spaced in
+   lat/lon instead (1D `lats`/`lons` variables, no Cartesian `x`/`y`), a
+   genuinely different layout this hasn't been tested against (today it
+   returns `400` rather than guess). Needs a real pre-2021 file inspected
+   the same way the post-2021 one was (`nc_info()` structural dump, then
+   verify array-flattening order against real coordinate values — don't
+   assume). Deliberately permanently out of scope: the raw Level 1a Doppler
+   sweeps (`RADAR_TDR/` bundles) — those are pre-synthesis and would
+   require reimplementing HRD's variational Doppler synthesis algorithm,
+   not just serving already-gridded data.
 8. **Raw netCDF passthrough** (`crates/server/src/routers/raw.rs`): for the
    GOES side this can subset directly from the same file `goes.rs` already
    downloads (no new data source) — a `netcdf` crate variable slice by
    center/dimensions, streamed back with `Content-Type: application/x-netcdf`.
    The recon MET side already has this — see `GET /v1/recon/mission/{id}/download`.
-   The TDR side depends on (7) above.
+   The TDR side can reuse `tdr_nc.rs`'s `fetch_and_cache()` (already fetches
+   + decompresses a mission's file) and just stream the cached `.nc`
+   straight through, same as the recon MET path — no new fetch logic
+   needed, just the route.
 9. **Extend historical satellite coverage** — pre-2017 storms (e.g.
    Katrina, 2005) predate the ABI instrument entirely and need a
    different data source and file-format parser, not just another S3
