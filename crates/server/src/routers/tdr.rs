@@ -313,10 +313,15 @@ struct CompositeQuery {
     /// `altitude`: max-value projection across every CAPPI level at one
     /// analysis time. `time`: max-value mosaic of one CAPPI level across
     /// every analysis time in the mission, aligned by storm center.
+    /// `time_volume`: same storm-center alignment as `time`, but mosaics
+    /// *every* CAPPI level instead of collapsing to one — a genuine 3D
+    /// composite, volume-shaped like `GET /v1/tdr/volume` rather than
+    /// sweep-shaped.
     mode: String,
-    /// Required for `mode=altitude`, ignored for `mode=time`.
+    /// Required for `mode=altitude`, ignored otherwise.
     analysis_time: Option<String>,
     /// `mode=time` only — which CAPPI level to mosaic. Defaults to 2.0km.
+    /// Ignored for `mode=time_volume`, which mosaics every level.
     z: Option<f32>,
 }
 
@@ -340,6 +345,26 @@ struct CompositeQuery {
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
     let conn = tdr::get_connection(&state.paths.tdr_db)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
+
+    if q.mode == "time_volume" {
+        if !q.product.starts_with("xy") {
+            return Err(ApiError::bad_request(format!(
+                "Unknown product '{}' — expected xy or xy_rel.",
+                q.product
+            )));
+        }
+        let mission = tdr::get_mission(&conn, &q.mission_id)?
+            .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {}", q.mission_id)))?;
+        let level = q.level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
+        let files = tdr::find_files_for_product(&conn, &q.mission_id, &level, &q.product)?;
+        if files.is_empty() {
+            return Err(ApiError::not_found(format!(
+                "No '{}' netCDF files on record for mission {} at level {level}.",
+                q.product, q.mission_id
+            )));
+        }
+        return get_composite_time_volume(mission, level, files, &cache_dir, &q).await;
+    }
 
     let (mission, level, x, y, data, detail, origin) = match q.mode.as_str() {
         "altitude" => {
@@ -435,7 +460,9 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
             )
         }
         other => {
-            return Err(ApiError::bad_request(format!("Unknown mode '{other}' — expected 'altitude' or 'time'.")));
+            return Err(ApiError::bad_request(format!(
+                "Unknown mode '{other}' — expected 'altitude', 'time', or 'time_volume'."
+            )));
         }
     };
 
@@ -455,6 +482,116 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
         "data": data_out,
         "origin_lat": origin.map(|(la, _)| la),
         "origin_lon": origin.map(|(_, lo)| lo),
+        "colorscale": cs.stops,
+        "zmin": cs.zmin,
+        "zmax": cs.zmax,
+        "units": cs.units,
+    })))
+}
+
+/// `mode=time_volume` — the 3D counterpart to `mode=time`: instead of
+/// collapsing to one CAPPI level before mosaicking, this reads every
+/// analysis time's *entire* volume and mosaics level-by-level (same
+/// storm-center alignment as `mode=time`, run once per level), so the
+/// result is a genuine 3D composite the dashboard can feed straight into
+/// the same volumetric raymarch renderer as `GET /v1/tdr/volume` — hence
+/// the volume-shaped (not sweep-shaped) response.
+// Takes mission/level/files already resolved (owned, not a `&Connection` —
+// rusqlite's Connection isn't Sync, so a reference to it can't cross the
+// `.await`s below without making the whole handler's future non-Send; the
+// caller does the DB lookups synchronously and hands off owned data).
+async fn get_composite_time_volume(
+    mission: tdr::Mission,
+    level: String,
+    files: Vec<tdr::FileRecord>,
+    cache_dir: &std::path::Path,
+    q: &CompositeQuery,
+) -> ApiResult<Json<Value>> {
+    // Read every analysis time's whole volume first — need them all in hand
+    // before we know the reference origin and canonical level grid.
+    let mut volumes = Vec::with_capacity(files.len());
+    for file in &files {
+        let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
+        let nc_path = tdr_nc::fetch_and_cache(cache_dir, &file.source_url, &cache_key)
+            .await
+            .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
+        let field = q.field.clone();
+        let volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+            .await
+            .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        volumes.push((file.analysis_time.clone(), volume));
+    }
+
+    // Same reasoning as mode=time: no origin, no anchor to align by.
+    let mut usable: Vec<_> = volumes.iter().filter(|(_, v)| v.origin_lat.is_some() && v.origin_lon.is_some()).collect();
+    if usable.len() < 2 {
+        return Err(ApiError::bad_request(format!(
+            "Only {} of {} analysis time(s) had an ORIGIN_LATITUDE/LONGITUDE to align by — \
+             a time mosaic needs at least 2.",
+            usable.len(),
+            volumes.len()
+        )));
+    }
+    usable.sort_by(|a, b| a.0.cmp(&b.0));
+    let (lat0, lon0) = (usable[0].1.origin_lat.unwrap(), usable[0].1.origin_lon.unwrap());
+
+    // Every volume needs the same level grid to mosaic level-by-level —
+    // drop any whose levels don't match the reference (first usable) rather
+    // than guessing how to reconcile mismatched CAPPI grids.
+    let reference_levels = usable[0].1.levels.clone();
+    let levels_match = |levels: &[f32]| {
+        levels.len() == reference_levels.len()
+            && levels.iter().zip(&reference_levels).all(|(a, b)| (a - b).abs() < 0.01)
+    };
+    let usable: Vec<_> = usable.into_iter().filter(|(_, v)| levels_match(&v.levels)).collect();
+    if usable.len() < 2 {
+        return Err(ApiError::bad_request(
+            "Fewer than 2 analysis times share a common CAPPI level grid — can't build a 3D time mosaic."
+                .to_string(),
+        ));
+    }
+
+    let times_used: Vec<String> = usable.iter().map(|(t, _)| t.clone()).collect();
+    let n_levels = reference_levels.len();
+    let mut mosaic_x = Vec::new();
+    let mut mosaic_y = Vec::new();
+    let mut data_out: Vec<Vec<Vec<Option<f64>>>> = Vec::with_capacity(n_levels);
+    for li in 0..n_levels {
+        let planes: Vec<noaa_recon_core::sweep::GeoPlane> = usable
+            .iter()
+            .map(|(_, v)| {
+                let (offset_x_km, offset_y_km) =
+                    noaa_recon_core::sweep::latlon_offset_km(v.origin_lat.unwrap(), v.origin_lon.unwrap(), lat0, lon0);
+                noaa_recon_core::sweep::GeoPlane { x: &v.x, y: &v.y, data: &v.data[li], offset_x_km, offset_y_km }
+            })
+            .collect();
+        let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes);
+        if li == 0 {
+            mosaic_x = mosaic.x;
+            mosaic_y = mosaic.y;
+        }
+        data_out.push(mosaic.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect());
+    }
+
+    let cs = colorscale_for_field(&q.field);
+    Ok(Json(json!({
+        "mission_id": mission.mission_id,
+        "storm_name": mission.storm_name,
+        "level": level,
+        "product": q.product,
+        "field": q.field,
+        "mode": "time_volume",
+        "detail": {
+            "analysis_times_used": times_used,
+            "reference_origin": {"lat": lat0, "lon": lon0},
+        },
+        "x": mosaic_x,
+        "y": mosaic_y,
+        "levels_km": reference_levels,
+        "data": data_out,
+        "origin_lat": lat0,
+        "origin_lon": lon0,
         "colorscale": cs.stops,
         "zmin": cs.zmin,
         "zmax": cs.zmax,

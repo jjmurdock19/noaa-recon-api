@@ -167,23 +167,19 @@
       <legend>Product <button type="button" id="product-help-btn" class="neutral" title="What do these products mean?" style="padding:1px 8px; margin-left:4px; border-radius:50%; font-weight:bold;">?</button></legend>
       <div class="field"><label for="sel-view">View</label>
         <select id="sel-view">
-          <option value="sweep">2D sweep (CAPPI / vertical profile)</option>
-          <option value="volume">3D volume</option>
-          <option value="composite">Composite</option>
+          <option value="sweep">2D</option>
+          <option value="volume">3D</option>
         </select>
       </div>
       <div class="row" style="margin-top:8px">
         <div class="field"><label for="sel-level">Level</label><select id="sel-level"></select></div>
         <div class="field"><label for="sel-product">Product</label><select id="sel-product"></select></div>
       </div>
-      <div class="field" id="field-composite-mode" style="margin-top:8px">
-        <label for="sel-composite-mode">Composite mode</label>
-        <select id="sel-composite-mode">
-          <option value="altitude">Altitude max-projection (one time, all levels)</option>
-          <option value="time">Time mosaic (one level, whole mission)</option>
-        </select>
-      </div>
       <div class="field" id="field-time" style="margin-top:8px"><label for="sel-time">Analysis time (UTC)</label><select id="sel-time"></select></div>
+      <label class="field" id="field-altitude-composite" style="margin-top:8px; flex-direction:row; align-items:center; gap:6px; font-size:12px;">
+        <input type="checkbox" id="chk-altitude-composite" style="width:auto;">
+        Altitude max-projection (collapse levels, 2D only)
+      </label>
       <div class="field" style="margin-top:8px"><label for="sel-field">Field</label><select id="sel-field"></select></div>
       <div class="field" id="field-z" style="margin-top:8px">
         <label for="inp-z">CAPPI altitude (km)</label>
@@ -479,8 +475,21 @@ function distinct(arr) { return Array.from(new Set(arr)); }
 const VIEW_HINTS = {
   sweep: '2D sweep plots one horizontal CAPPI or the along-track vertical profile.',
   volume: '3D volume renders the full xy/xy_rel field as a continuous volumetric solid (GPU raymarched through every CAPPI level at once) — drag to orbit, scroll to zoom. Only xy-family products have a level axis, so vertical profiles aren’t selectable here.',
-  composite: 'Composite flattens a mission into one image: "Altitude max-projection" collapses one analysis time’s whole level axis (like classic composite reflectivity); "Time mosaic" aligns every analysis time by its storm center (ORIGIN_LATITUDE/LONGITUDE) and mosaics one CAPPI level into a single storm-spanning composite — works for either xy or xy_rel.',
+  compositeAltitude: 'Altitude max-projection collapses one analysis time’s whole level axis into a single plane (like classic composite reflectivity).',
+  compositeTime: 'Time mosaic aligns every analysis time by its storm center (ORIGIN_LATITUDE/LONGITUDE) and mosaics one CAPPI level into a single storm-spanning composite.',
+  compositeVolume: '3D composite mosaics every analysis time’s *entire* level axis by storm center into one storm-spanning volumetric composite — same alignment as the 2D time mosaic, extended to every CAPPI level, GPU raymarched the same way as 3D volume.',
 };
+
+// Pseudo analysis_time value: picking it in the time dropdown swaps in a
+// storm-center time mosaic (2D: one level across every time; 3D: every
+// level across every time) instead of one specific instant.
+const TIME_COMPOSITE_VALUE = '__composite__';
+function isTimeComposite() { return $('sel-time').value === TIME_COMPOSITE_VALUE; }
+function canAltitudeComposite() {
+  const product = $('sel-product').value || '';
+  return currentView() === 'sweep' && !product.startsWith('vert_') && !isTimeComposite();
+}
+function isAltitudeComposite() { return canAltitudeComposite() && $('chk-altitude-composite').checked; }
 
 // ── Product help modal ───────────────────────────────────────────────────
 
@@ -557,7 +566,14 @@ function populateTimes() {
   const level = $('sel-level').value;
   const product = $('sel-product').value;
   const times = distinct(missionFiles.filter(f => f.level === level && f.product === product).map(f => f.analysis_time)).sort();
-  fillSelect($('sel-time'), times);
+  const options = [...times];
+  // Only xy-family products have a storm-center grid to mosaic by (see
+  // GET /v1/tdr/composite), and mosaicking needs at least 2 times to mean
+  // anything — so the composite entry only shows up when it'd actually work.
+  if (times.length > 1 && !product.startsWith('vert_')) {
+    options.push([TIME_COMPOSITE_VALUE, 'Composite (mosaic all times)']);
+  }
+  fillSelect($('sel-time'), options);
   populateFields();
 }
 
@@ -573,21 +589,30 @@ function applyViewVisibility() {
   const view = currentView();
   const product = $('sel-product').value || '';
   const isVert = view === 'sweep' && product.startsWith('vert_');
-  const compositeMode = $('sel-composite-mode').value;
+  const timeComposite = isTimeComposite();
 
-  $('field-composite-mode').classList.toggle('hidden', view !== 'composite');
-  const needsTime = view === 'sweep' || (view === 'composite' && compositeMode === 'altitude') || view === 'volume';
-  $('field-time').classList.toggle('hidden', !needsTime);
-  const needsZ = (view === 'sweep' && !isVert) || (view === 'composite' && compositeMode === 'time');
+  // Altitude max-projection collapses levels at one instant, so it's
+  // incompatible with the time-mosaic pseudo-option (which already spans
+  // every instant) and with 3D (which already shows every level).
+  $('field-altitude-composite').classList.toggle('hidden', !canAltitudeComposite());
+  if (!canAltitudeComposite()) $('chk-altitude-composite').checked = false;
+  const altitudeComposite = isAltitudeComposite();
+
+  const needsZ = view === 'sweep' && !isVert && !altitudeComposite;
   $('field-z').classList.toggle('hidden', !needsZ);
   $('field-3d-style').classList.toggle('hidden', view !== 'volume');
 
-  const labels = { sweep: 'Plot sweep', volume: 'Load 3D volume', composite: 'Load composite' };
+  const labels = {
+    sweep: (timeComposite || altitudeComposite) ? 'Load composite' : 'Plot sweep',
+    volume: timeComposite ? 'Load 3D composite' : 'Load 3D volume',
+  };
   $('btn-load').textContent = labels[view] || 'Plot';
-  $('view-hint').textContent = VIEW_HINTS[view] || '';
+  let hint = VIEW_HINTS[view] || '';
+  if (altitudeComposite) hint = VIEW_HINTS.compositeAltitude;
+  else if (timeComposite) hint = view === 'volume' ? VIEW_HINTS.compositeVolume : VIEW_HINTS.compositeTime;
+  $('view-hint').textContent = hint;
 
-  const showPlotly = view === 'sweep' || view === 'composite';
-  $('plot').style.display = showPlotly ? '' : 'none';
+  $('plot').style.display = view === 'sweep' ? '' : 'none';
   $('plot3d').style.display = view === 'volume' ? 'flex' : 'none';
   if (view === 'volume') requestAnimationFrame(ensure3dSceneSized);
 }
@@ -1545,22 +1570,30 @@ async function plotVolume() {
   }
 }
 
+// One of three composite modes, resolved from the view + time-picker state
+// rather than a separate mode selector (see isTimeComposite/isAltitudeComposite):
+// 'altitude' (2D, one instant, every level collapsed), 'time' (2D, one
+// level, every instant mosaicked), 'time_volume' (3D, every level *and*
+// every instant mosaicked — the volume-shaped counterpart of 'time').
 async function plotComposite() {
   const missionId = $('sel-mission').value;
   const level = $('sel-level').value;
   const product = $('sel-product').value;
   const field = $('sel-field').value;
-  const mode = $('sel-composite-mode').value;
+  const mode = isTimeComposite() ? (currentView() === 'volume' ? 'time_volume' : 'time') : 'altitude';
   const btn = $('btn-load');
 
   const params = new URLSearchParams({ mission_id: missionId, level, product, field, mode });
   if (mode === 'altitude') params.set('analysis_time', $('sel-time').value);
-  else params.set('z', $('inp-z').value || '2.0');
+  else if (mode === 'time') params.set('z', $('inp-z').value || '2.0');
+  // time_volume mosaics every level — no z, no single analysis_time.
 
   btn.disabled = true;
-  setStatus('loading', mode === 'time'
-    ? 'Fetching every analysis time and mosaicking one level (may take a while for a long mission)…'
-    : 'Fetching + collapsing the level axis…');
+  setStatus('loading', mode === 'time_volume'
+    ? 'Fetching every analysis time\'s full volume and mosaicking every level (may take a while for a long mission)…'
+    : mode === 'time'
+      ? 'Fetching every analysis time and mosaicking one level (may take a while for a long mission)…'
+      : 'Fetching + collapsing the level axis…');
   try {
     const comp = await getJSON(`/v1/tdr/composite?${params.toString()}`);
     const isoTime = mode === 'altitude'
@@ -1570,18 +1603,33 @@ async function plotComposite() {
       mission_id: comp.mission_id, origin_lat: comp.origin_lat, origin_lon: comp.origin_lon,
       x: comp.x, y: comp.y, isoTime, truncateToLeg: false,
     });
-    render(comp, false);
+
     const info = $('info-bar');
-    const detail = mode === 'altitude'
-      ? `<span>Analysis time: <b>${comp.detail.analysis_time}Z</b></span>`
-      : `<span>Level: <b>${comp.detail.z_km} km</b></span><span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>`;
-    info.innerHTML = `
-      <span>Storm: <b>${comp.storm_name || '—'}</b></span>
-      <span>Mission: <b>${comp.mission_id}</b></span>
-      <span>Mode: <b>${mode === 'altitude' ? 'Altitude max-projection' : 'Time mosaic'}</b></span>
-      <span>Field: <b>${comp.field}</b> (${comp.units})</span>
-      ${detail}
-    `;
+    info.style.display = '';
+    if (mode === 'time_volume') {
+      lastVolume = comp;
+      buildVolumeScene(comp);
+      info.innerHTML = `
+        <span>Storm: <b>${comp.storm_name || '—'}</b></span>
+        <span>Mission: <b>${comp.mission_id}</b></span>
+        <span>Mode: <b>3D time mosaic composite</b></span>
+        <span>Field: <b>${comp.field}</b> (${comp.units})</span>
+        <span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>
+        <span>Levels: <b>${comp.levels_km.length}</b> (${Math.min(...comp.levels_km)}–${Math.max(...comp.levels_km)} km)</span>
+      `;
+    } else {
+      render(comp, false);
+      const detail = mode === 'altitude'
+        ? `<span>Analysis time: <b>${comp.detail.analysis_time}Z</b></span>`
+        : `<span>Level: <b>${comp.detail.z_km} km</b></span><span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>`;
+      info.innerHTML = `
+        <span>Storm: <b>${comp.storm_name || '—'}</b></span>
+        <span>Mission: <b>${comp.mission_id}</b></span>
+        <span>Mode: <b>${mode === 'altitude' ? 'Altitude max-projection' : 'Time mosaic'}</b></span>
+        <span>Field: <b>${comp.field}</b> (${comp.units})</span>
+        ${detail}
+      `;
+    }
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1783,7 +1831,8 @@ $('sel-mission').addEventListener('change', (e) => loadMissionFiles(e.target.val
 $('sel-view').addEventListener('change', populateProducts);
 $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
-$('sel-composite-mode').addEventListener('change', applyViewVisibility);
+$('sel-time').addEventListener('change', applyViewVisibility);
+$('chk-altitude-composite').addEventListener('change', applyViewVisibility);
 $('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
 
 $('product-help-btn').addEventListener('click', openHelpModal);
@@ -1819,8 +1868,8 @@ $('opacity-overall').addEventListener('input', (e) => {
 
 $('btn-load').addEventListener('click', () => {
   const view = currentView();
-  if (view === 'volume') plotVolume();
-  else if (view === 'composite') plotComposite();
+  if (isTimeComposite() || isAltitudeComposite()) plotComposite();
+  else if (view === 'volume') plotVolume();
   else plotSweep();
 });
 
