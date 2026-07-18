@@ -18,11 +18,16 @@
 //!   radar/level2/{year}/{storm_slug}/{mission_id}/` — the storm name *is*
 //!   part of the path.
 //!
-//! Only the gridded analysis products are indexed (`xy`/`xy_rel`, the
-//! `vert_inbound`/`vert_outbound` profiles, and the two AWIPS derivatives) —
-//! the ancillary `analysis.tar`/`radials.so.gz`/`jobfile.tar.gz` bundles
+//! Only the gridded analysis products are indexed as *files* (`xy`/`xy_rel`,
+//! the `vert_inbound`/`vert_outbound` profiles, and the two AWIPS
+//! derivatives) — the ancillary `radials.so.gz`/`jobfile.tar.gz` bundles
 //! aren't netCDF and aren't what a future slice/passthrough endpoint would
-//! ever read, so there's no reason to index them.
+//! ever read, so there's no reason to index them as files. The one
+//! exception is `{prefix}_{start}_{stop}_analysis.tar`: its *filename*
+//! (never its contents — this module still never downloads a bundle)
+//! carries the real HHMM start/stop of the radar leg that produced it, one
+//! bundle per leg, which is the only place that boundary actually lives —
+//! see `parse_leg_filename` and the `legs` table.
 //!
 //! Storm-name resolution piggybacks on the recon MET archive where
 //! possible: TDR `mission_id`s (`YYYYMMDDAI`) use the exact same scheme as
@@ -178,6 +183,21 @@ fn parse_product_filename(name: &str) -> Option<ParsedFile> {
     })
 }
 
+/// Recognizes a leg's bundle filename, `{YYMMDDAI}_{startHHMM}_{stopHHMM}_analysis.tar`
+/// (optionally `.gz`) — confirmed against a live crawl of both hosts to be
+/// present for every leg, one bundle each, with the two 4-digit groups being
+/// that leg's actual radar-on/radar-off times (not analysis_times — those
+/// only mark when one product inside the leg was centered). Returns
+/// `(start_time, stop_time)`. Only the filename is ever read; the tar itself
+/// is never fetched — see the module doc comment.
+fn parse_leg_filename(name: &str) -> Option<(String, String)> {
+    static LEG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = LEG_RE
+        .get_or_init(|| Regex::new(r"(?i)^\d{6}[a-z]\d+_(\d{4})_(\d{4})_analysis\.tar(?:\.gz)?$").unwrap());
+    let c = re.captures(name)?;
+    Some((c[1].to_string(), c[2].to_string()))
+}
+
 fn mission_year(mission_id: &str) -> Option<i64> {
     mission_id.get(0..4)?.parse().ok()
 }
@@ -287,6 +307,13 @@ async fn harvest_mission_dir(
     if files.is_empty() {
         return Ok(false);
     }
+    let legs: Vec<(String, String, String)> = hrefs
+        .iter()
+        .filter_map(|h| {
+            let name = h.rsplit('/').next().unwrap_or(h);
+            parse_leg_filename(name).map(|(start, stop)| (start, stop, format!("{mission_url}{name}")))
+        })
+        .collect();
 
     let (storm_name, storm_id) = resolve_storm(recon_conn, conn, mission_id, level2_storm_slug)?;
     let (aircraft, tail_num) = aircraft_from_mission_id(mission_id);
@@ -336,12 +363,27 @@ async fn harvest_mission_dir(
                 fetched_at,
             ])?;
         }
+
+        let mut leg_stmt = conn.prepare(
+            "INSERT INTO legs (mission_id, level, start_time, stop_time, source_url, fetched_at) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(mission_id, level, start_time, stop_time) DO UPDATE SET \
+               source_url=excluded.source_url, fetched_at=excluded.fetched_at",
+        )?;
+        for (start, stop, url) in &legs {
+            leg_stmt.execute(rusqlite::params![mission_id, level.as_str(), start, stop, url, fetched_at])?;
+        }
         Ok(())
     })();
     match res {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
-            tracing::info!("{mission_id} ({}): indexed {} product file(s)", level.as_str(), files.len());
+            tracing::info!(
+                "{mission_id} ({}): indexed {} product file(s), {} leg(s)",
+                level.as_str(),
+                files.len(),
+                legs.len()
+            );
             Ok(true)
         }
         Err(e) => {
@@ -485,6 +527,19 @@ mod tests {
         assert!(parse_product_filename("240630I1_1127_1228_analysis.tar").is_none());
         assert!(parse_product_filename("240630I1_1127_1228_radials.so.gz").is_none());
         assert!(parse_product_filename("20240630123554_20240630I1_120152_jobfile.tar.gz").is_none());
+    }
+
+    #[test]
+    fn parses_leg_bundle_filenames() {
+        let (start, stop) = parse_leg_filename("240630I1_1127_1228_analysis.tar").unwrap();
+        assert_eq!(start, "1127");
+        assert_eq!(stop, "1228");
+        // .gz variant and case-insensitive aircraft letter, seen on both hosts.
+        let (start, stop) = parse_leg_filename("180708h1_1012_1158_analysis.tar.gz").unwrap();
+        assert_eq!(start, "1012");
+        assert_eq!(stop, "1158");
+        assert!(parse_leg_filename("240630I1_1127_radials.so.gz").is_none());
+        assert!(parse_leg_filename("240630I1_1127_xy.nc.gz").is_none());
     }
 
     #[test]

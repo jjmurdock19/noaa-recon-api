@@ -101,6 +101,22 @@ async fn get_mission(
             })
         })
         .collect();
+    // Real radar-on/radar-off times per leg, lifted from each leg's
+    // `*_analysis.tar` bundle filename — see tdr_ingest.rs::parse_leg_filename.
+    // Missions crawled before this existed will have none until re-crawled
+    // (`ingest-tdr --force`); callers should fall back to analysis_times.
+    let legs = tdr::get_mission_legs(&conn, &mission_id)?;
+    let legs_json: Vec<Value> = legs
+        .iter()
+        .map(|l| {
+            json!({
+                "level": l.level,
+                "start_time": l.start_time,
+                "stop_time": l.stop_time,
+                "source_url": l.source_url,
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "mission_id": mission.mission_id,
         "year": mission.year,
@@ -112,6 +128,7 @@ async fn get_mission(
         "has_level2": mission.has_level2,
         "file_count": files.len(),
         "files": files_json,
+        "legs": legs_json,
     })))
 }
 

@@ -53,6 +53,22 @@ CREATE TABLE IF NOT EXISTS files (
     UNIQUE(mission_id, level, product, format, analysis_time)
 );
 CREATE INDEX IF NOT EXISTS idx_tdr_files_mission ON files(mission_id);
+
+-- One row per radar leg (radar started, flown, stopped) — start_time/stop_time
+-- are the real HHMM bounds lifted straight from that leg's
+-- `{prefix}_{start}_{stop}_analysis.tar` bundle filename (see tdr_ingest.rs),
+-- not derived/guessed from the analysis_times of the xy/vert files it produced.
+CREATE TABLE IF NOT EXISTS legs (
+    id          INTEGER PRIMARY KEY,
+    mission_id  TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    level       TEXT NOT NULL,
+    start_time  TEXT NOT NULL,
+    stop_time   TEXT NOT NULL,
+    source_url  TEXT NOT NULL,
+    fetched_at  INTEGER NOT NULL,
+    UNIQUE(mission_id, level, start_time, stop_time)
+);
+CREATE INDEX IF NOT EXISTS idx_tdr_legs_mission ON legs(mission_id);
 ";
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +130,25 @@ impl FileRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LegRecord {
+    pub level: String,
+    pub start_time: String,
+    pub stop_time: String,
+    pub source_url: String,
+}
+
+impl LegRecord {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            level: row.get("level")?,
+            start_time: row.get("start_time")?,
+            stop_time: row.get("stop_time")?,
+            source_url: row.get("source_url")?,
+        })
+    }
+}
+
 pub fn get_connection(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -164,6 +199,16 @@ pub fn get_mission_files(conn: &Connection, mission_id: &str) -> rusqlite::Resul
         "SELECT * FROM files WHERE mission_id = ?1 ORDER BY level, analysis_time, product",
     )?;
     let rows = stmt.query_map([mission_id], FileRecord::from_row)?;
+    rows.collect()
+}
+
+/// A mission's radar legs, chronological — see the `legs` table doc comment
+/// in `SCHEMA` for where start_time/stop_time actually come from.
+pub fn get_mission_legs(conn: &Connection, mission_id: &str) -> rusqlite::Result<Vec<LegRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM legs WHERE mission_id = ?1 ORDER BY start_time",
+    )?;
+    let rows = stmt.query_map([mission_id], LegRecord::from_row)?;
     rows.collect()
 }
 

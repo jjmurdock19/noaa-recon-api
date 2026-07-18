@@ -196,16 +196,27 @@
           <option value="layered">Layered slices (compatibility fallback)</option>
         </select>
       </div>
-      <div class="field" id="field-smoothing" style="margin-top:8px">
-        <label for="inp-smoothing">Smoothing (<span id="smoothing-value">0</span> passes)</label>
-        <input id="inp-smoothing" type="range" min="0" max="3" step="1" value="0" style="width:100%;">
-      </div>
       <button id="btn-load" style="margin-top:12px; width:100%">Plot sweep</button>
     </fieldset>
 
     <div id="view-hint" style="font-size:11px; color:var(--text-faint); line-height:1.5;">
       2D sweep plots one horizontal CAPPI or the along-track vertical profile.
     </div>
+
+    <fieldset id="fs-satellite" style="display:none">
+      <legend>Satellite basemap</legend>
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+        GOES Band 13 (Clean IR), georeferenced under the TDR data — stacks below the
+        2D heatmap and along the floor of the 3D view.
+      </div>
+      <button id="btn-load-satellite" class="neutral" style="width:100%;">Load Band 13 basemap</button>
+      <div id="satellite-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
+      <label style="display:flex; align-items:center; gap:6px; margin-top:10px; font-size:11px; color:var(--text-muted);">
+        <input type="checkbox" id="chk-flight-track" checked>
+        Show recon aircraft track
+      </label>
+      <div id="flight-track-status" style="font-size:11px; color:var(--text-faint); margin-top:2px;"></div>
+    </fieldset>
   </div>
 
   <div id="plot-area">
@@ -237,15 +248,6 @@
           <input type="range" id="opacity-overall" min="0.1" max="3" step="0.05" value="1.6" style="flex:1;">
         </label>
       </div>
-    </div>
-    <div id="satellite-panel" style="display:none; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); padding:12px;">
-      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-        <b style="font-size:12px;">Satellite overlay</b>
-        <span style="font-size:11px; color:var(--text-muted);">GOES Band 13 (Clean IR), centered on the storm at the plotted time</span>
-        <button id="btn-load-satellite" class="neutral" style="margin-left:auto;">Load Band 13 image</button>
-      </div>
-      <div id="satellite-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
-      <img id="satellite-img" style="display:none; margin-top:8px; max-width:100%; border-radius:4px; border:1px solid var(--border);">
     </div>
   </div>
 </main>
@@ -385,9 +387,73 @@ async function loadMissions(year, stormName) {
 }
 
 let missionFiles = []; // flat list of {level, product, format, analysis_time, storm_relative, fall_speed_removed}
+// [startUnix, endUnix][] windows, one per TDR leg, sorted ascending.
+let tdrLegs = [];
+// Whether tdrLegs came from real analysis.tar bundle times (realTdrLegs) or
+// had to be estimated (inferredTdrLegs) because this mission predates that
+// data being captured — surfaced in the flight-track status so it's obvious
+// when a leg's boundary is a guess.
+let tdrLegsAreReal = false;
+
+// Real leg boundaries, straight from the archive: each leg's `*_analysis.tar`
+// bundle filename carries its own actual start/stop HHMM (see backend
+// tdr_ingest.rs::parse_leg_filename) — that's the radar's real on/off time,
+// not a guess. `data.legs` can have the same [start,stop] pair twice (Level
+// 1b and Level 2 both indexing the same leg), so dedupe before sorting.
+function realTdrLegs(missionId, legs) {
+  const seen = new Set();
+  const windows = [];
+  for (const l of legs) {
+    const key = `${l.start_time}-${l.stop_time}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    windows.push([analysisTimeToUnix(missionId, l.start_time), analysisTimeToUnix(missionId, l.stop_time)]);
+  }
+  return windows.sort((a, b) => a[0] - b[0]);
+}
+
+// Fallback for missions indexed before the backend captured real leg
+// bundles (or where the archive simply has no analysis.tar for a leg): every
+// distinct analysis_time IS one leg's own stamp — the radar is started,
+// flown, stopped, and *that* stop is what gets analyzed and sent off as one
+// analysis_time (not a batch of several). So legs partition the mission
+// timeline back-to-back: leg i runs from the previous leg's analysis_time
+// (exclusive) to its own (inclusive). The very first leg has no previous
+// stamp to start from, so it's estimated as starting one median-gap before
+// its own analysis_time. Strictly an approximation — see realTdrLegs above
+// for the actual data.
+function inferredTdrLegs(missionId, files) {
+  const times = distinct(files.map(f => f.analysis_time))
+    .map((hhmm) => analysisTimeToUnix(missionId, hhmm))
+    .sort((a, b) => a - b);
+  if (!times.length) return [];
+  const gaps = [];
+  for (let i = 1; i < times.length; i++) gaps.push(times[i] - times[i - 1]);
+  const sortedGaps = [...gaps].sort((a, b) => a - b);
+  const medianGap = sortedGaps.length ? sortedGaps[Math.floor(sortedGaps.length / 2)] : 15 * 60;
+  return times.map((t, i) => [i === 0 ? t - medianGap : times[i - 1], t]);
+}
+
+// First match wins, and legs are ascending with each one's end equal to the
+// next one's start — so a point sitting exactly on a shared boundary lands
+// in the earlier leg (the one that stamp actually belongs to), not the next.
+function legWindowFor(unixTime) {
+  if (unixTime == null) return null;
+  return tdrLegs.find(([s, e]) => unixTime >= s && unixTime <= e) || null;
+}
 
 async function loadMissionFiles(missionId) {
   $('fs-product').style.display = 'none';
+  // A new mission means any previously loaded satellite basemap / flight
+  // track is for the wrong storm/time — drop it rather than leaving a
+  // stale control visible.
+  currentGeoContext = null;
+  satelliteOverlay = null;
+  currentFlightTrackPoints = [];
+  tdrLegs = [];
+  tdrLegsAreReal = false;
+  $('fs-satellite').style.display = 'none';
+  $('flight-track-status').textContent = '';
   try {
     const data = await getJSON(`/v1/tdr/mission/${encodeURIComponent(missionId)}`);
     missionFiles = (data.files || []).filter(f => f.format === 'nc' && (f.product === 'xy' || f.product.startsWith('xy_') || f.product.startsWith('vert_')));
@@ -395,6 +461,9 @@ async function loadMissionFiles(missionId) {
       setStatus('error', `Mission ${missionId} has no plottable (netCDF) product files indexed.`);
       return;
     }
+    const realLegs = realTdrLegs(missionId, data.legs || []);
+    tdrLegsAreReal = realLegs.length > 0;
+    tdrLegs = tdrLegsAreReal ? realLegs : inferredTdrLegs(missionId, missionFiles);
     setStatus(null, '');
     populateLevels();
     $('fs-product').style.display = '';
@@ -476,7 +545,11 @@ function populateProducts() {
   const view = currentView();
   let products = distinct(missionFiles.filter(f => f.level === level).map(f => f.product)).sort();
   if (view !== 'sweep') products = products.filter(isVolumeCapableProduct);
-  fillSelect($('sel-product'), products);
+  const selProduct = $('sel-product');
+  fillSelect(selProduct, products);
+  // `xy` is by far the most commonly used product — default to it instead
+  // of whatever sorts first alphabetically (vert_inbound, otherwise).
+  if (products.includes('xy')) selProduct.value = 'xy';
   populateTimes();
 }
 
@@ -508,7 +581,6 @@ function applyViewVisibility() {
   const needsZ = (view === 'sweep' && !isVert) || (view === 'composite' && compositeMode === 'time');
   $('field-z').classList.toggle('hidden', !needsZ);
   $('field-3d-style').classList.toggle('hidden', view !== 'volume');
-  $('field-smoothing').classList.toggle('hidden', view !== 'volume');
 
   const labels = { sweep: 'Plot sweep', volume: 'Load 3D volume', composite: 'Load composite' };
   $('btn-load').textContent = labels[view] || 'Plot';
@@ -573,8 +645,21 @@ function initThree() {
   const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
+  // No polar-angle clamp: the camera is free to orbit to any elevation,
+  // including past vertical and from underneath. OrbitControls already
+  // clamps phi to its own internal epsilon short of the exact poles, which
+  // is enough to avoid the lookAt singularity there.
   const group = new THREE.Group();
   scene.add(group);
+  // World X=east/Y=up/Z=north (see addOrientationHelpers) is a left-handed
+  // triple: East x Up = South, not North, so a camera looking straight down
+  // with North held at the top of the screen shows East on the left and
+  // West on the right — a screen-space mirror, not a data error (each axis
+  // is individually correct against real lat/lon; verified against a real
+  // xy.nc file). Mirroring the whole group across X once, here, makes the
+  // triple right-handed so top-down views read the way a map does, without
+  // touching any of the many places x is computed as "east-west km."
+  group.scale.x = -1;
   three = { renderer, scene, camera, controls, group };
   (function animate() {
     requestAnimationFrame(animate);
@@ -724,82 +809,14 @@ void main() {
 // built (nx, nz, ny), NOT (nx, ny, nz), or altitude and north-south swap
 // (this was the "sideways" bug: altitude got mapped to the depth axis and
 // north-south to the height axis).
-// Separable neighbor-average smoothing over the volume's (level, y, x) grid.
-// Each pass averages only over the *valid* (non-missing) neighbors within
-// `radius` along one axis at a time (x, then y, then level) — this both
-// smooths blocky/noisy CAPPI cells and mildly fills small single-cell gaps
-// (since a missing cell can still average in from valid neighbors), without
-// inventing data far from anything actually observed. Returns a new
-// data[level][y][x] array in the same shape as vol.data; radius=0 returns
-// vol.data unchanged.
-function smoothVolume(vol, radius) {
-  if (!radius) return vol.data;
-  const nz = vol.levels_km.length, ny = vol.y.length, nx = vol.x.length;
-  const n = nz * ny * nx;
-  let buf = new Float32Array(n);
-  let i = 0;
-  for (let z = 0; z < nz; z++) {
-    for (let y = 0; y < ny; y++) {
-      for (let x = 0; x < nx; x++) {
-        const v = vol.data[z][y][x];
-        buf[i++] = v == null ? NaN : v;
-      }
-    }
-  }
-
-  function passAxis(src, axis) {
-    const out = new Float32Array(n);
-    const stride = axis === 'x' ? 1 : axis === 'y' ? nx : nx * ny;
-    const size = axis === 'x' ? nx : axis === 'y' ? ny : nz;
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        for (let x = 0; x < nx; x++) {
-          const base = (z * ny + y) * nx + x;
-          const idxAlong = axis === 'x' ? x : axis === 'y' ? y : z;
-          let sum = 0, count = 0;
-          for (let d = -radius; d <= radius; d++) {
-            const j = idxAlong + d;
-            if (j < 0 || j >= size) continue;
-            const v = src[base + d * stride];
-            if (!Number.isNaN(v)) { sum += v; count++; }
-          }
-          out[base] = count > 0 ? sum / count : NaN;
-        }
-      }
-    }
-    return out;
-  }
-
-  buf = passAxis(buf, 'x');
-  buf = passAxis(buf, 'y');
-  buf = passAxis(buf, 'z');
-
-  const out = [];
-  let k = 0;
-  for (let z = 0; z < nz; z++) {
-    const plane = [];
-    for (let y = 0; y < ny; y++) {
-      const row = new Array(nx);
-      for (let x = 0; x < nx; x++) {
-        const v = buf[k++];
-        row[x] = Number.isNaN(v) ? null : v;
-      }
-      plane.push(row);
-    }
-    out.push(plane);
-  }
-  return out;
-}
-
-function buildVolumeTexture(vol, dataOverride) {
+function buildVolumeTexture(vol) {
   const nx = vol.x.length, ny = vol.y.length, nz = vol.levels_km.length;
-  const volData = dataOverride || vol.data;
   const data = new Uint8Array(nx * nz * ny * 4);
   let i = 0;
   for (let ns = 0; ns < ny; ns++) {        // depth axis   -> north-south
     for (let alt = 0; alt < nz; alt++) {   // height axis  -> altitude
       for (let ew = 0; ew < nx; ew++) {    // width axis   -> east-west
-        const value = volData[alt][ns][ew];
+        const value = vol.data[alt][ns][ew];
         const t = normalizeT(value, vol.zmin, vol.zmax);
         const [r, g, b] = t == null ? [0, 0, 0] : interpolateColorRgb(t, vol.colorscale);
         data[i++] = r; data[i++] = g; data[i++] = b;
@@ -819,65 +836,224 @@ function buildVolumeTexture(vol, dataOverride) {
 }
 
 function volumeExtents(vol) {
-  const xExtent = Math.max(...vol.x) - Math.min(...vol.x) || 1;
-  const yExtent = Math.max(...vol.y) - Math.min(...vol.y) || 1;
+  const xMin = Math.min(...vol.x), xMax = Math.max(...vol.x);
+  const yMin = Math.min(...vol.y), yMax = Math.max(...vol.y);
+  const xExtent = xMax - xMin || 1;
+  const yExtent = yMax - yMin || 1;
+  const xCenter = (xMin + xMax) / 2, yCenter = (yMin + yMax) / 2;
   const zMin = Math.min(...vol.levels_km), zMax = Math.max(...vol.levels_km);
   const zSpan = Math.max(zMax - zMin, 1);
   // Vertical exaggeration: real CAPPI spacing (a few km) is tiny next to the
   // ~100+ km horizontal extent, so scale altitude into a comparable range.
   const zScale = (Math.max(xExtent, yExtent) * 0.6) / zSpan;
-  return { xExtent, yExtent, zMin, zMax, zSpan, zScale };
+  return { xMin, xMax, yMin, yMax, xExtent, yExtent, xCenter, yCenter, zMin, zMax, zSpan, zScale };
 }
 
-// ── Orientation helpers (bounding wireframe + axis labels) ─────────────
+// ── Orientation helpers (bounding wireframe, N/S/E/W labels, grid + tick
+// marks) ─────────────────────────────────────────────────────────────────
 // Both scene builders share the same world convention: X = the data's x
 // (E/W of storm center, km), Z = the data's y (N/S of storm center, km),
-// Y = altitude, spanning [0, heightWorld] — added after the "sideways" bug
-// made it clear a bare AxesHelper alone wasn't enough to orient by.
+// Y = altitude, spanning [0, heightWorld]. World (0,0) is the storm's own
+// origin — the box/planes/grid are offset by (xCenter, yCenter) so they sit
+// at the data's *actual* coordinate range rather than assuming it's
+// symmetric around the origin, and grid tick labels show real km values.
 
-function makeTextSprite(text) {
+// Display-only unit conversions — the underlying grid/positions stay in the
+// API's native km throughout; only what a label prints changes.
+const KM_PER_NM = 1.852;
+const FT_PER_KM = 3280.84;
+
+function makeTextSprite(text, opts) {
+  const { fontPx = 32, color = '#ffffff' } = opts || {};
   const canvas = document.createElement('canvas');
-  canvas.width = 200; canvas.height = 48;
   const ctx = canvas.getContext('2d');
-  ctx.font = 'bold 26px sans-serif';
-  ctx.fillStyle = '#ffffff';
+  ctx.font = `bold ${fontPx}px sans-serif`;
+  // Size the canvas to the actual text so longer labels ("6561 ft") don't
+  // clip and short ones ("N") don't render tiny inside an oversized box.
+  const textWidth = ctx.measureText(text).width;
+  canvas.width = Math.ceil(textWidth + fontPx * 0.8);
+  canvas.height = Math.ceil(fontPx * 1.6);
+  // Re-set font: changing canvas.width/height resets the 2D context.
+  ctx.font = `bold ${fontPx}px sans-serif`;
+  ctx.fillStyle = color;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, 100, 24);
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
   const tex = new THREE.CanvasTexture(canvas);
   const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
   const sprite = new THREE.Sprite(mat);
-  const scale = Math.max(1, canvas.width / 10);
-  sprite.scale.set(scale, scale * (canvas.height / canvas.width), 1);
+  // World-unit scale is tied to font size (not canvas pixels), so labels
+  // stay legible relative to the scene regardless of string length.
+  const scaleH = fontPx * 1.1;
+  sprite.scale.set(scaleH * (canvas.width / canvas.height), scaleH, 1);
   return sprite;
 }
 
-function addOrientationHelpers(group, xExtent, yExtent, heightWorld) {
+// A "nice" (1/2/5 x 10^n) step size giving roughly `target` gridlines
+// across `range`.
+function niceGridStep(range, target = 5) {
+  const raw = range / target;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const norm = raw / mag;
+  const step = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10;
+  return step * mag;
+}
+
+function addOrientationHelpers(group, ext) {
+  const { xMin, xMax, yMin, yMax, xExtent, yExtent, xCenter, yCenter, zMin, zMax, heightWorld } = ext;
+  const margin = Math.max(xExtent, yExtent) * 0.08;
+
   const boxGeo = new THREE.BoxGeometry(xExtent, heightWorld, yExtent);
   const wireframe = new THREE.LineSegments(
     new THREE.EdgesGeometry(boxGeo),
-    new THREE.LineBasicMaterial({ color: 0x8899aa, transparent: true, opacity: 0.5 }),
+    new THREE.LineBasicMaterial({ color: 0xd8e4f0, transparent: true, opacity: 0.85 }),
   );
-  wireframe.position.y = heightWorld / 2;
+  wireframe.position.set(xCenter, heightWorld / 2, yCenter);
   group.add(wireframe);
 
-  const labelX = makeTextSprite('E/W (km)');
-  labelX.position.set(xExtent / 2 + Math.max(xExtent, yExtent) * 0.08, 0, 0);
-  group.add(labelX);
+  // N/S/E/W — world +X = data's +x (east), +Z = data's +y (north).
+  const dirLabel = (text, x, z) => {
+    const s = makeTextSprite(text, { fontPx: 46, color: '#ffe9a8' });
+    s.position.set(x, 0, z);
+    group.add(s);
+  };
+  // Verified directly against a real xy.nc file's LATITUDE/LONGITUDE grid
+  // (not assumed): increasing x -> increasing longitude (east), increasing
+  // y -> increasing latitude (north). A prior "fix" here swapped N/S based
+  // on a screenshot that was almost certainly an unrestricted camera
+  // looking up from underneath the data (see the maxPolarAngle clamp above)
+  // — reverted back to the empirically-confirmed mapping.
+  dirLabel('East', xMax + margin, yCenter);
+  dirLabel('West', xMin - margin, yCenter);
+  dirLabel('North', xCenter, yMax + margin);
+  dirLabel('South', xCenter, yMin - margin);
 
-  const labelZ = makeTextSprite('N/S (km)');
-  labelZ.position.set(0, 0, yExtent / 2 + Math.max(xExtent, yExtent) * 0.08);
-  group.add(labelZ);
-
-  const labelY = makeTextSprite('Altitude (km)');
-  labelY.position.set(0, heightWorld + Math.max(xExtent, yExtent) * 0.06, 0);
+  const labelY = makeTextSprite('Altitude (ft)', { fontPx: 38, color: '#ffe9a8' });
+  // Offset further out (not directly above the tick-label column below) so
+  // it doesn't collide with the topmost altitude tick.
+  labelY.position.set(xMin - margin * 1.6, heightWorld + margin * 0.9, yMin - margin * 1.6);
   group.add(labelY);
+
+  // Floor grid + tick labels (nautical miles) along the two horizontal
+  // edges. The "nice" step is chosen in nm, then converted back to km for
+  // actual gridline spacing, so ticks land on round nm values (5, 10, 25…)
+  // rather than round km ones.
+  const stepNm = niceGridStep(Math.max(xExtent, yExtent) / KM_PER_NM);
+  const step = stepNm * KM_PER_NM;
+  const gridMat = new THREE.LineBasicMaterial({ color: 0x6f8aa8, transparent: true, opacity: 0.45 });
+  const pts = [];
+  for (let gx = Math.ceil(xMin / step) * step; gx <= xMax + 1e-6; gx += step) {
+    pts.push(gx, 0.01, yMin, gx, 0.01, yMax);
+  }
+  for (let gy = Math.ceil(yMin / step) * step; gy <= yMax + 1e-6; gy += step) {
+    pts.push(xMin, 0.01, gy, xMax, 0.01, gy);
+  }
+  if (pts.length) {
+    const gridGeo = new THREE.BufferGeometry();
+    gridGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    group.add(new THREE.LineSegments(gridGeo, gridMat));
+  }
+  for (let gx = Math.ceil(xMin / step) * step; gx <= xMax + 1e-6; gx += step) {
+    const lbl = makeTextSprite(`${Math.round(gx / KM_PER_NM)} nm`, { fontPx: 26 });
+    lbl.position.set(gx, 0, yMin - margin * 0.5);
+    group.add(lbl);
+  }
+  for (let gy = Math.ceil(yMin / step) * step; gy <= yMax + 1e-6; gy += step) {
+    const lbl = makeTextSprite(`${Math.round(gy / KM_PER_NM)} nm`, { fontPx: 26 });
+    lbl.position.set(xMin - margin * 0.5, 0, gy);
+    group.add(lbl);
+  }
+
+  // Altitude ticks at 5,000 ft increments (not one per raw CAPPI level —
+  // actual level spacing in km converts to odd, non-round foot values like
+  // "6,562 ft", which reads as noise rather than a scale). Label size is
+  // sized to the actual world-space gap between ticks — at fontPx=24 a
+  // label is ~26 world units tall, which is *taller* than the ~20-unit gap
+  // a typical mission's vertical exaggeration produces at 5,000ft spacing,
+  // so a fixed size guaranteed overlapping, unreadable stacked text. If
+  // even the smallest readable size would still overlap, double the step
+  // (10k, 20k…) instead of forcing tiny/illegible labels.
+  const altScale = heightWorld / Math.max(zMax - zMin, 1);
+  let altStepFt = 5000;
+  let tickGapWorld = (altStepFt / FT_PER_KM) * altScale;
+  while (tickGapWorld < 14 && altStepFt < 40000) {
+    altStepFt *= 2;
+    tickGapWorld = (altStepFt / FT_PER_KM) * altScale;
+  }
+  const altFontPx = Math.max(11, Math.min(24, tickGapWorld * 0.55));
+  const zMinFt = zMin * FT_PER_KM, zMaxFt = zMax * FT_PER_KM;
+  for (let ft = Math.ceil(zMinFt / altStepFt) * altStepFt; ft <= zMaxFt + 1; ft += altStepFt) {
+    const levelKm = ft / FT_PER_KM;
+    const worldY = (levelKm - zMin) * altScale;
+    const lbl = makeTextSprite(`${ft.toLocaleString()} ft`, { fontPx: altFontPx });
+    lbl.position.set(xMin - margin * 0.5, worldY, yMin - margin * 0.5);
+    group.add(lbl);
+    const tickGeo = new THREE.BufferGeometry();
+    tickGeo.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute([xMin, worldY, yMin, xMin - margin * 0.25, worldY, yMin - margin * 0.25], 3),
+    );
+    group.add(new THREE.LineSegments(tickGeo, gridMat));
+  }
 }
 
-function frameCamera(camera, controls, xExtent, yExtent, heightWorld) {
-  const dist = Math.max(xExtent, yExtent, heightWorld) * 1.5;
-  camera.position.set(dist, dist * 0.55 + heightWorld * 0.5, dist);
-  controls.target.set(0, heightWorld / 2, 0);
+function addSatelliteFloor(group) {
+  if (!satelliteOverlay || !currentGeoContext) return;
+  const kmPerDegLat = 110.574;
+  const kmPerDegLon = 111.32 * Math.cos((currentGeoContext.lat * Math.PI) / 180);
+  const [[latS, lonW], [latN, lonE]] = satelliteOverlay.bounds;
+  const westKm = (lonW - currentGeoContext.lon) * kmPerDegLon;
+  const eastKm = (lonE - currentGeoContext.lon) * kmPerDegLon;
+  const southKm = (latS - currentGeoContext.lat) * kmPerDegLat;
+  const northKm = (latN - currentGeoContext.lat) * kmPerDegLat;
+  const sizeX = eastKm - westKm, sizeZ = northKm - southKm;
+  if (sizeX <= 0 || sizeZ <= 0) return;
+
+  const loader = new THREE.TextureLoader();
+  loader.load(satelliteOverlay.url, (tex) => {
+    const geo = new THREE.PlaneGeometry(sizeX, sizeZ);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.92, depthWrite: false });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set((westKm + eastKm) / 2, 0.005, (southKm + northKm) / 2);
+    mesh.renderOrder = -1;
+    group.add(mesh);
+  });
+}
+
+// Aircraft track as a 3D polyline (x/y from projectFlightTrack, altitude
+// mapped onto the same vertical scale as the CAPPI levels), with small
+// start/end markers so direction of travel is legible at a glance.
+function addFlightTrack(group, ext) {
+  if (!currentFlightTrackPoints.length) return;
+  const altScale = ext.heightWorld / Math.max(ext.zMax - ext.zMin, 1);
+  const pts = currentFlightTrackPoints
+    .filter((p) => p.altKm != null)
+    .map((p) => new THREE.Vector3(p.xKm, Math.max(0, (p.altKm - ext.zMin) * altScale), p.yKm));
+  if (pts.length < 2) return;
+
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xff59d6 }));
+  group.add(line);
+
+  const dotRadius = Math.max(ext.xExtent, ext.yExtent) * 0.01;
+  const dot = (p, color) => {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(dotRadius, 10, 10),
+      new THREE.MeshBasicMaterial({ color }),
+    );
+    mesh.position.copy(p);
+    group.add(mesh);
+  };
+  dot(pts[0], 0x5fff8f); // start: green
+  dot(pts[pts.length - 1], 0xff5f5f); // end: red
+}
+
+function frameCamera(camera, controls, ext) {
+  const { xExtent, yExtent, xCenter, yCenter, heightWorld } = ext;
+  const dist = Math.max(xExtent, yExtent, heightWorld) * 1.6;
+  camera.position.set(xCenter + dist, dist * 0.55 + heightWorld * 0.5, yCenter + dist);
+  controls.target.set(xCenter, heightWorld / 2, yCenter);
   controls.update();
 }
 
@@ -888,10 +1064,10 @@ function buildRaymarchVolumeScene(vol) {
   clearThreeGroup();
   currentVolumeMaterial = null;
 
-  const radius = parseInt($('inp-smoothing').value, 10) || 0;
-  const tex = buildVolumeTexture(vol, radius ? smoothVolume(vol, radius) : null);
-  const { xExtent, yExtent, zSpan, zScale } = volumeExtents(vol);
-  const heightWorld = zSpan * zScale;
+  const tex = buildVolumeTexture(vol);
+  const ext = volumeExtents(vol);
+  ext.heightWorld = ext.zSpan * ext.zScale;
+  ext.levels = vol.levels_km;
 
   const geometry = new THREE.BoxGeometry(1, 1, 1);
   const material = new THREE.RawShaderMaterial({
@@ -910,15 +1086,17 @@ function buildRaymarchVolumeScene(vol) {
   });
   currentVolumeMaterial = material;
   const mesh = new THREE.Mesh(geometry, material);
-  mesh.scale.set(xExtent, heightWorld, yExtent);
-  // Box is centered at local origin; lift it so it spans y=[0, heightWorld]
-  // — same "floor at 0" convention as the layered fallback, so switching
-  // between the two doesn't also relocate the volume.
-  mesh.position.y = heightWorld / 2;
+  mesh.scale.set(ext.xExtent, ext.heightWorld, ext.yExtent);
+  // Box is centered at local origin; lift/shift it so it spans the data's
+  // actual x/y/altitude range — same "floor at 0" convention as the
+  // layered fallback, so switching between the two doesn't relocate it.
+  mesh.position.set(ext.xCenter, ext.heightWorld / 2, ext.yCenter);
   group.add(mesh);
 
-  addOrientationHelpers(group, xExtent, yExtent, heightWorld);
-  frameCamera(camera, controls, xExtent, yExtent, heightWorld);
+  addSatelliteFloor(group);
+  addFlightTrack(group, ext);
+  addOrientationHelpers(group, ext);
+  frameCamera(camera, controls, ext);
 
   // Force shader compilation now (rather than letting it happen lazily
   // inside the render loop) so a link/compile failure throws here, where
@@ -932,24 +1110,25 @@ function buildLayeredVolumeScene(vol) {
   currentVolumeMaterial = null;
 
   const nx = vol.x.length, ny = vol.y.length;
-  const { xExtent, yExtent, zMin, zMax, zScale } = volumeExtents(vol);
-  const heightWorld = (zMax - zMin) * zScale;
+  const ext = volumeExtents(vol);
+  ext.heightWorld = (ext.zMax - ext.zMin) * ext.zScale;
+  ext.levels = vol.levels_km;
   const levels = vol.levels_km;
-  const radius = parseInt($('inp-smoothing').value, 10) || 0;
-  const volData = radius ? smoothVolume(vol, radius) : vol.data;
 
   for (let li = 0; li < levels.length; li++) {
-    const tex = levelTexture(volData[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
-    const geo = new THREE.PlaneGeometry(xExtent, yExtent);
+    const tex = levelTexture(vol.data[li], ny, nx, vol.colorscale, vol.zmin, vol.zmax);
+    const geo = new THREE.PlaneGeometry(ext.xExtent, ext.yExtent);
     const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.rotation.x = -Math.PI / 2;
-    mesh.position.y = (levels[li] - zMin) * zScale;
+    mesh.position.set(ext.xCenter, (levels[li] - ext.zMin) * ext.zScale, ext.yCenter);
     group.add(mesh);
   }
 
-  addOrientationHelpers(group, xExtent, yExtent, heightWorld);
-  frameCamera(camera, controls, xExtent, yExtent, heightWorld);
+  addSatelliteFloor(group);
+  addFlightTrack(group, ext);
+  addOrientationHelpers(group, ext);
+  frameCamera(camera, controls, ext);
 }
 
 // ── Opacity transfer-function editor ("transparency table") ────────────
@@ -1151,7 +1330,7 @@ function buildVolumeScene(vol) {
 
 let lastVolume = null;
 
-// ── Satellite overlay (GOES Band 13, centered on the storm) ─────────────
+// ── Satellite overlay (GOES Band 13, centered on the storm) + recon track ──
 
 function missionDateStr(missionId) {
   const d = missionId.slice(0, 8); // mission_id = YYYYMMDDAI...
@@ -1162,30 +1341,142 @@ function isoTimeFor(missionId, hhmm) {
   return `${missionDateStr(missionId)}T${hhmm.slice(0, 2)}:${hhmm.slice(2, 4)}:00Z`;
 }
 
+function analysisTimeToUnix(missionId, hhmm) {
+  return Date.parse(isoTimeFor(missionId, hhmm)) / 1000;
+}
+
+// The single representative instant for the satellite fetch: the analysis
+// time itself for a sweep/volume/altitude-composite, or the middle
+// analysis time for a time-mosaic composite (which spans many).
+function singleIsoTime(missionId, hhmm) {
+  return isoTimeFor(missionId, hhmm);
+}
+function rangeIsoTime(missionId, hhmmList) {
+  const sorted = [...hhmmList].sort();
+  return isoTimeFor(missionId, sorted[Math.floor(sorted.length / 2)]);
+}
+
 let currentGeoContext = null;
+// { url, bounds: [[latS,lonW],[latN,lonE]] } once loaded — georeferenced
+// against whatever currentGeoContext was active when it was fetched.
+let satelliteOverlay = null;
+// { xKm, yKm, altKm, unixTime }[] — the recon track projected into the
+// same km-from-storm-center frame as everything else.
+let currentFlightTrackPoints = [];
+let showFlightTrack = true;
+// mission_id -> { obs, startUnix, endUnix } from GET /v1/recon/mission/{id},
+// or null if that mission has no recon track on file. Cached since it
+// doesn't change across re-plots of the same mission.
+const reconObsCache = {};
 
 // Called after every successful sweep/volume/composite load. Needs an
-// origin (lat/lon) and an analysis time to place a satellite fetch — a
+// origin (lat/lon) and an instant to place a satellite fetch — a
 // vertical-profile sweep has neither (no CAPPI grid, no single origin), so
-// this just hides the panel in that case rather than guessing.
-function updateGeoContext({ mission_id, origin_lat, origin_lon, x, y, analysisTime }) {
-  if (origin_lat == null || origin_lon == null || !analysisTime || !mission_id) {
+// this just hides the satellite control in that case rather than guessing.
+// Always drops any already-loaded basemap: the storm has likely moved since
+// it was fetched, so silently reusing it across a new time/location would
+// mislead rather than help — reloading it is one click. The flight track
+// re-fetches (from cache) automatically instead, since it's on by default
+// and should just track along with the plot.
+//
+// truncateToLeg: a single volume/sweep shows one analysis_time's worth of
+// data — only the track flown during that TDR leg belongs next to it. A
+// composite already flattens multiple analysis_times (or the whole level
+// axis) into one image, so there's no single leg to match — show the
+// mission's whole track there instead.
+async function updateGeoContext({ mission_id, origin_lat, origin_lon, x, y, isoTime, truncateToLeg = true }) {
+  if (origin_lat == null || origin_lon == null || !isoTime || !mission_id) {
     currentGeoContext = null;
   } else {
     const widthKm = Math.max(Math.max(...x) - Math.min(...x), Math.max(...y) - Math.min(...y), 50) * 1.3;
-    currentGeoContext = { lat: origin_lat, lon: origin_lon, isoTime: isoTimeFor(mission_id, analysisTime), widthKm };
+    const legWindow = truncateToLeg ? legWindowFor(Date.parse(isoTime) / 1000) : null;
+    currentGeoContext = { lat: origin_lat, lon: origin_lon, widthKm, isoTime, legWindow };
   }
-  $('satellite-panel').style.display = currentGeoContext ? '' : 'none';
-  $('satellite-img').style.display = 'none';
+  satelliteOverlay = null;
+  $('fs-satellite').style.display = currentGeoContext ? '' : 'none';
   $('satellite-status').textContent = '';
+  await refreshFlightTrack(mission_id);
+}
+
+// Fetches (and caches) the recon mission's whole track plus its own actual
+// start/end — a single storm-reconnaissance flight is already the right
+// scope ("in and around the data"), so the track just plots everything
+// between the mission's own start_unix/end_unix rather than guessing a
+// window around whichever single analysis time happens to be plotted.
+async function getReconObs(missionId) {
+  if (missionId in reconObsCache) return reconObsCache[missionId];
+  try {
+    const data = await getJSON(`/v1/recon/mission/${encodeURIComponent(missionId)}`);
+    reconObsCache[missionId] = { obs: data.obs || [], startUnix: data.start_unix, endUnix: data.end_unix };
+  } catch (e) {
+    reconObsCache[missionId] = null;
+  }
+  return reconObsCache[missionId];
+}
+
+// Projects recon obs ([unix_time, lat, lon, wind_kt, wind_dir, sfmr_kt,
+// alt_m]) into km-from-storm-center.
+function projectFlightTrack(obs, originLat, originLon) {
+  const kmPerDegLat = 110.574;
+  const kmPerDegLon = 111.32 * Math.cos((originLat * Math.PI) / 180);
+  const pts = [];
+  for (const o of obs) {
+    const [unixTime, lat, lon, , , , altM] = o;
+    if (lat == null || lon == null) continue;
+    pts.push({
+      xKm: (lon - originLon) * kmPerDegLon,
+      yKm: (lat - originLat) * kmPerDegLat,
+      altKm: altM != null ? altM / 1000 : null,
+      unixTime,
+    });
+  }
+  return pts;
+}
+
+async function refreshFlightTrack(missionId) {
+  currentFlightTrackPoints = [];
+  const statusEl = $('flight-track-status');
+  if (!showFlightTrack || !currentGeoContext || !missionId) {
+    statusEl.textContent = '';
+    return;
+  }
+  const recon = await getReconObs(missionId);
+  if (recon == null) {
+    statusEl.textContent = 'No recon track on file for this mission.';
+    return;
+  }
+  const allPoints = projectFlightTrack(recon.obs, currentGeoContext.lat, currentGeoContext.lon);
+  // Truncate to the specific leg this analysis_time belongs to (not the
+  // whole mission) — otherwise every analysis_time shows the same
+  // whole-flight track instead of just what was flown while this leg's data
+  // was being collected. Composites pass no legWindow, so they keep the
+  // whole track (see updateGeoContext).
+  const { legWindow } = currentGeoContext;
+  currentFlightTrackPoints = legWindow
+    ? allPoints.filter(p => p.unixTime >= legWindow[0] && p.unixTime <= legWindow[1])
+    : allPoints;
+  statusEl.textContent = currentFlightTrackPoints.length
+    ? legWindow
+      ? `${currentFlightTrackPoints.length} track point(s) flown during this leg (of ${allPoints.length} total flight points, ${tdrLegsAreReal ? 'real' : 'estimated'} leg times).`
+      : `${currentFlightTrackPoints.length} track point(s) for the whole flight.`
+    : 'Recon track exists but has no usable lat/lon points in range.';
+}
+
+// Re-applies the loaded basemap / flight track to whichever view is
+// currently showing — a Plotly image layer + scatter trace under/over the
+// 2D heatmap, or a floor plane + line in the 3D scene.
+function applySatelliteOverlay() {
+  if (currentView() === 'volume' && lastVolume) {
+    buildVolumeScene(lastVolume);
+  } else if (lastSweep) {
+    render(lastSweep, lastIsVert);
+  }
 }
 
 async function loadSatelliteImage() {
   if (!currentGeoContext) return;
   const btn = $('btn-load-satellite');
   const statusEl = $('satellite-status');
-  const img = $('satellite-img');
-  img.style.display = 'none';
   btn.disabled = true;
   statusEl.textContent = 'Requesting GOES Band 13 scan…';
   try {
@@ -1207,9 +1498,9 @@ async function loadSatelliteImage() {
     }
     if (resp.status === 'error') throw new Error(resp.message || 'satellite render failed');
     if (resp.status !== 'ready') throw new Error('Timed out waiting for the satellite image to render.');
-    img.src = apiBase() + resp.png_url;
-    img.style.display = '';
-    statusEl.textContent = `${resp.satellite || 'GOES'} Band 13, scan ${resp.scan_start || ''}`.trim();
+    satelliteOverlay = { url: apiBase() + resp.png_url, bounds: resp.bounds };
+    applySatelliteOverlay();
+    statusEl.textContent = `${resp.satellite || 'GOES'} Band 13, scan ${resp.scan_start || ''} — applied as basemap.`.trim();
   } catch (e) {
     statusEl.textContent = 'Error: ' + e.message;
   } finally {
@@ -1231,6 +1522,10 @@ async function plotVolume() {
   try {
     const vol = await getJSON(`/v1/tdr/volume?${params.toString()}`);
     lastVolume = vol;
+    await updateGeoContext({
+      mission_id: vol.mission_id, origin_lat: vol.origin_lat, origin_lon: vol.origin_lon,
+      x: vol.x, y: vol.y, isoTime: singleIsoTime(vol.mission_id, vol.analysis_time),
+    });
     buildVolumeScene(vol);
     const info = $('info-bar');
     info.style.display = '';
@@ -1242,10 +1537,6 @@ async function plotVolume() {
       <span>Field: <b>${vol.field}</b> (${vol.units})</span>
       <span>Levels: <b>${vol.levels_km.length}</b> (${Math.min(...vol.levels_km)}–${Math.max(...vol.levels_km)} km)</span>
     `;
-    updateGeoContext({
-      mission_id: vol.mission_id, origin_lat: vol.origin_lat, origin_lon: vol.origin_lon,
-      x: vol.x, y: vol.y, analysisTime: vol.analysis_time,
-    });
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1272,6 +1563,13 @@ async function plotComposite() {
     : 'Fetching + collapsing the level axis…');
   try {
     const comp = await getJSON(`/v1/tdr/composite?${params.toString()}`);
+    const isoTime = mode === 'altitude'
+      ? singleIsoTime(comp.mission_id, comp.detail.analysis_time)
+      : rangeIsoTime(comp.mission_id, comp.detail.analysis_times_used);
+    await updateGeoContext({
+      mission_id: comp.mission_id, origin_lat: comp.origin_lat, origin_lon: comp.origin_lon,
+      x: comp.x, y: comp.y, isoTime, truncateToLeg: false,
+    });
     render(comp, false);
     const info = $('info-bar');
     const detail = mode === 'altitude'
@@ -1284,13 +1582,6 @@ async function plotComposite() {
       <span>Field: <b>${comp.field}</b> (${comp.units})</span>
       ${detail}
     `;
-    const analysisTimeForGeo = mode === 'altitude'
-      ? comp.detail.analysis_time
-      : comp.detail.analysis_times_used[Math.floor(comp.detail.analysis_times_used.length / 2)];
-    updateGeoContext({
-      mission_id: comp.mission_id, origin_lat: comp.origin_lat, origin_lon: comp.origin_lon,
-      x: comp.x, y: comp.y, analysisTime: analysisTimeForGeo,
-    });
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1317,11 +1608,12 @@ async function plotSweep() {
   setStatus('loading', 'Fetching + slicing (first request for a file downloads and caches it server-side, may take a few seconds)…');
   try {
     const sweep = await getJSON(`/v1/tdr/sweep?${params.toString()}`);
-    render(sweep, isVert);
-    updateGeoContext({
+    await updateGeoContext({
       mission_id: sweep.mission_id, origin_lat: sweep.origin_lat, origin_lon: sweep.origin_lon,
-      x: sweep.x, y: sweep.y, analysisTime: sweep.analysis_time,
+      x: sweep.x, y: sweep.y,
+      isoTime: isVert ? null : singleIsoTime(sweep.mission_id, sweep.analysis_time),
     });
+    render(sweep, isVert);
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1332,6 +1624,32 @@ async function plotSweep() {
 
 let lastSweep = null;
 let lastIsVert = false;
+
+// Converts the loaded satellite basemap's lat/lon bounds into a Plotly
+// `layout.images` entry positioned in the same km-from-storm-center frame
+// the heatmap trace already uses — only meaningful for the xy/composite
+// frame (not a vertical profile's radius/height frame, which has no
+// geographic meaning).
+function satelliteImageLayoutEntry() {
+  if (!satelliteOverlay || !currentGeoContext) return null;
+  const kmPerDegLat = 110.574;
+  const kmPerDegLon = 111.32 * Math.cos((currentGeoContext.lat * Math.PI) / 180);
+  const [[latS, lonW], [latN, lonE]] = satelliteOverlay.bounds;
+  const westKm = (lonW - currentGeoContext.lon) * kmPerDegLon;
+  const eastKm = (lonE - currentGeoContext.lon) * kmPerDegLon;
+  const southKm = (latS - currentGeoContext.lat) * kmPerDegLat;
+  const northKm = (latN - currentGeoContext.lat) * kmPerDegLat;
+  if (eastKm <= westKm || northKm <= southKm) return null;
+  return {
+    source: satelliteOverlay.url,
+    xref: 'x', yref: 'y',
+    x: westKm, y: northKm,
+    sizex: eastKm - westKm, sizey: northKm - southKm,
+    xanchor: 'left', yanchor: 'top',
+    sizing: 'stretch',
+    layer: 'below',
+  };
+}
 
 function render(sweep, isVert) {
   lastSweep = sweep;
@@ -1349,6 +1667,8 @@ function render(sweep, isVert) {
     ${sweep.origin_lat != null ? `<span>Origin: <b>${sweep.origin_lat.toFixed(2)}, ${sweep.origin_lon.toFixed(2)}</b></span>` : ''}
   `;
 
+  const basemap = isVert ? null : satelliteImageLayoutEntry();
+
   const trace = {
     type: 'heatmap',
     x: sweep.x,
@@ -1357,6 +1677,9 @@ function render(sweep, isVert) {
     zmin: sweep.zmin,
     zmax: sweep.zmax,
     colorscale: sweep.colorscale,
+    // Let the satellite basemap show through when one's loaded — full
+    // opacity would just paint over it.
+    opacity: basemap ? 0.72 : 1,
     colorbar: { title: { text: sweep.units, side: 'right' } },
     hovertemplate: isVert
       ? 'radius %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + sweep.units + '<extra></extra>'
@@ -1382,9 +1705,38 @@ function render(sweep, isVert) {
       gridcolor: grid, zerolinecolor: grid,
       scaleanchor: isVert ? undefined : 'x',
     },
+    images: basemap ? [basemap] : [],
   };
 
-  Plotly.newPlot('plot', [trace], layout, { responsive: true, displaylogo: false });
+  const traces = [trace];
+  if (!isVert && currentFlightTrackPoints.length) {
+    traces.push({
+      type: 'scatter',
+      mode: 'lines+markers',
+      x: currentFlightTrackPoints.map((p) => p.xKm),
+      y: currentFlightTrackPoints.map((p) => p.yKm),
+      line: { color: '#ff59d6', width: 2 },
+      marker: { size: 3, color: '#ff59d6' },
+      name: 'Aircraft track',
+      hovertemplate: 'track x %{x:.0f} km, y %{y:.0f} km<extra></extra>',
+    });
+    // Start (green) / end (red) markers — same convention as the 3D view.
+    const first = currentFlightTrackPoints[0];
+    const last = currentFlightTrackPoints[currentFlightTrackPoints.length - 1];
+    traces.push({
+      type: 'scatter',
+      mode: 'markers',
+      x: [first.xKm, last.xKm],
+      y: [first.yKm, last.yKm],
+      marker: { size: 10, color: ['#5fff8f', '#ff5f5f'], line: { color: '#000', width: 1 } },
+      text: ['Track start', 'Track end'],
+      hovertemplate: '%{text}<extra></extra>',
+      name: 'Track start/end',
+      showlegend: false,
+    });
+  }
+
+  Plotly.newPlot('plot', traces, layout, { responsive: true, displaylogo: false });
 }
 
 // ── Theme toggle (auto -> dark -> light -> auto) ─────────────────────────
@@ -1433,10 +1785,6 @@ $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
 $('sel-composite-mode').addEventListener('change', applyViewVisibility);
 $('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
-$('inp-smoothing').addEventListener('input', (e) => {
-  $('smoothing-value').textContent = e.target.value;
-  if (lastVolume) buildVolumeScene(lastVolume);
-});
 
 $('product-help-btn').addEventListener('click', openHelpModal);
 $('help-modal-close').addEventListener('click', closeHelpModal);
@@ -1444,6 +1792,14 @@ $('help-modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHelpModal(); });
 
 $('btn-load-satellite').addEventListener('click', loadSatelliteImage);
+
+$('chk-flight-track').addEventListener('change', async (e) => {
+  showFlightTrack = e.target.checked;
+  const missionId = lastVolume && currentView() === 'volume' ? lastVolume.mission_id : (lastSweep ? lastSweep.mission_id : null);
+  if (!missionId) return;
+  await refreshFlightTrack(missionId);
+  applySatelliteOverlay();
+});
 
 const opacityCanvas = $('opacity-editor-canvas');
 opacityCanvas.addEventListener('pointerdown', (e) => {
