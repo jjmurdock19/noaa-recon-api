@@ -105,16 +105,41 @@ fn read_xy_volume_raw(path: &Path, field: &str) -> anyhow::Result<XyVolumeRaw> {
 
     let _guard = nc_lock();
     let ds = netcdf::open(path)?;
-    if ds.variable("x").is_none() || ds.variable("y").is_none() || ds.variable("LATITUDE").is_none() {
-        anyhow::bail!(
-            "this xy.nc file isn't the post-2021 Cartesian x/y + LATITUDE/LONGITUDE schema this \
-             endpoint supports (see the AOML TDR README's 2021 gridding-change note) — pre-2021 \
-             lat/lon-gridded files aren't handled yet"
-        );
-    }
+    let origin_lat = global_attr_f32(&ds, "ORIGIN_LATITUDE");
+    let origin_lon = global_attr_f32(&ds, "ORIGIN_LONGITUDE");
 
-    let x: Vec<f32> = ds.variable("x").unwrap().get_values(..)?;
-    let y: Vec<f32> = ds.variable("y").unwrap().get_values(..)?;
+    let (x, y) = if ds.variable("x").is_some() && ds.variable("y").is_some() && ds.variable("LATITUDE").is_some() {
+        // Post-2021 schema: Cartesian x/y (km-from-center) declared directly.
+        let x: Vec<f32> = ds.variable("x").unwrap().get_values(..)?;
+        let y: Vec<f32> = ds.variable("y").unwrap().get_values(..)?;
+        (x, y)
+    } else if ds.variable("lons").is_some() && ds.variable("lats").is_some() {
+        // Pre-2021 schema (see the AOML TDR README's 2021 gridding-change
+        // note): grid is regularly spaced in degrees lat/lon instead of a
+        // declared Cartesian x/y. Field variables still use dims `(lons,
+        // lats, level, time)` — the same slowest-to-fastest order as
+        // post-2021's `(x, y, level, time)` — so we only need to turn `lons`/
+        // `lats` into an equivalent km-from-origin grid for `sweep`'s slicing
+        // math and for `geo_mosaic` alignment against post-2021 volumes.
+        let (lat0, lon0) = origin_lat.zip(origin_lon).ok_or_else(|| {
+            anyhow::anyhow!(
+                "pre-2021 lat/lon-gridded xy file is missing ORIGIN_LATITUDE/ORIGIN_LONGITUDE, \
+                 needed to convert its lons/lats grid to km-from-origin"
+            )
+        })?;
+        let lons: Vec<f32> = ds.variable("lons").unwrap().get_values(..)?;
+        let lats: Vec<f32> = ds.variable("lats").unwrap().get_values(..)?;
+        let x: Vec<f32> = lons.iter().map(|&lon| sweep::latlon_offset_km(lat0, lon, lat0, lon0).0).collect();
+        let y: Vec<f32> = lats.iter().map(|&lat| sweep::latlon_offset_km(lat, lon0, lat0, lon0).1).collect();
+        (x, y)
+    } else {
+        anyhow::bail!(
+            "this xy.nc file has neither the post-2021 Cartesian x/y + LATITUDE/LONGITUDE schema \
+             nor the pre-2021 lons/lats-gridded schema this endpoint supports (see the AOML TDR \
+             README's 2021 gridding-change note)"
+        );
+    };
+
     let levels: Vec<f32> = ds
         .variable("level")
         .ok_or_else(|| anyhow::anyhow!("missing 'level' variable"))?
@@ -124,16 +149,7 @@ fn read_xy_volume_raw(path: &Path, field: &str) -> anyhow::Result<XyVolumeRaw> {
     let missing = missing_value(&field_var);
     let flat: Vec<f32> = field_var.get_values(..)?;
 
-    Ok(XyVolumeRaw {
-        x,
-        y,
-        levels,
-        flat,
-        missing,
-        origin_lat: global_attr_f32(&ds, "ORIGIN_LATITUDE"),
-        origin_lon: global_attr_f32(&ds, "ORIGIN_LONGITUDE"),
-        storm_name_attr: storm_name_attr(&ds),
-    })
+    Ok(XyVolumeRaw { x, y, levels, flat, missing, origin_lat, origin_lon, storm_name_attr: storm_name_attr(&ds) })
 }
 
 /// Reads one field's *entire* volume (every CAPPI level, not just one) from
@@ -239,9 +255,8 @@ fn storm_name_attr(ds: &netcdf::File) -> Option<String> {
 /// Reads one field from an `xy`/`xy_rel` volume file and slices out the
 /// CAPPI plane nearest `requested_z_km` (default 2.0km — above the lowest
 /// level, which the AOML TDR README warns isn't representative of the
-/// surface). Errors on a pre-2021 lat/lon-gridded file (no `x`/`y`/
-/// `LATITUDE` variables) rather than guessing at that schema's layout —
-/// see the README's TDR roadmap entry for why that's out of scope for now.
+/// surface). Handles both the post-2021 Cartesian x/y schema and the
+/// pre-2021 lons/lats-gridded schema (see [`read_xy_volume_raw`]).
 pub fn read_xy_slice(path: &Path, field: &str, requested_z_km: Option<f32>) -> anyhow::Result<FieldSlice> {
     let raw = read_xy_volume_raw(path, field)?;
     let level_idx = sweep::nearest_index(&raw.levels, requested_z_km.unwrap_or(2.0));

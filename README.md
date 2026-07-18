@@ -194,8 +194,9 @@ full TDR pipeline (mission/file index, ingest, and sweep slice rendering)
 are fully implemented and verified against live NOAA data on this branch.
 Reflectance-band tiles (2/3/5) and the composite products are still in the
 works, along with the raw-netCDF passthrough (`501 Not Implemented`) — see
-"Roadmap" below. TDR sweep rendering only covers the post-2021 Cartesian
-grid schema so far — see "TDR archive" below.
+"Roadmap" below. TDR sweep rendering covers both the post-2021 Cartesian
+grid schema and the pre-2021 lons/lats-gridded schema — see "TDR archive"
+below.
 
 ## Sources
 
@@ -1031,21 +1032,23 @@ this branch — axum has no auto-generated docs UI to misconfigure.*
    means sourcing (or building) a city-lights raster and implementing real
    atmospheric correction — a substantially bigger lift than the rest of
    this project's rendering pipeline.
-7. **TDR sweep rendering — pre-2021 schema** (`GET /v1/tdr/sweep`): the
-   post-2021 Cartesian grid schema (`x`/`y` dims + 2D `LATITUDE`/
-   `LONGITUDE`) is fully implemented and verified against real `xy`/
-   `vert_inbound`/`vert_outbound` files — see `services/tdr_nc.rs` and
-   `crates/core/src/sweep.rs`. What's left: the AOML TDR README documents a
-   2021 gridding-change break — pre-2021 files are regularly-spaced in
-   lat/lon instead (1D `lats`/`lons` variables, no Cartesian `x`/`y`), a
-   genuinely different layout this hasn't been tested against (today it
-   returns `400` rather than guess). Needs a real pre-2021 file inspected
-   the same way the post-2021 one was (`nc_info()` structural dump, then
-   verify array-flattening order against real coordinate values — don't
-   assume). Deliberately permanently out of scope: the raw Level 1a Doppler
-   sweeps (`RADAR_TDR/` bundles) — those are pre-synthesis and would
-   require reimplementing HRD's variational Doppler synthesis algorithm,
-   not just serving already-gridded data.
+7. ~~**TDR sweep rendering — pre-2021 schema**~~ **Done.** (`GET
+   /v1/tdr/sweep`): both schemas are now implemented in
+   `read_xy_volume_raw()` in `services/tdr_nc.rs`. Post-2021: Cartesian
+   grid (`x`/`y` dims + 2D `LATITUDE`/`LONGITUDE`), verified against real
+   `xy`/`vert_inbound`/`vert_outbound` files. Pre-2021 (the AOML TDR
+   README's 2021 gridding-change break): regularly-spaced 1D `lons`/`lats`
+   variables instead of Cartesian `x`/`y` — verified against a real
+   pre-2021 file (`cache/tdr_nc/20181009H1_1b_xy_0911.nc`); field
+   variables there use dims `(lons, lats, level, time)`, the same
+   slowest-to-fastest order `sweep.rs` already assumes for `(x, y, level,
+   time)`, so `lons`/`lats` are converted to a km-from-`ORIGIN_LATITUDE`/
+   `ORIGIN_LONGITUDE` grid via `sweep::latlon_offset_km()` and fed through
+   the same slicing code as the post-2021 path. Deliberately permanently
+   out of scope: the raw Level 1a Doppler sweeps (`RADAR_TDR/` bundles) —
+   those are pre-synthesis and would require reimplementing HRD's
+   variational Doppler synthesis algorithm, not just serving
+   already-gridded data.
 8. **Raw netCDF passthrough** (`crates/server/src/routers/raw.rs`): for the
    GOES side this can subset directly from the same file `goes.rs` already
    downloads (no new data source) — a `netcdf` crate variable slice by

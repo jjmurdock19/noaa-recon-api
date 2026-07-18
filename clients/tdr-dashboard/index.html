@@ -1362,8 +1362,22 @@ function missionDateStr(missionId) {
   return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
 }
 
+// analysis_time isn't strictly bounded to 00:00–23:59 — NOAA lets it roll
+// past 2400 for a leg that crosses midnight, so it stays sortable as a
+// plain string against the rest of the mission's same nominal date (e.g.
+// "2445" = 00:45 the next day). Building "T24:45:00Z" straight from that
+// is invalid ISO 8601 (rejected by the satellite endpoint) — roll the
+// overflow into the calendar date instead of truncating/wrapping the hour
+// in place.
 function isoTimeFor(missionId, hhmm) {
-  return `${missionDateStr(missionId)}T${hhmm.slice(0, 2)}:${hhmm.slice(2, 4)}:00Z`;
+  const hh = parseInt(hhmm.slice(0, 2), 10);
+  const mm = hhmm.slice(2, 4);
+  const day = new Date(`${missionDateStr(missionId)}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() + Math.floor(hh / 24));
+  const y = day.getUTCFullYear();
+  const mo = String(day.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(day.getUTCDate()).padStart(2, '0');
+  return `${y}-${mo}-${d}T${String(hh % 24).padStart(2, '0')}:${mm}:00Z`;
 }
 
 function analysisTimeToUnix(missionId, hhmm) {
