@@ -150,6 +150,14 @@
         <button class="neutral" id="token-toggle" type="button" title="Show/hide token">👁</button>
       </div>
     </div>
+    <div class="field">
+      <label for="sel-velocity-unit">Wind/velocity units</label>
+      <select id="sel-velocity-unit">
+        <option value="m/s">m/s</option>
+        <option value="mph">mph</option>
+        <option value="kt">knots</option>
+      </select>
+    </div>
     <button class="neutral" id="theme-toggle" title="Cycle theme">Theme</button>
   </div>
 </header>
@@ -176,10 +184,13 @@
         <div class="field"><label for="sel-product">Product</label><select id="sel-product"></select></div>
       </div>
       <div class="field" id="field-time" style="margin-top:8px"><label for="sel-time">Analysis time (UTC)</label><select id="sel-time"></select></div>
-      <label class="field" id="field-altitude-composite" style="margin-top:8px; flex-direction:row; align-items:center; gap:6px; font-size:12px;">
-        <input type="checkbox" id="chk-altitude-composite" style="width:auto;">
-        Altitude max-projection (collapse levels, 2D only)
-      </label>
+      <div class="field" id="field-altitude-composite" style="margin-top:8px">
+        <label for="sel-slice-mode">Slice mode</label>
+        <select id="sel-slice-mode">
+          <option value="cappi">Single altitude (CAPPI)</option>
+          <option value="altitude-composite">Altitude max-projection (collapse levels)</option>
+        </select>
+      </div>
       <div class="field" style="margin-top:8px"><label for="sel-field">Field</label><select id="sel-field"></select></div>
       <div class="field" id="field-z" style="margin-top:8px">
         <label for="inp-z">CAPPI altitude (km)</label>
@@ -199,31 +210,40 @@
       2D sweep plots one horizontal CAPPI or the along-track vertical profile.
     </div>
 
-    <fieldset id="fs-satellite" style="display:none">
-      <legend>Satellite basemap</legend>
-      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
-        GOES Band 13 (Clean IR), georeferenced under the TDR data — stacks below the
-        2D heatmap and along the floor of the 3D view.
-      </div>
-      <button id="btn-load-satellite" class="neutral" style="width:100%;">Load Band 13 basemap</button>
-      <div id="satellite-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
+    <fieldset id="fs-overlays" style="display:none">
+      <legend>Overlays</legend>
+
+      <label class="field" id="field-streamlines" style="flex-direction:row; align-items:center; gap:6px; font-size:12px;">
+        <input type="checkbox" id="chk-streamlines" style="width:auto;">
+        Wind streamlines (u/v)
+      </label>
+
       <label style="display:flex; align-items:center; gap:6px; margin-top:10px; font-size:11px; color:var(--text-muted);">
         <input type="checkbox" id="chk-flight-track" checked>
-        Show recon aircraft track
+        Recon aircraft track
       </label>
       <div id="flight-track-status" style="font-size:11px; color:var(--text-faint); margin-top:2px;"></div>
-    </fieldset>
 
-    <fieldset id="fs-planeslice" style="display:none">
-      <legend>Plane slice</legend>
-      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
-        Click two points on the 2D plot to cut an arbitrary vertical cross-section through this
-        analysis time's full volume — not just the fixed along/across-track
-        vert_inbound/vert_outbound cuts.
+      <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+        <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+          GOES Band 13 (Clean IR) basemap, georeferenced under the TDR data — stacks
+          below the 2D heatmap and along the floor of the 3D view.
+        </div>
+        <button id="btn-load-satellite" class="neutral" style="width:100%;">Load Band 13 basemap</button>
+        <div id="satellite-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
       </div>
-      <button id="btn-planeslice-toggle" class="neutral" type="button" style="width:100%;">Draw plane slice</button>
-      <div id="planeslice-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
-      <button id="btn-planeslice-clear" class="neutral" type="button" style="width:100%; margin-top:6px; display:none;">Clear</button>
+
+      <div id="planeslice-controls" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border); display:none;">
+        <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+          Plane slice: click a start point on the 2D plot, then move the cursor to draw a
+          line, then click again to cut a vertical cross-section through this analysis
+          time's full volume (not just the fixed along/across-track
+          vert_inbound/vert_outbound cuts). Esc backs out mid-draw.
+        </div>
+        <button id="btn-planeslice-toggle" class="neutral" type="button" style="width:100%;">Draw plane slice</button>
+        <div id="planeslice-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
+        <button id="btn-planeslice-clear" class="neutral" type="button" style="width:100%; margin-top:6px; display:none;">Clear</button>
+      </div>
     </fieldset>
   </div>
 
@@ -231,10 +251,6 @@
     <div id="status"></div>
     <div id="info-bar" style="display:none"></div>
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
-    <div id="planeslice-panel" style="display:none; flex-direction:column; gap:8px;">
-      <div id="planeslice-info-bar" style="display:flex; flex-wrap:wrap; gap:6px 18px; font-size:12px; color:var(--text-muted); padding:8px 12px; background:var(--bg-panel); border:1px solid var(--border); border-radius:4px;"></div>
-      <div id="plot-planeslice" style="height:320px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel);"></div>
-    </div>
     <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
       <canvas id="plot3d-canvas" style="width:100%; height:100%; display:block;"></canvas>
       <div id="plot3d-legend" style="position:absolute; top:10px; right:10px; display:flex; flex-direction:column; align-items:center; gap:4px; background:rgba(20,20,20,0.7); border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:10px 8px; font-size:10px; color:#fff;"></div>
@@ -271,6 +287,17 @@
       <button type="button" id="help-modal-close" class="neutral" style="padding:4px 10px;">Close</button>
     </div>
     <div style="font-size:12px; line-height:1.6; color:var(--text);" id="help-modal-body"></div>
+  </div>
+</div>
+
+<div id="planeslice-modal-backdrop" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100; align-items:center; justify-content:center;">
+  <div id="planeslice-modal" style="background:var(--bg-panel); border:1px solid var(--border); border-radius:6px; max-width:1200px; width:96%; max-height:90vh; overflow-y:auto; padding:20px 24px; box-shadow:0 8px 30px rgba(0,0,0,0.4);">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <h2 style="margin:0; font-size:16px; color:var(--text-heading);">Plane slice cross-section</h2>
+      <button type="button" id="planeslice-modal-close" class="neutral" style="padding:4px 10px;">Close</button>
+    </div>
+    <div id="planeslice-info-bar" style="display:flex; flex-wrap:wrap; gap:6px 18px; font-size:12px; color:var(--text-muted); padding:8px 12px; background:var(--bg-panel); border:1px solid var(--border); border-radius:4px; margin-bottom:10px;"></div>
+    <div id="plot-planeslice" style="height:600px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel);"></div>
   </div>
 </div>
 
@@ -464,7 +491,7 @@ async function loadMissionFiles(missionId) {
   currentFlightTrackPoints = [];
   tdrLegs = [];
   tdrLegsAreReal = false;
-  $('fs-satellite').style.display = 'none';
+  $('fs-overlays').style.display = 'none';
   $('flight-track-status').textContent = '';
   try {
     const data = await getJSON(`/v1/tdr/mission/${encodeURIComponent(missionId)}`);
@@ -505,7 +532,7 @@ function canAltitudeComposite() {
   const product = $('sel-product').value || '';
   return currentView() === 'sweep' && !product.startsWith('vert_') && !isTimeComposite();
 }
-function isAltitudeComposite() { return canAltitudeComposite() && $('chk-altitude-composite').checked; }
+function isAltitudeComposite() { return canAltitudeComposite() && $('sel-slice-mode').value === 'altitude-composite'; }
 
 // ── Product help modal ───────────────────────────────────────────────────
 
@@ -611,7 +638,7 @@ function applyViewVisibility() {
   // incompatible with the time-mosaic pseudo-option (which already spans
   // every instant) and with 3D (which already shows every level).
   $('field-altitude-composite').classList.toggle('hidden', !canAltitudeComposite());
-  if (!canAltitudeComposite()) $('chk-altitude-composite').checked = false;
+  if (!canAltitudeComposite()) $('sel-slice-mode').value = 'cappi';
   const altitudeComposite = isAltitudeComposite();
 
   const needsZ = view === 'sweep' && !isVert && !altitudeComposite;
@@ -640,6 +667,18 @@ function applyViewVisibility() {
   if (view !== 'sweep' || isVert || (timeComposite && !altitudeComposite)) {
     planeSliceContext = null;
     updatePlaneSliceAvailability();
+  }
+
+  // Streamlines need an x/y Cartesian grid to trace u/v across — available
+  // for any 2D xy/xy_rel view (plain sweep, altitude composite, *and* time
+  // composite, unlike the plane slice tool: a mean-of-u/v streamline over a
+  // time mosaic is still physically meaningful), just not a vertical
+  // profile (no u/v there) or the 3D view (nothing 2D to overlay onto).
+  const streamlinesPossible = view === 'sweep' && !isVert;
+  $('field-streamlines').classList.toggle('hidden', !streamlinesPossible);
+  if (!streamlinesPossible && $('chk-streamlines').checked) {
+    $('chk-streamlines').checked = false;
+    clearStreamlines();
   }
 }
 
@@ -1110,7 +1149,7 @@ function frameCamera(camera, controls, ext) {
 
 let currentVolumeMaterial = null;
 
-function buildRaymarchVolumeScene(vol) {
+function buildRaymarchVolumeScene(vol, preserveCamera) {
   const { group, camera, controls } = initThree();
   clearThreeGroup();
   currentVolumeMaterial = null;
@@ -1147,7 +1186,7 @@ function buildRaymarchVolumeScene(vol) {
   addSatelliteFloor(group);
   addFlightTrack(group, ext);
   addOrientationHelpers(group, ext);
-  frameCamera(camera, controls, ext);
+  if (!preserveCamera) frameCamera(camera, controls, ext);
 
   // Force shader compilation now (rather than letting it happen lazily
   // inside the render loop) so a link/compile failure throws here, where
@@ -1155,7 +1194,7 @@ function buildRaymarchVolumeScene(vol) {
   three.renderer.compile(three.scene, camera);
 }
 
-function buildLayeredVolumeScene(vol) {
+function buildLayeredVolumeScene(vol, preserveCamera) {
   const { group, camera, controls } = initThree();
   clearThreeGroup();
   currentVolumeMaterial = null;
@@ -1179,7 +1218,7 @@ function buildLayeredVolumeScene(vol) {
   addSatelliteFloor(group);
   addFlightTrack(group, ext);
   addOrientationHelpers(group, ext);
-  frameCamera(camera, controls, ext);
+  if (!preserveCamera) frameCamera(camera, controls, ext);
 }
 
 // ── Opacity transfer-function editor ("transparency table") ────────────
@@ -1231,8 +1270,12 @@ function buildOpacityLUT() {
 function updateOpacityEditorValueLabels() {
   const minEl = $('opacity-min-label'), maxEl = $('opacity-max-label');
   if (lastVolume) {
-    minEl.textContent = `${lastVolume.zmin} ${lastVolume.units}`;
-    maxEl.textContent = `${lastVolume.zmax} ${lastVolume.units}`;
+    // lastVolume is the raw (native m/s) response — convert for display,
+    // same as buildVolumeScene does for the actual texture/legend, so this
+    // label doesn't silently disagree with what's on screen.
+    const disp = toDisplayUnits(lastVolume);
+    minEl.textContent = `${disp.zmin} ${disp.units}`;
+    maxEl.textContent = `${disp.zmax} ${disp.units}`;
   } else {
     minEl.textContent = 'low value';
     maxEl.textContent = 'high value';
@@ -1343,15 +1386,29 @@ function opacityEditorPointerUp() {
 function renderVolumeLegend(stops, zmin, zmax, units) {
   const el = $('plot3d-legend');
   const gradient = stops.map(([f, hex]) => `${hex} ${(f * 100).toFixed(0)}%`).join(', ');
+  const round = (v) => (Math.abs(v) >= 10 ? Math.round(v) : Math.round(v * 10) / 10);
   el.innerHTML = `
-    <div>${zmax}</div>
+    <div>${round(zmax)}</div>
     <div style="width:14px; height:120px; border-radius:2px; background:linear-gradient(to top, ${gradient});"></div>
-    <div>${zmin}</div>
+    <div>${round(zmin)}</div>
     <div style="margin-top:2px;">${units}</div>
   `;
 }
 
-function buildVolumeScene(vol) {
+// `vol` is passed through display-unit conversion here (once, up front) so
+// every downstream consumer — the raymarch/layered texture builders, the
+// legend, the opacity editor's axis labels — sees already-converted
+// data/zmin/zmax/units without needing to know about units at all. Callers
+// keep the raw (native m/s) response in `lastVolume` so a later unit
+// change can re-render without a new fetch.
+// `opts.preserveCamera`: skip re-framing the camera to the data extent —
+// for a refresh that doesn't change the dataset (a unit change, an
+// overlay toggle, a 3D-style switch), the user's current orbit/zoom should
+// survive; only a genuinely new volume (new mission/product/analysis_time)
+// should re-frame.
+function buildVolumeScene(rawVol, opts = {}) {
+  const preserveCamera = !!opts.preserveCamera;
+  const vol = toDisplayUnits(rawVol);
   const { renderer } = initThree();
   let style = $('sel-3d-style').value;
   if (style === 'raymarch' && !renderer.capabilities.isWebGL2) {
@@ -1360,17 +1417,17 @@ function buildVolumeScene(vol) {
     style = 'layered';
   }
   if (style === 'layered') {
-    buildLayeredVolumeScene(vol);
+    buildLayeredVolumeScene(vol, preserveCamera);
   } else {
     try {
-      buildRaymarchVolumeScene(vol);
+      buildRaymarchVolumeScene(vol, preserveCamera);
     } catch (e) {
       // WebGL2/sampler3D not available, or a shader failed to compile on
       // this GPU/driver — fall back to the always-supported layered view
       // rather than leaving a blank canvas.
       console.warn('Volumetric raymarch render failed, falling back to layered slices:', e);
       $('sel-3d-style').value = 'layered';
-      buildLayeredVolumeScene(vol);
+      buildLayeredVolumeScene(vol, preserveCamera);
       setStatus('error', 'Volumetric rendering isn\'t supported on this browser/GPU — showing layered slices instead.');
     }
   }
@@ -1458,7 +1515,7 @@ async function updateGeoContext({ mission_id, origin_lat, origin_lon, x, y, isoT
     currentGeoContext = { lat: origin_lat, lon: origin_lon, widthKm, isoTime, legWindow };
   }
   satelliteOverlay = null;
-  $('fs-satellite').style.display = currentGeoContext ? '' : 'none';
+  $('fs-overlays').style.display = currentGeoContext ? '' : 'none';
   $('satellite-status').textContent = '';
   await refreshFlightTrack(mission_id);
 }
@@ -1530,11 +1587,72 @@ async function refreshFlightTrack(missionId) {
 // Re-applies the loaded basemap / flight track to whichever view is
 // currently showing — a Plotly image layer + scatter trace under/over the
 // 2D heatmap, or a floor plane + line in the 3D scene.
+// The recon-track scatter traces (line + start/end markers) for whatever's
+// currently in `currentFlightTrackPoints` — shared by render()'s initial
+// build and updateOverlaysOnPlot()'s incremental patch so the two can't
+// drift out of sync with each other.
+function flightTrackTraces() {
+  if (!currentFlightTrackPoints.length) return [];
+  const first = currentFlightTrackPoints[0];
+  const last = currentFlightTrackPoints[currentFlightTrackPoints.length - 1];
+  return [
+    {
+      type: 'scatter',
+      mode: 'lines+markers',
+      x: currentFlightTrackPoints.map((p) => p.xKm),
+      y: currentFlightTrackPoints.map((p) => p.yKm),
+      line: { color: '#ff59d6', width: 2 },
+      marker: { size: 3, color: '#ff59d6' },
+      name: 'Aircraft track',
+      hovertemplate: 'track x %{x:.0f} km, y %{y:.0f} km<extra></extra>',
+    },
+    // Start (green) / end (red) markers — same convention as the 3D view.
+    {
+      type: 'scatter',
+      mode: 'markers',
+      x: [first.xKm, last.xKm],
+      y: [first.yKm, last.yKm],
+      marker: { size: 10, color: ['#5fff8f', '#ff5f5f'], line: { color: '#000', width: 1 } },
+      text: ['Track start', 'Track end'],
+      hovertemplate: '%{text}<extra></extra>',
+      name: 'Track start/end',
+      showlegend: false,
+    },
+  ];
+}
+
+// Patches the satellite basemap image + recon flight-track traces onto the
+// already-rendered #plot in place, via Plotly.relayout/restyle/addTraces/
+// deleteTraces rather than a full Plotly.newPlot — so toggling an overlay
+// never resets the user's current zoom/pan. A no-op if there's no base 2D
+// plot yet (nothing to patch onto) or it's a vertical profile (no
+// geographic frame for either overlay to mean anything in).
+async function updateOverlaysOnPlot() {
+  const gd = $('plot');
+  if (!gd || !gd.data || !gd.data.length || !lastSweep || lastIsVert) return;
+
+  const basemap = satelliteImageLayoutEntry();
+  await Plotly.relayout('plot', { images: basemap ? [basemap] : [] });
+  // Dim the heatmap so the basemap shows through — same convention as
+  // render()'s initial build.
+  await Plotly.restyle('plot', { opacity: basemap ? 0.72 : 1 }, [0]);
+
+  const trackIdx = ['Aircraft track', 'Track start/end'].flatMap(findTraceIndices);
+  if (trackIdx.length) await Plotly.deleteTraces('plot', trackIdx).catch(() => {});
+  const newTrackTraces = flightTrackTraces();
+  if (newTrackTraces.length) await Plotly.addTraces('plot', newTrackTraces);
+}
+
+// Re-applies the loaded basemap / flight track to whichever view is
+// currently showing. 2D patches the existing plot in place (see
+// updateOverlaysOnPlot); 3D still rebuilds the Three.js scene wholesale
+// (no incremental path for that yet) but keeps the camera where the user
+// left it rather than reframing.
 function applySatelliteOverlay() {
   if (currentView() === 'volume' && lastVolume) {
-    buildVolumeScene(lastVolume);
+    buildVolumeScene(lastVolume, { preserveCamera: true });
   } else if (lastSweep) {
-    render(lastSweep, lastIsVert);
+    updateOverlaysOnPlot();
   }
 }
 
@@ -1599,12 +1717,13 @@ async function plotVolume() {
       <span>Mission: <b>${vol.mission_id}</b></span>
       <span>Product: <b>${vol.product}</b></span>
       <span>Analysis time: <b>${vol.analysis_time}Z</b></span>
-      <span>Field: <b>${vol.field}</b> (${vol.units})</span>
+      <span>Field: <b>${vol.field}</b> (${toDisplayUnits(vol).units})</span>
       <span>Levels: <b>${vol.levels_km.length}</b> (${Math.min(...vol.levels_km)}–${Math.max(...vol.levels_km)} km)</span>
     `;
-    // The plane slice tool clicks on the 2D #plot heatmap, which the 3D
-    // volume view doesn't show — nothing to click on, so it's unavailable.
+    // The plane slice tool and streamlines both overlay on the 2D #plot
+    // heatmap, which the 3D volume view doesn't show — neither applies.
     planeSliceContext = null;
+    currentGridQuery = null;
     updatePlaneSliceAvailability();
     setStatus(null, '');
   } catch (e) {
@@ -1650,6 +1769,7 @@ async function plotComposite() {
 
     const info = $('info-bar');
     info.style.display = '';
+    let streamlinesOk = true;
     if (mode === 'time_volume') {
       lastVolume = comp;
       buildVolumeScene(comp);
@@ -1657,12 +1777,14 @@ async function plotComposite() {
         <span>Storm: <b>${comp.storm_name || '—'}</b></span>
         <span>Mission: <b>${comp.mission_id}</b></span>
         <span>Mode: <b>3D time mosaic composite</b></span>
-        <span>Field: <b>${comp.field}</b> (${comp.units})</span>
+        <span>Field: <b>${comp.field}</b> (${toDisplayUnits(comp).units})</span>
         <span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>
         <span>Levels: <b>${comp.levels_km.length}</b> (${Math.min(...comp.levels_km)}–${Math.max(...comp.levels_km)} km)</span>
       `;
-      // 3D view, nothing on-screen for the plane slice tool to click.
+      // 3D view, nothing on-screen for the plane slice tool or streamlines
+      // to overlay onto.
       planeSliceContext = null;
+      currentGridQuery = null;
     } else {
       render(comp, false);
       const detail = mode === 'altitude'
@@ -1672,7 +1794,7 @@ async function plotComposite() {
         <span>Storm: <b>${comp.storm_name || '—'}</b></span>
         <span>Mission: <b>${comp.mission_id}</b></span>
         <span>Mode: <b>${mode === 'altitude' ? 'Altitude max-projection' : 'Time mosaic'}</b></span>
-        <span>Field: <b>${comp.field}</b> (${comp.units})</span>
+        <span>Field: <b>${comp.field}</b> (${toDisplayUnits(comp).units})</span>
         ${detail}
       `;
       // 'altitude' still cuts through one analysis time's whole volume, so
@@ -1682,9 +1804,14 @@ async function plotComposite() {
       planeSliceContext = mode === 'altitude'
         ? { mission_id: comp.mission_id, level: comp.level, product: comp.product, analysis_time: comp.detail.analysis_time, field: comp.field }
         : null;
+      // Streamlines only need an x/y grid, not a single volume, so 'time'
+      // works here too (mean-of-u/v across the mosaicked times) — see
+      // applyViewVisibility for why this is broader than planeSliceContext.
+      currentGridQuery = { endpoint: '/v1/tdr/composite', params };
+      streamlinesOk = await refreshStreamlines();
     }
     updatePlaneSliceAvailability();
-    setStatus(null, '');
+    if (streamlinesOk) setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
   } finally {
@@ -1721,7 +1848,9 @@ async function plotSweep() {
     // sweep, never a vert_inbound/vert_outbound profile.
     planeSliceContext = isVert ? null : { mission_id: sweep.mission_id, level: sweep.level, product: sweep.product, analysis_time: sweep.analysis_time, field: sweep.field };
     updatePlaneSliceAvailability();
-    setStatus(null, '');
+    currentGridQuery = isVert ? null : { endpoint: '/v1/tdr/sweep', params };
+    const streamlinesOk = await refreshStreamlines();
+    if (streamlinesOk) setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
   } finally {
@@ -1743,6 +1872,47 @@ let lastIsVert = false;
 let planeSliceContext = null; // {mission_id, level, product, analysis_time, field} or null
 let planeSliceToolActive = false;
 let planeSlicePoints = []; // [{x,y}, ...] up to 2, in the plot's km-from-center frame
+let lastPlaneSliceCut = null; // raw (native m/s) last-rendered cross-section, or null
+
+// ── Velocity units ───────────────────────────────────────────────────────
+// The server always answers in the netCDF file's native m/s — conversion
+// to mph/knots is purely a display concern, so it happens here, at render
+// time, against the *raw* response every render function is handed
+// (lastSweep/lastVolume/lastPlaneSliceCut all stay in native m/s). That
+// way flipping the unit selector just re-renders already-fetched data
+// instead of triggering a new network round-trip.
+const VELOCITY_FIELDS = new Set(['radial_wind', 'tangential_wind', 'wind_speed', 'u', 'v', 'w']);
+function isVelocityField(field) { return VELOCITY_FIELDS.has(field); }
+
+const VELOCITY_UNITS = {
+  'm/s': { factor: 1, label: 'm/s' },
+  mph: { factor: 2.2369362920544, label: 'mph' },
+  kt: { factor: 1.9438444924406047, label: 'kt' },
+};
+function currentVelocityUnit() { return $('sel-velocity-unit').value || 'm/s'; }
+
+// Recursively multiplies every number in a possibly-nested (1D/2D/3D)
+// array by `factor`, leaving `null`/`undefined` (missing data) untouched.
+function mapNested(data, fn) {
+  return Array.isArray(data) ? data.map((v) => mapNested(v, fn)) : (data == null ? data : fn(data));
+}
+
+// Returns {data, zmin, zmax, units} for display: converted to the
+// currently-selected velocity unit if `resp.field` is a speed/velocity
+// field, otherwise (reflectivity, vorticity — not a speed) passed through
+// unchanged. Never mutates `resp`.
+function toDisplayUnits(resp) {
+  if (!resp || !isVelocityField(resp.field)) return resp;
+  const { factor, label } = VELOCITY_UNITS[currentVelocityUnit()];
+  if (factor === 1) return resp;
+  return {
+    ...resp,
+    data: mapNested(resp.data, (v) => v * factor),
+    zmin: resp.zmin != null ? resp.zmin * factor : resp.zmin,
+    zmax: resp.zmax != null ? resp.zmax * factor : resp.zmax,
+    units: label,
+  };
+}
 
 // Converts the loaded satellite basemap's lat/lon bounds into a Plotly
 // `layout.images` entry positioned in the same km-from-storm-center frame
@@ -1773,6 +1943,13 @@ function satelliteImageLayoutEntry() {
 function render(sweep, isVert) {
   lastSweep = sweep;
   lastIsVert = isVert;
+  // A brand-new Plotly.newPlot below wipes every existing trace, including
+  // any streamline/plane-slice overlay added on top of the previous plot —
+  // and any in-progress plane-slice draw belonged to the old grid, so drop
+  // it too rather than let a stale point/line linger against new data.
+  planeSlicePoints = [];
+
+  const disp = toDisplayUnits(sweep);
   const info = $('info-bar');
   info.style.display = '';
   info.innerHTML = `
@@ -1781,7 +1958,7 @@ function render(sweep, isVert) {
     <span>Level: <b>${sweep.level}</b></span>
     <span>Product: <b>${sweep.product}</b></span>
     <span>Analysis time: <b>${sweep.analysis_time}Z</b></span>
-    <span>Field: <b>${sweep.field}</b> (${sweep.units})</span>
+    <span>Field: <b>${sweep.field}</b> (${disp.units})</span>
     ${sweep.z_km != null ? `<span>Altitude: <b>${sweep.z_km} km</b></span>` : ''}
     ${sweep.origin_lat != null ? `<span>Origin: <b>${sweep.origin_lat.toFixed(2)}, ${sweep.origin_lon.toFixed(2)}</b></span>` : ''}
   `;
@@ -1792,17 +1969,17 @@ function render(sweep, isVert) {
     type: 'heatmap',
     x: sweep.x,
     y: sweep.y,
-    z: sweep.data,
-    zmin: sweep.zmin,
-    zmax: sweep.zmax,
+    z: disp.data,
+    zmin: disp.zmin,
+    zmax: disp.zmax,
     colorscale: sweep.colorscale,
     // Let the satellite basemap show through when one's loaded — full
     // opacity would just paint over it.
     opacity: basemap ? 0.72 : 1,
-    colorbar: { title: { text: sweep.units, side: 'right' } },
+    colorbar: { title: { text: disp.units, side: 'right' } },
     hovertemplate: isVert
-      ? 'radius %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + sweep.units + '<extra></extra>'
-      : 'x %{x:.0f} km<br>y %{y:.0f} km<br>%{z:.1f} ' + sweep.units + '<extra></extra>',
+      ? 'radius %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + disp.units + '<extra></extra>'
+      : 'x %{x:.0f} km<br>y %{y:.0f} km<br>%{z:.1f} ' + disp.units + '<extra></extra>',
   };
 
   const isDark = getEffectiveTheme() === 'dark';
@@ -1828,57 +2005,218 @@ function render(sweep, isVert) {
   };
 
   const traces = [trace];
-  if (!isVert && currentFlightTrackPoints.length) {
-    traces.push({
-      type: 'scatter',
-      mode: 'lines+markers',
-      x: currentFlightTrackPoints.map((p) => p.xKm),
-      y: currentFlightTrackPoints.map((p) => p.yKm),
-      line: { color: '#ff59d6', width: 2 },
-      marker: { size: 3, color: '#ff59d6' },
-      name: 'Aircraft track',
-      hovertemplate: 'track x %{x:.0f} km, y %{y:.0f} km<extra></extra>',
-    });
-    // Start (green) / end (red) markers — same convention as the 3D view.
-    const first = currentFlightTrackPoints[0];
-    const last = currentFlightTrackPoints[currentFlightTrackPoints.length - 1];
-    traces.push({
-      type: 'scatter',
-      mode: 'markers',
-      x: [first.xKm, last.xKm],
-      y: [first.yKm, last.yKm],
-      marker: { size: 10, color: ['#5fff8f', '#ff5f5f'], line: { color: '#000', width: 1 } },
-      text: ['Track start', 'Track end'],
-      hovertemplate: '%{text}<extra></extra>',
-      name: 'Track start/end',
-      showlegend: false,
-    });
-  }
+  if (!isVert) traces.push(...flightTrackTraces());
 
   Plotly.newPlot('plot', traces, layout, { responsive: true, displaylogo: false }).then(() => {
     // Plotly.newPlot tears down and rebuilds the plot's event target each
-    // call, so click handlers from a previous render() don't survive —
-    // re-attach every time rather than once at page load.
+    // call, so handlers from a previous render() don't survive — re-attach
+    // every time rather than once at page load.
     $('plot').removeAllListeners?.('plotly_click');
+    $('plot').removeAllListeners?.('plotly_hover');
     $('plot').on('plotly_click', onMainPlotClick);
+    $('plot').on('plotly_hover', onMainPlotHover);
   });
 }
 
-// ── Plane slice tool ─────────────────────────────────────────────────────
+// ── Streamlines ──────────────────────────────────────────────────────────
+// Traces wind-flow streamlines (u/v components) across whatever 2D x/y grid
+// is currently plotted, overlaid on top of the heatmap via
+// Plotly.addTraces — computed entirely client-side by bilinearly sampling
+// the u/v grids and integrating outward from a set of evenly-spaced seed
+// points, mirroring the same renormalizing-bilinear-sample approach
+// `noaa_recon_core::sweep::bilinear_sample` uses server-side for the plane
+// slice tool.
 
-// Shows/hides the "Plane slice" panel based on whether the plot currently
+// {endpoint, params: URLSearchParams} describing how to re-fetch the
+// currently-plotted grid with field swapped to 'u'/'v' — set whenever a 2D
+// xy/xy_rel grid (plain sweep, altitude composite, or time composite)
+// successfully loads; null for anything without an x/y grid to trace
+// (vertical profile, 3D view). See applyViewVisibility for why 'time'
+// composite is included here but not in planeSliceContext.
+let currentGridQuery = null;
+
+// Looks up a trace's current index on `#plot` by its `name`, rather than
+// caching indices from whenever a trace was added — several independent
+// overlays (streamlines, the plane-slice draw-in-progress point/line) get
+// added and removed from the same plot at different times via
+// Plotly.addTraces/deleteTraces, and a cached index silently goes stale the
+// moment *any* earlier trace is removed (Plotly re-indexes everything
+// after it). Looking it up fresh each time sidesteps that entirely.
+function findTraceIndices(name) {
+  const gd = $('plot');
+  if (!gd || !gd.data) return [];
+  const out = [];
+  gd.data.forEach((t, i) => { if (t.name === name) out.push(i); });
+  return out;
+}
+
+const STREAMLINE_SEED_COLS = 12;
+const STREAMLINE_SEED_ROWS = 9;
+const STREAMLINE_MAX_STEPS_EACH_DIR = 24;
+
+// Same renormalizing bilinear interpolation as the server's plane-slice
+// sampler (data[yi][xi], xs/ys ascending) — missing corners don't poison
+// the sample, they just drop out of the weighted average.
+function bilinearSample2D(dataYX, xs, ys, x, y) {
+  const nx = xs.length, ny = ys.length;
+  if (nx < 2 || ny < 2 || x < xs[0] || x > xs[nx - 1] || y < ys[0] || y > ys[ny - 1]) return null;
+  let xi = 0; while (xi < nx - 2 && xs[xi + 1] <= x) xi++;
+  let yi = 0; while (yi < ny - 2 && ys[yi + 1] <= y) yi++;
+  const x0 = xs[xi], x1 = xs[xi + 1], y0 = ys[yi], y1 = ys[yi + 1];
+  const tx = x1 > x0 ? (x - x0) / (x1 - x0) : 0;
+  const ty = y1 > y0 ? (y - y0) / (y1 - y0) : 0;
+  const corners = [
+    [dataYX[yi][xi], (1 - tx) * (1 - ty)],
+    [dataYX[yi][xi + 1], tx * (1 - ty)],
+    [dataYX[yi + 1][xi], (1 - tx) * ty],
+    [dataYX[yi + 1][xi + 1], tx * ty],
+  ];
+  let sum = 0, weight = 0;
+  for (const [v, w] of corners) { if (v != null) { sum += v * w; weight += w; } }
+  return weight > 0 ? sum / weight : null;
+}
+
+// Walks one direction from `start` along the (u,v) field, a fixed `stepKm`
+// per iteration (normalized to the local flow direction, not scaled by
+// speed — a constant visual step keeps line segments evenly spaced
+// regardless of how fast the wind is at that point). Stops at the grid
+// boundary, missing data, or a near-zero wind (nothing to follow).
+function traceOneDirection(u, v, xs, ys, start, stepKm, maxSteps, sign) {
+  const pts = [start];
+  let { x, y } = start;
+  for (let i = 0; i < maxSteps; i++) {
+    const uu = bilinearSample2D(u, xs, ys, x, y);
+    const vv = bilinearSample2D(v, xs, ys, x, y);
+    if (uu == null || vv == null) break;
+    const speed = Math.hypot(uu, vv);
+    if (speed < 1e-3) break;
+    x += (uu / speed) * stepKm * sign;
+    y += (vv / speed) * stepKm * sign;
+    if (x < xs[0] || x > xs[xs.length - 1] || y < ys[0] || y > ys[ys.length - 1]) break;
+    pts.push({ x, y });
+  }
+  return pts;
+}
+
+// Seeds an evenly-spaced grid of points, integrates a streamline both ways
+// from each, and packs every line into a single Plotly trace (`null`-
+// separated segments, the standard trick for many disconnected polylines
+// in one trace) plus one direction-arrow marker per line — 3 traces total
+// (a dark outline, a light line on top for contrast over any heatmap
+// colorscale, and rotated triangle-marker arrows), not one pair per line,
+// so this stays cheap regardless of seed count.
+function buildStreamlineTraces(uResp, vResp) {
+  const xs = uResp.x, ys = uResp.y;
+  const u = uResp.data, v = vResp.data;
+  if (xs.length < 2 || ys.length < 2) return [];
+  const dxSpacing = Math.abs(xs[1] - xs[0]);
+  const dySpacing = Math.abs(ys[1] - ys[0]);
+  const stepKm = 0.6 * Math.max(dxSpacing, dySpacing);
+
+  const lineX = [], lineY = [];
+  const arrowX = [], arrowY = [], arrowAngle = [];
+
+  for (let r = 0; r < STREAMLINE_SEED_ROWS; r++) {
+    for (let c = 0; c < STREAMLINE_SEED_COLS; c++) {
+      const sx = xs[0] + ((c + 0.5) / STREAMLINE_SEED_COLS) * (xs[xs.length - 1] - xs[0]);
+      const sy = ys[0] + ((r + 0.5) / STREAMLINE_SEED_ROWS) * (ys[ys.length - 1] - ys[0]);
+      if (bilinearSample2D(u, xs, ys, sx, sy) == null || bilinearSample2D(v, xs, ys, sx, sy) == null) continue;
+
+      const fwd = traceOneDirection(u, v, xs, ys, { x: sx, y: sy }, stepKm, STREAMLINE_MAX_STEPS_EACH_DIR, 1);
+      const bwd = traceOneDirection(u, v, xs, ys, { x: sx, y: sy }, stepKm, STREAMLINE_MAX_STEPS_EACH_DIR, -1);
+      const path = [...bwd.slice(1).reverse(), ...fwd]; // bwd[0] === seed === fwd[0]
+      if (path.length < 3) continue;
+
+      path.forEach((p) => { lineX.push(p.x); lineY.push(p.y); });
+      lineX.push(null); lineY.push(null); // segment separator so traces don't connect between streamlines
+
+      // Direction arrow ~65% along the path (biased toward the forward
+      // half, so it reads as "this is where the flow is headed").
+      const ai = Math.min(path.length - 2, Math.floor(path.length * 0.65));
+      const dx = path[ai + 1].x - path[ai].x, dy = path[ai + 1].y - path[ai].y;
+      if (dx !== 0 || dy !== 0) {
+        arrowX.push(path[ai].x); arrowY.push(path[ai].y);
+        // Plotly marker.angle is clockwise degrees from "up"; a
+        // triangle-up marker rotated by atan2(dx,dy) points along (dx,dy).
+        arrowAngle.push((Math.atan2(dx, dy) * 180) / Math.PI);
+      }
+    }
+  }
+
+  if (!lineX.length) return [];
+  return [
+    {
+      type: 'scatter', mode: 'lines', x: lineX, y: lineY,
+      line: { color: 'rgba(15,15,15,0.5)', width: 2.6 },
+      hoverinfo: 'skip', showlegend: false, name: 'streamlines-outline',
+    },
+    {
+      type: 'scatter', mode: 'lines', x: lineX, y: lineY,
+      line: { color: 'rgba(255,255,255,0.92)', width: 1.1 },
+      hoverinfo: 'skip', showlegend: false, name: 'streamlines',
+    },
+    {
+      type: 'scatter', mode: 'markers', x: arrowX, y: arrowY,
+      marker: { symbol: 'triangle-up', size: 7, angle: arrowAngle, color: 'rgba(255,255,255,0.92)', line: { color: 'rgba(15,15,15,0.6)', width: 1 } },
+      hoverinfo: 'skip', showlegend: false, name: 'streamline-arrows',
+    },
+  ];
+}
+
+function clearStreamlines() {
+  const idx = ['streamlines-outline', 'streamlines', 'streamline-arrows'].flatMap(findTraceIndices);
+  if (idx.length) Plotly.deleteTraces('plot', idx).catch(() => {});
+}
+
+// Re-fetches u/v for whatever's described by `currentGridQuery` and
+// (re)draws the streamline overlay — called after a compatible 2D grid
+// loads and whenever the checkbox is toggled. A no-op if the checkbox is
+// unchecked (just clears any existing overlay) or nothing plottable is
+// loaded yet. Returns false on a fetch failure (having already reported it
+// via setStatus) so a caller that's about to declare success right
+// afterward — e.g. plotSweep's final `setStatus(null, '')` — knows not to
+// clobber that error message.
+async function refreshStreamlines() {
+  clearStreamlines();
+  if (!$('chk-streamlines').checked || !currentGridQuery) return true;
+  const { endpoint, params } = currentGridQuery;
+  const uParams = new URLSearchParams(params); uParams.set('field', 'u');
+  const vParams = new URLSearchParams(params); vParams.set('field', 'v');
+  try {
+    const [u, v] = await Promise.all([
+      getJSON(`${endpoint}?${uParams.toString()}`),
+      getJSON(`${endpoint}?${vParams.toString()}`),
+    ]);
+    const traces = buildStreamlineTraces(u, v);
+    if (!traces.length) return true;
+    await Plotly.addTraces('plot', traces);
+    return true;
+  } catch (e) {
+    setStatus('error', 'Failed to load wind streamlines: ' + e.message);
+    return false;
+  }
+}
+
+// ── Plane slice tool ─────────────────────────────────────────────────────
+// Click a start point on the main 2D plot, move the cursor (a rubber-band
+// line follows it live via `plotly_hover`, since the heatmap trace covers
+// every point so it fires continuously), click an end point to fetch the
+// cross-section, or hit Escape to back out mid-draw. The point/line
+// themselves are small pixel-sized scatter markers added via
+// Plotly.addTraces and updated in place via Plotly.restyle — never a full
+// Plotly.newPlot — so drawing a cut never resets the user's zoom/pan on
+// the main plot. Results open in a modal rather than a panel under the
+// plot, so they don't fight the main plot for vertical space.
+
+// Shows/hides the plane-slice controls based on whether the plot currently
 // on screen is something a plane slice makes sense against (a single
 // analysis time's plain xy/xy_rel sweep — see the state comment above).
 // Called both reactively (view/product/time-mosaic controls change) and
 // after a plot successfully loads.
 function updatePlaneSliceAvailability() {
   const available = !!planeSliceContext;
-  $('fs-planeslice').style.display = available ? '' : 'none';
-  if (!available) {
-    planeSliceToolActive = false;
-    planeSlicePoints = [];
-    $('planeslice-panel').style.display = 'none';
-  }
+  $('planeslice-controls').style.display = available ? '' : 'none';
+  if (!available) cancelPlaneSliceDrawing();
   updatePlaneSliceStatus();
 }
 
@@ -1894,35 +2232,71 @@ function updatePlaneSliceStatus(state) {
   } else if (planeSlicePoints.length === 0) {
     status.textContent = 'Click a start point on the plot.';
   } else if (planeSlicePoints.length === 1) {
-    status.textContent = 'Click an end point on the plot.';
+    status.textContent = 'Move the cursor, then click an end point (Esc to back out).';
   } else {
     status.textContent = 'Click two new points to redraw.';
   }
-  $('btn-planeslice-clear').style.display = $('planeslice-panel').style.display !== 'none' ? '' : 'none';
+  $('btn-planeslice-clear').style.display = planeSliceToolActive || planeSlicePoints.length ? '' : 'none';
 }
 
-function redrawPlaneSliceOverlay() {
-  const shapes = [];
-  const annotations = [];
-  planeSlicePoints.forEach((p, i) => {
-    shapes.push({
-      type: 'circle', xref: 'x', yref: 'y',
-      x0: p.x - 4, x1: p.x + 4, y0: p.y - 4, y1: p.y + 4,
-      line: { color: '#ffdd55', width: 2 }, fillcolor: 'rgba(255,221,85,0.35)',
-    });
-    annotations.push({
-      x: p.x, y: p.y, text: i === 0 ? 'A' : 'B', showarrow: false, yshift: 16,
-      font: { color: '#ffdd55', size: 12, weight: 'bold' },
-    });
-  });
-  if (planeSlicePoints.length === 2) {
-    const [a, b] = planeSlicePoints;
-    shapes.push({
-      type: 'line', xref: 'x', yref: 'y', x0: a.x, y0: a.y, x1: b.x, y1: b.y,
-      line: { color: '#ffdd55', width: 2 },
-    });
+async function clearPlaneSliceDrawOverlay() {
+  const idx = ['planeslice-point', 'planeslice-line'].flatMap(findTraceIndices);
+  if (idx.length) await Plotly.deleteTraces('plot', idx).catch(() => {});
+}
+
+// Draws (or updates in place) the placed point(s) plus a line — from the
+// first point to either the second placed point or, while only one point
+// is down, to `liveEnd` (the live cursor position) — as two small scatter
+// traces. Adds them once via Plotly.addTraces, then only ever
+// Plotly.restyles their x/y after that, so this never touches zoom/pan.
+async function updatePlaneSliceDrawOverlay(liveEnd) {
+  if (!planeSlicePoints.length) { await clearPlaneSliceDrawOverlay(); return; }
+
+  let [pointIdx] = findTraceIndices('planeslice-point');
+  let [lineIdx] = findTraceIndices('planeslice-line');
+  if (pointIdx == null || lineIdx == null) {
+    const gd = $('plot');
+    const startIdx = gd.data ? gd.data.length : 0;
+    await Plotly.addTraces('plot', [
+      {
+        type: 'scatter', mode: 'markers', x: [], y: [],
+        marker: { size: 8, color: '#ffdd55', line: { color: 'rgba(0,0,0,0.65)', width: 1.5 } },
+        hoverinfo: 'skip', showlegend: false, name: 'planeslice-point',
+      },
+      {
+        type: 'scatter', mode: 'lines', x: [], y: [],
+        line: { color: '#ffdd55', width: 2 },
+        hoverinfo: 'skip', showlegend: false, name: 'planeslice-line',
+      },
+    ]);
+    pointIdx = startIdx; lineIdx = startIdx + 1;
   }
-  Plotly.relayout('plot', { shapes, annotations });
+
+  const pointXs = planeSlicePoints.map((p) => p.x);
+  const pointYs = planeSlicePoints.map((p) => p.y);
+  let lineXs = [], lineYs = [];
+  if (planeSlicePoints.length === 1 && liveEnd) {
+    lineXs = [planeSlicePoints[0].x, liveEnd.x];
+    lineYs = [planeSlicePoints[0].y, liveEnd.y];
+  } else if (planeSlicePoints.length === 2) {
+    lineXs = [planeSlicePoints[0].x, planeSlicePoints[1].x];
+    lineYs = [planeSlicePoints[0].y, planeSlicePoints[1].y];
+  }
+  await Promise.all([
+    Plotly.restyle('plot', { x: [pointXs], y: [pointYs] }, [pointIdx]),
+    Plotly.restyle('plot', { x: [lineXs], y: [lineYs] }, [lineIdx]),
+  ]);
+}
+
+// Escape: back out of whatever the tool is mid-way through, and fully
+// deactivate it (matches the "Cancel plane slice" button) rather than just
+// clearing the current point — a plain Esc reads as "get me out of this
+// mode," not "let me try that line again."
+function cancelPlaneSliceDrawing() {
+  planeSliceToolActive = false;
+  planeSlicePoints = [];
+  clearPlaneSliceDrawOverlay();
+  updatePlaneSliceStatus();
 }
 
 function onMainPlotClick(ev) {
@@ -1931,12 +2305,22 @@ function onMainPlotClick(ev) {
   if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return;
   if (planeSlicePoints.length >= 2) planeSlicePoints = [];
   planeSlicePoints.push({ x: pt.x, y: pt.y });
-  redrawPlaneSliceOverlay();
+  updatePlaneSliceDrawOverlay();
   if (planeSlicePoints.length === 2) {
     fetchPlaneSlice();
   } else {
     updatePlaneSliceStatus();
   }
+}
+
+// Live rubber-band line while the second point hasn't been placed yet — the
+// heatmap trace has a value at every (x,y), so `plotly_hover` fires on
+// essentially every mouse move over the plot, not just over "real" markers.
+function onMainPlotHover(ev) {
+  if (!planeSliceToolActive || planeSlicePoints.length !== 1) return;
+  const pt = ev.points && ev.points[0];
+  if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return;
+  updatePlaneSliceDrawOverlay({ x: pt.x, y: pt.y });
 }
 
 async function fetchPlaneSlice() {
@@ -1953,6 +2337,7 @@ async function fetchPlaneSlice() {
   updatePlaneSliceStatus('loading');
   try {
     const cut = await getJSON(`/v1/tdr/plane_slice?${params.toString()}`);
+    lastPlaneSliceCut = cut; // raw (native m/s) — renderPlaneSlice converts for display
     renderPlaneSlice(cut);
     updatePlaneSliceStatus('done');
   } catch (e) {
@@ -1961,11 +2346,16 @@ async function fetchPlaneSlice() {
   }
 }
 
+function closePlaneSliceModal() {
+  $('planeslice-modal-backdrop').style.display = 'none';
+}
+
 function renderPlaneSlice(cut) {
-  $('planeslice-panel').style.display = 'flex';
+  const disp = toDisplayUnits(cut);
+  $('planeslice-modal-backdrop').style.display = 'flex';
   const distKm = cut.x.length ? cut.x[cut.x.length - 1] : 0;
   $('planeslice-info-bar').innerHTML = `
-    <span>Field: <b>${cut.field}</b> (${cut.units})</span>
+    <span>Field: <b>${cut.field}</b> (${disp.units})</span>
     <span>Cut length: <b>${distKm.toFixed(1)} km</b></span>
     <span>A → B: <b>(${cut.endpoints.x0.toFixed(0)}, ${cut.endpoints.y0.toFixed(0)})</b> to
       <b>(${cut.endpoints.x1.toFixed(0)}, ${cut.endpoints.y1.toFixed(0)})</b> km</span>
@@ -1978,10 +2368,10 @@ function renderPlaneSlice(cut) {
 
   const trace = {
     type: 'heatmap',
-    x: cut.x, y: cut.y, z: cut.data,
-    zmin: cut.zmin, zmax: cut.zmax, colorscale: cut.colorscale,
-    colorbar: { title: { text: cut.units, side: 'right' } },
-    hovertemplate: 'along cut %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + cut.units + '<extra></extra>',
+    x: disp.x, y: disp.y, z: disp.data,
+    zmin: disp.zmin, zmax: disp.zmax, colorscale: disp.colorscale,
+    colorbar: { title: { text: disp.units, side: 'right' } },
+    hovertemplate: 'along cut %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + disp.units + '<extra></extra>',
   };
   const layout = {
     paper_bgcolor: paper,
@@ -1991,6 +2381,10 @@ function renderPlaneSlice(cut) {
     xaxis: { title: 'Distance along cut (km), A → B', gridcolor: grid, zerolinecolor: grid },
     yaxis: { title: 'Height (km)', gridcolor: grid, zerolinecolor: grid },
   };
+  // This is a small, self-contained modal plot with no zoom/pan worth
+  // preserving between redraws — a full newPlot here is fine (unlike the
+  // main #plot, which updatePlaneSliceDrawOverlay is careful to only
+  // restyle in place).
   Plotly.newPlot('plot-planeslice', [trace], layout, { responsive: true, displaylogo: false });
 }
 
@@ -2039,25 +2433,42 @@ $('sel-view').addEventListener('change', populateProducts);
 $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
 $('sel-time').addEventListener('change', applyViewVisibility);
-$('chk-altitude-composite').addEventListener('change', applyViewVisibility);
+$('sel-slice-mode').addEventListener('change', applyViewVisibility);
+$('chk-streamlines').addEventListener('change', refreshStreamlines);
+$('sel-velocity-unit').addEventListener('change', () => {
+  try { localStorage.setItem('tdr-velocity-unit', $('sel-velocity-unit').value); } catch (e) {}
+  // Re-render from whatever's already fetched (all kept in native m/s) —
+  // no network round-trip needed just to change a display unit.
+  if (currentView() === 'sweep' && lastSweep) render(lastSweep, lastIsVert);
+  if (currentView() === 'volume' && lastVolume) buildVolumeScene(lastVolume, { preserveCamera: true });
+  if (lastPlaneSliceCut && $('planeslice-modal-backdrop').style.display !== 'none') renderPlaneSlice(lastPlaneSliceCut);
+});
 $('btn-planeslice-toggle').addEventListener('click', () => {
-  planeSliceToolActive = !planeSliceToolActive;
-  planeSlicePoints = [];
-  if (!planeSliceToolActive) Plotly.relayout('plot', { shapes: [], annotations: [] });
-  updatePlaneSliceStatus();
+  if (planeSliceToolActive) {
+    cancelPlaneSliceDrawing();
+  } else {
+    planeSliceToolActive = true;
+    updatePlaneSliceStatus();
+  }
 });
 $('btn-planeslice-clear').addEventListener('click', () => {
   planeSlicePoints = [];
-  $('planeslice-panel').style.display = 'none';
-  Plotly.relayout('plot', { shapes: [], annotations: [] });
+  clearPlaneSliceDrawOverlay();
   updatePlaneSliceStatus();
 });
-$('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
+$('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume, { preserveCamera: true }); });
 
 $('product-help-btn').addEventListener('click', openHelpModal);
 $('help-modal-close').addEventListener('click', closeHelpModal);
 $('help-modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'help-modal-backdrop') closeHelpModal(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHelpModal(); });
+$('planeslice-modal-close').addEventListener('click', closePlaneSliceModal);
+$('planeslice-modal-backdrop').addEventListener('click', (e) => { if (e.target.id === 'planeslice-modal-backdrop') closePlaneSliceModal(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if ($('help-modal-backdrop').style.display !== 'none') { closeHelpModal(); return; }
+  if ($('planeslice-modal-backdrop').style.display !== 'none') { closePlaneSliceModal(); return; }
+  if (planeSliceToolActive) cancelPlaneSliceDrawing();
+});
 
 $('btn-load-satellite').addEventListener('click', loadSatelliteImage);
 
@@ -2098,6 +2509,8 @@ $('btn-load').addEventListener('click', () => {
     if (savedBase) apiBaseInput.value = savedBase;
     const savedToken = localStorage.getItem('tdr-api-token');
     if (savedToken) apiTokenInput.value = savedToken;
+    const savedUnit = localStorage.getItem('tdr-velocity-unit');
+    if (savedUnit && VELOCITY_UNITS[savedUnit]) $('sel-velocity-unit').value = savedUnit;
   } catch (e) {}
   apiBaseLabel.textContent = apiBase();
   loadYears();
