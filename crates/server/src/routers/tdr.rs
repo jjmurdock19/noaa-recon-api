@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/tdr/sweep", get(get_sweep))
         .route("/tdr/volume", get(get_volume))
         .route("/tdr/composite", get(get_composite))
+        .route("/tdr/plane_slice", get(get_plane_slice))
         .route("/tdr/:year", get(list_storms_for_year))
         .route("/tdr/:year/*storm_name", get(list_missions_for_storm))
 }
@@ -341,7 +342,13 @@ struct CompositeQuery {
 ///   every sweep onto one shared output grid sized to the union of all of
 ///   them ([`noaa_recon_core::sweep::geo_mosaic`]) — literally "take the
 ///   centers, align them" into one storm-spanning composite, not just a
-///   same-cell overlay.
+///   same-cell overlay. Where two sweeps' grids land on the same output
+///   cell, they're genuinely combined per
+///   [`noaa_recon_core::sweep::combine_mode_for_field`] — maxed for
+///   reflectivity (the standard composite-reflectivity convention),
+///   averaged for everything else (wind/vorticity fields, where an extreme
+///   from one analysis time shouldn't dominate the composite) — never a
+///   last-write-wins overlay.
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
     let conn = tdr::get_connection(&state.paths.tdr_db)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
@@ -444,7 +451,8 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     noaa_recon_core::sweep::GeoPlane { x: &s.x, y: &s.y, data: &s.data, offset_x_km, offset_y_km }
                 })
                 .collect();
-            let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes);
+            let combine_mode = noaa_recon_core::sweep::combine_mode_for_field(&q.field);
+            let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes, combine_mode);
             (
                 mission,
                 level,
@@ -455,6 +463,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     "z_km": requested_z,
                     "analysis_times_used": times_used,
                     "reference_origin": {"lat": lat0, "lon": lon0},
+                    "combine_mode": if combine_mode == noaa_recon_core::sweep::CombineMode::Max { "max" } else { "mean" },
                 }),
                 Some((lat0, lon0)),
             )
@@ -554,6 +563,7 @@ async fn get_composite_time_volume(
 
     let times_used: Vec<String> = usable.iter().map(|(t, _)| t.clone()).collect();
     let n_levels = reference_levels.len();
+    let combine_mode = noaa_recon_core::sweep::combine_mode_for_field(&q.field);
     let mut mosaic_x = Vec::new();
     let mut mosaic_y = Vec::new();
     let mut data_out: Vec<Vec<Vec<Option<f64>>>> = Vec::with_capacity(n_levels);
@@ -566,7 +576,7 @@ async fn get_composite_time_volume(
                 noaa_recon_core::sweep::GeoPlane { x: &v.x, y: &v.y, data: &v.data[li], offset_x_km, offset_y_km }
             })
             .collect();
-        let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes);
+        let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes, combine_mode);
         if li == 0 {
             mosaic_x = mosaic.x;
             mosaic_y = mosaic.y;
@@ -585,6 +595,7 @@ async fn get_composite_time_volume(
         "detail": {
             "analysis_times_used": times_used,
             "reference_origin": {"lat": lat0, "lon": lon0},
+            "combine_mode": if combine_mode == noaa_recon_core::sweep::CombineMode::Max { "max" } else { "mean" },
         },
         "x": mosaic_x,
         "y": mosaic_y,
@@ -596,5 +607,92 @@ async fn get_composite_time_volume(
         "zmin": cs.zmin,
         "zmax": cs.zmax,
         "units": cs.units,
+    })))
+}
+
+#[derive(Deserialize)]
+struct PlaneSliceQuery {
+    mission_id: String,
+    level: Option<String>,
+    /// `xy` or `xy_rel` only — a plane slice needs the whole level axis of
+    /// a volume to cut through, same restriction as `GET /v1/tdr/volume`.
+    product: String,
+    analysis_time: String,
+    field: String,
+    /// The cut line's two endpoints, in the same km-from-origin coordinate
+    /// system as the `x`/`y` a sweep/volume response returns — i.e. exactly
+    /// the coordinates a client already has in hand from a prior sweep or
+    /// volume plot, so it can let a user click two points on that plot and
+    /// pass them straight through.
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// How many evenly-spaced points to sample along the line. Defaults to
+    /// 100; clamped to at least 2.
+    n: Option<usize>,
+}
+
+/// `GET /v1/tdr/plane_slice` — the "plane slice" tool: an arbitrary
+/// vertical cross-section through one analysis time's `xy` volume, cut
+/// between two points a user picks on the horizontal CAPPI image, rather
+/// than only the fixed along/across-track cuts baked into
+/// `vert_inbound`/`vert_outbound`. Reads the whole volume (every CAPPI
+/// level, same as `GET /v1/tdr/volume`) and bilinearly interpolates each
+/// level along the requested line
+/// ([`noaa_recon_core::sweep::plane_slice`]), so the cross-section is
+/// smooth regardless of the line's angle through the grid — not just
+/// snapped to the nearest existing column.
+async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSliceQuery>) -> ApiResult<Json<Value>> {
+    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let (mission, file, level) =
+        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time)?;
+
+    let cache_dir = state.paths.cache_root.join("tdr_nc");
+    let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, q.analysis_time);
+    let nc_path = tdr_nc::fetch_and_cache(&cache_dir, &file.source_url, &cache_key)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
+
+    let field = q.field.clone();
+    let volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+        .await
+        .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let n = q.n.unwrap_or(100).max(2);
+    let cut = noaa_recon_core::sweep::plane_slice(
+        &volume.data,
+        &volume.x,
+        &volume.y,
+        &volume.levels,
+        q.x0,
+        q.y0,
+        q.x1,
+        q.y1,
+        n,
+    );
+
+    let cs = colorscale_for_field(&q.field);
+    let data: Vec<Vec<Option<f64>>> =
+        cut.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect();
+
+    Ok(Json(json!({
+        "mission_id": mission.mission_id,
+        "storm_name": volume.storm_name_attr.unwrap_or(mission.storm_name),
+        "level": level,
+        "product": q.product,
+        "analysis_time": q.analysis_time,
+        "field": q.field,
+        "endpoints": {"x0": q.x0, "y0": q.y0, "x1": q.x1, "y1": q.y1},
+        "x": cut.along_km,
+        "y": cut.levels,
+        "data": data,
+        "colorscale": cs.stops,
+        "zmin": cs.zmin,
+        "zmax": cs.zmax,
+        "units": cs.units,
+        "origin_lat": volume.origin_lat,
+        "origin_lon": volume.origin_lon,
     })))
 }

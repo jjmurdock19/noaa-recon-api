@@ -124,6 +124,97 @@ pub fn vertical_profile_slice(flat: &[f32], nradius: usize, nheight: usize, miss
     out
 }
 
+/// Bilinearly samples one CAPPI plane (`data[yi][xi]`, `xs`/`ys` ascending
+/// coordinate arrays) at an arbitrary point `(x, y)` — the building block
+/// for [`plane_slice`]'s cross-sections, which need values *between* grid
+/// columns, not just at them. `None` outside the grid's bounding box.
+/// Missing corners don't poison the sample: this renormalizes the bilinear
+/// weights over whichever of the 4 surrounding corners are actually
+/// present, so e.g. a point next to one masked-out corner still gets a
+/// sensible interpolated value instead of silently going missing.
+fn bilinear_sample(data: &[Vec<Option<f32>>], xs: &[f32], ys: &[f32], x: f32, y: f32) -> Option<f32> {
+    if xs.len() < 2 || ys.len() < 2 {
+        return None;
+    }
+    if x < xs[0] || x > xs[xs.len() - 1] || y < ys[0] || y > ys[ys.len() - 1] {
+        return None;
+    }
+    // Index of the grid cell containing (x, y): last coordinate <= x/y.
+    let xi = xs.partition_point(|&v| v <= x).saturating_sub(1).min(xs.len() - 2);
+    let yi = ys.partition_point(|&v| v <= y).saturating_sub(1).min(ys.len() - 2);
+    let (x0, x1) = (xs[xi], xs[xi + 1]);
+    let (y0, y1) = (ys[yi], ys[yi + 1]);
+    let tx = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+    let ty = if y1 > y0 { (y - y0) / (y1 - y0) } else { 0.0 };
+
+    let corners = [
+        (data[yi][xi], (1.0 - tx) * (1.0 - ty)),
+        (data[yi][xi + 1], tx * (1.0 - ty)),
+        (data[yi + 1][xi], (1.0 - tx) * ty),
+        (data[yi + 1][xi + 1], tx * ty),
+    ];
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    for (v, w) in corners {
+        if let Some(v) = v {
+            sum += v * w;
+            weight += w;
+        }
+    }
+    (weight > 0.0).then(|| sum / weight)
+}
+
+/// One vertical cross-section cut through an `xy`-volume along an arbitrary
+/// line — the "plane slice" tool: pick any two points on the CAPPI image,
+/// get the along-track height profile between them, not just the fixed
+/// along/across-track cuts baked into `vert_inbound`/`vert_outbound`.
+pub struct PlaneSlice {
+    /// Distance (km) along the cut line, from `(x0,y0)` to `(x1,y1)`.
+    pub along_km: Vec<f32>,
+    pub levels: Vec<f32>,
+    /// `data[level_idx][along_idx]`, same row-is-height convention as
+    /// [`vertical_profile_slice`].
+    pub data: Vec<Vec<Option<f32>>>,
+}
+
+/// Cuts a [`PlaneSlice`] out of an `xy`-volume (`volume[level_idx][yi][xi]`,
+/// as produced by [`xy_volume`]) between `(x0,y0)` and `(x1,y1)` (km,
+/// same coordinate system as `xs`/`ys`), sampled at `n_samples` evenly-
+/// spaced points along the line (clamped to at least 2). Each sample point
+/// is bilinearly interpolated ([`bilinear_sample`]) rather than snapped to
+/// the nearest grid column, so the cross-section is smooth regardless of
+/// the line's angle through the grid.
+pub fn plane_slice(
+    volume: &[Vec<Vec<Option<f32>>>],
+    xs: &[f32],
+    ys: &[f32],
+    levels: &[f32],
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    n_samples: usize,
+) -> PlaneSlice {
+    let n = n_samples.max(2);
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let total_km = (dx * dx + dy * dy).sqrt();
+    let along_km: Vec<f32> = (0..n).map(|i| total_km * (i as f32 / (n - 1) as f32)).collect();
+
+    let data: Vec<Vec<Option<f32>>> = volume
+        .iter()
+        .map(|plane| {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / (n - 1) as f32;
+                    bilinear_sample(plane, xs, ys, x0 + dx * t, y0 + dy * t)
+                })
+                .collect()
+        })
+        .collect();
+
+    PlaneSlice { along_km, levels: levels.to_vec(), data }
+}
+
 /// Approximate local flat-earth offset (km) of `(lat, lon)` relative to a
 /// reference `(lat0, lon0)` — accurate enough for aligning TDR sweeps
 /// separated by tens to a couple hundred km (a single mission's track),
@@ -156,17 +247,50 @@ pub struct Mosaic {
     pub data: Vec<Vec<Option<f32>>>,
 }
 
+/// How [`geo_mosaic`] resolves two sweeps landing on the same output cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CombineMode {
+    /// Keep the largest value seen at that cell — the classic "composite
+    /// reflectivity" convention (same as [`max_projection`]/
+    /// [`max_composite`]): what you'd see if the strongest return from any
+    /// analysis time paints through. Right for reflectivity, wrong for
+    /// anything where "biggest" isn't "most representative" — see
+    /// [`combine_mode_for_field`].
+    Max,
+    /// Average every value seen at that cell. For instantaneous physical
+    /// quantities (wind components, vorticity, speed) sampled at different
+    /// times, the mean at an overlapping cell is a far more honest summary
+    /// than whichever single analysis time happened to have the largest
+    /// reading there — `Max` would systematically bias a wind composite
+    /// toward transient gusts instead of the storm's steadier structure.
+    Mean,
+}
+
+/// The physically-sensible default [`CombineMode`] for a given `xy` field —
+/// `Max` for reflectivity (the standard "composite reflectivity" product
+/// every radar display uses), `Mean` for everything else (wind components,
+/// vorticity, speed — all instantaneous quantities where averaging across
+/// overlapping analysis times is more representative than taking an
+/// extreme).
+pub fn combine_mode_for_field(field: &str) -> CombineMode {
+    match field {
+        "reflectivity" => CombineMode::Max,
+        _ => CombineMode::Mean,
+    }
+}
+
 /// Forward-scatters several storm-centered sweeps, each shifted by its own
 /// (lat,lon)-derived offset from a shared reference point, onto one shared
 /// output grid — the "align by storm center, build one composite" mosaic
 /// backing `GET /v1/tdr/composite?mode=time`. Where two sweeps land on the
-/// same output cell, keeps the max value (same "composite reflectivity"
-/// convention as [`max_projection`]/[`max_composite`]).
+/// same output cell, `mode` decides how their values combine (see
+/// [`CombineMode`]) — this is genuine per-cell combination, not last-sweep-
+/// wins layering: every plane that touches a cell contributes to it.
 ///
 /// Assumes every plane shares the same grid spacing (true for TDR's fixed
 /// analysis resolution) — spacing is read from the first plane. Returns an
 /// empty mosaic if `planes` is empty.
-pub fn geo_mosaic(planes: &[GeoPlane]) -> Mosaic {
+pub fn geo_mosaic(planes: &[GeoPlane], mode: CombineMode) -> Mosaic {
     let Some(first) = planes.first() else {
         return Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
     };
@@ -193,7 +317,12 @@ pub fn geo_mosaic(planes: &[GeoPlane]) -> Mosaic {
     let ny_out = (((gy_max - gy_min) / dy_spacing).round() as usize) + 1;
     let x_out: Vec<f32> = (0..nx_out).map(|i| gx_min + i as f32 * dx_spacing).collect();
     let y_out: Vec<f32> = (0..ny_out).map(|i| gy_min + i as f32 * dy_spacing).collect();
-    let mut data_out = vec![vec![None; nx_out]; ny_out];
+
+    // Mean needs a running sum+count per cell alongside the max-so-far;
+    // cheap to track both and pick the one `mode` asked for at the end.
+    let mut sum_out = vec![vec![0.0f32; nx_out]; ny_out];
+    let mut count_out = vec![vec![0u32; nx_out]; ny_out];
+    let mut max_out: Vec<Vec<Option<f32>>> = vec![vec![None; nx_out]; ny_out];
 
     for p in planes {
         for (yi, y) in p.y.iter().enumerate() {
@@ -210,10 +339,23 @@ pub fn geo_mosaic(planes: &[GeoPlane]) -> Mosaic {
                 if out_xi >= nx_out || out_yi >= ny_out {
                     continue;
                 }
-                data_out[out_yi][out_xi] = Some(data_out[out_yi][out_xi].map_or(v, |b: f32| b.max(v)));
+                sum_out[out_yi][out_xi] += v;
+                count_out[out_yi][out_xi] += 1;
+                max_out[out_yi][out_xi] = Some(max_out[out_yi][out_xi].map_or(v, |b: f32| b.max(v)));
             }
         }
     }
+
+    let data_out = match mode {
+        CombineMode::Max => max_out,
+        CombineMode::Mean => (0..ny_out)
+            .map(|yi| {
+                (0..nx_out)
+                    .map(|xi| (count_out[yi][xi] > 0).then(|| sum_out[yi][xi] / count_out[yi][xi] as f32))
+                    .collect()
+            })
+            .collect(),
+    };
 
     Mosaic { x: x_out, y: y_out, data: data_out }
 }
@@ -364,7 +506,7 @@ mod tests {
             GeoPlane { x: &x, y: &y, data: &a, offset_x_km: 0.0, offset_y_km: 0.0 },
             GeoPlane { x: &x, y: &y, data: &b, offset_x_km: 1.0, offset_y_km: 0.0 },
         ];
-        let mosaic = geo_mosaic(&planes);
+        let mosaic = geo_mosaic(&planes, CombineMode::Max);
         // Combined x extent: plane a covers [0,1], plane b (shifted) covers [1,2] -> [0,1,2].
         assert_eq!(mosaic.x, vec![0.0, 1.0, 2.0]);
         assert_eq!(mosaic.y, vec![0.0]);
@@ -374,9 +516,85 @@ mod tests {
     }
 
     #[test]
+    fn geo_mosaic_mean_averages_overlapping_cells_instead_of_maxing() {
+        // Same layout as the Max test above, but col1 (x=1) is where a's
+        // missing value and b's 5.0 would collide with a *second* real
+        // reading — use two planes that both have real data at the same
+        // output cell so Mean has something to average.
+        let x = [0.0f32, 1.0];
+        let y = [0.0f32];
+        let a = vec![vec![Some(3.0), Some(7.0)]];
+        let b = vec![vec![Some(5.0), Some(9.0)]];
+        let planes = vec![
+            GeoPlane { x: &x, y: &y, data: &a, offset_x_km: 0.0, offset_y_km: 0.0 },
+            GeoPlane { x: &x, y: &y, data: &b, offset_x_km: 1.0, offset_y_km: 0.0 },
+        ];
+        let mosaic = geo_mosaic(&planes, CombineMode::Mean);
+        // col1 (x=1) is the overlap: a's x=1 (7.0) and b's x=0 (5.0) -> mean 6.0.
+        assert_eq!(mosaic.data[0], vec![Some(3.0), Some(6.0), Some(9.0)]);
+    }
+
+    #[test]
     fn geo_mosaic_empty_input_returns_empty() {
-        let mosaic = geo_mosaic(&[]);
+        let mosaic = geo_mosaic(&[], CombineMode::Max);
         assert!(mosaic.x.is_empty() && mosaic.y.is_empty() && mosaic.data.is_empty());
+    }
+
+    #[test]
+    fn combine_mode_for_field_is_max_for_reflectivity_mean_otherwise() {
+        assert_eq!(combine_mode_for_field("reflectivity"), CombineMode::Max);
+        assert_eq!(combine_mode_for_field("wind_speed"), CombineMode::Mean);
+        assert_eq!(combine_mode_for_field("radial_wind"), CombineMode::Mean);
+        assert_eq!(combine_mode_for_field("vort"), CombineMode::Mean);
+    }
+
+    #[test]
+    fn bilinear_sample_interpolates_at_midpoint_and_matches_grid_at_nodes() {
+        let xs = [0.0f32, 2.0];
+        let ys = [0.0f32, 2.0];
+        // data[yi][xi]: (0,0)=0, (0,1)=10, (1,0)=20, (1,1)=30.
+        let data = vec![vec![Some(0.0), Some(10.0)], vec![Some(20.0), Some(30.0)]];
+        assert_eq!(bilinear_sample(&data, &xs, &ys, 0.0, 0.0), Some(0.0));
+        assert_eq!(bilinear_sample(&data, &xs, &ys, 2.0, 2.0), Some(30.0));
+        // Center of the cell is the average of all 4 corners.
+        assert_eq!(bilinear_sample(&data, &xs, &ys, 1.0, 1.0), Some(15.0));
+        // Outside the grid entirely.
+        assert_eq!(bilinear_sample(&data, &xs, &ys, 5.0, 5.0), None);
+    }
+
+    #[test]
+    fn bilinear_sample_renormalizes_around_a_missing_corner() {
+        let xs = [0.0f32, 2.0];
+        let ys = [0.0f32, 2.0];
+        // Corner (1,1) missing; the rest are 10.0, so any point should
+        // still resolve to 10.0 once weights are renormalized.
+        let data = vec![vec![Some(10.0), Some(10.0)], vec![Some(10.0), None]];
+        assert_eq!(bilinear_sample(&data, &xs, &ys, 1.5, 1.5), Some(10.0));
+        // All 4 corners missing -> None.
+        let all_missing = vec![vec![None, None], vec![None, None]];
+        assert_eq!(bilinear_sample(&all_missing, &xs, &ys, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn plane_slice_cuts_a_diagonal_cross_section_through_a_volume() {
+        let xs = [0.0f32, 2.0];
+        let ys = [0.0f32, 2.0];
+        let levels = [0.0f32, 1.0];
+        // Level 0: all zeros. Level 1: a simple ramp 0/10/20/30.
+        let level0 = vec![vec![Some(0.0), Some(0.0)], vec![Some(0.0), Some(0.0)]];
+        let level1 = vec![vec![Some(0.0), Some(10.0)], vec![Some(20.0), Some(30.0)]];
+        let volume = vec![level0, level1];
+
+        let cut = plane_slice(&volume, &xs, &ys, &levels, 0.0, 0.0, 2.0, 2.0, 3);
+        assert_eq!(cut.levels, vec![0.0, 1.0]);
+        // 3 samples along a 2*sqrt(2)-km diagonal: 0, half, full length.
+        assert!((cut.along_km[0]).abs() < 1e-4);
+        assert!((cut.along_km[2] - (8.0f32).sqrt()).abs() < 1e-3);
+        // Level 0 is flat zero everywhere along the cut.
+        assert_eq!(cut.data[0], vec![Some(0.0), Some(0.0), Some(0.0)]);
+        // Level 1 walks the diagonal from corner (0.0) through the center
+        // (mean of all 4 corners = 15.0) to the far corner (30.0).
+        assert_eq!(cut.data[1], vec![Some(0.0), Some(15.0), Some(30.0)]);
     }
 
     #[test]

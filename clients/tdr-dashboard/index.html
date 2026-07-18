@@ -213,12 +213,28 @@
       </label>
       <div id="flight-track-status" style="font-size:11px; color:var(--text-faint); margin-top:2px;"></div>
     </fieldset>
+
+    <fieldset id="fs-planeslice" style="display:none">
+      <legend>Plane slice</legend>
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+        Click two points on the 2D plot to cut an arbitrary vertical cross-section through this
+        analysis time's full volume — not just the fixed along/across-track
+        vert_inbound/vert_outbound cuts.
+      </div>
+      <button id="btn-planeslice-toggle" class="neutral" type="button" style="width:100%;">Draw plane slice</button>
+      <div id="planeslice-status" style="font-size:11px; color:var(--text-muted); margin-top:6px;"></div>
+      <button id="btn-planeslice-clear" class="neutral" type="button" style="width:100%; margin-top:6px; display:none;">Clear</button>
+    </fieldset>
   </div>
 
   <div id="plot-area">
     <div id="status"></div>
     <div id="info-bar" style="display:none"></div>
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
+    <div id="planeslice-panel" style="display:none; flex-direction:column; gap:8px;">
+      <div id="planeslice-info-bar" style="display:flex; flex-wrap:wrap; gap:6px 18px; font-size:12px; color:var(--text-muted); padding:8px 12px; background:var(--bg-panel); border:1px solid var(--border); border-radius:4px;"></div>
+      <div id="plot-planeslice" style="height:320px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel);"></div>
+    </div>
     <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
       <canvas id="plot3d-canvas" style="width:100%; height:100%; display:block;"></canvas>
       <div id="plot3d-legend" style="position:absolute; top:10px; right:10px; display:flex; flex-direction:column; align-items:center; gap:4px; background:rgba(20,20,20,0.7); border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:10px 8px; font-size:10px; color:#fff;"></div>
@@ -615,6 +631,16 @@ function applyViewVisibility() {
   $('plot').style.display = view === 'sweep' ? '' : 'none';
   $('plot3d').style.display = view === 'volume' ? 'flex' : 'none';
   if (view === 'volume') requestAnimationFrame(ensure3dSceneSized);
+
+  // Proactively hide the plane slice tool the moment the on-screen plot
+  // stops being a single analysis time's plain xy/xy_rel sweep — don't
+  // wait for the next plot load, since a stale context from the previous
+  // plot would otherwise let the tool fire a request against a view
+  // that's no longer showing what the user thinks they're clicking on.
+  if (view !== 'sweep' || isVert || (timeComposite && !altitudeComposite)) {
+    planeSliceContext = null;
+    updatePlaneSliceAvailability();
+  }
 }
 
 // ── Colorscale interpolation (shared by the 3D volume viewer) ──────────────
@@ -1576,6 +1602,10 @@ async function plotVolume() {
       <span>Field: <b>${vol.field}</b> (${vol.units})</span>
       <span>Levels: <b>${vol.levels_km.length}</b> (${Math.min(...vol.levels_km)}–${Math.max(...vol.levels_km)} km)</span>
     `;
+    // The plane slice tool clicks on the 2D #plot heatmap, which the 3D
+    // volume view doesn't show — nothing to click on, so it's unavailable.
+    planeSliceContext = null;
+    updatePlaneSliceAvailability();
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1631,6 +1661,8 @@ async function plotComposite() {
         <span>Times mosaicked: <b>${comp.detail.analysis_times_used.length}</b></span>
         <span>Levels: <b>${comp.levels_km.length}</b> (${Math.min(...comp.levels_km)}–${Math.max(...comp.levels_km)} km)</span>
       `;
+      // 3D view, nothing on-screen for the plane slice tool to click.
+      planeSliceContext = null;
     } else {
       render(comp, false);
       const detail = mode === 'altitude'
@@ -1643,7 +1675,15 @@ async function plotComposite() {
         <span>Field: <b>${comp.field}</b> (${comp.units})</span>
         ${detail}
       `;
+      // 'altitude' still cuts through one analysis time's whole volume, so
+      // a plane slice is meaningful there too. 'time' mosaics many analysis
+      // times into one image with no single volume behind it — not
+      // meaningful (the endpoint needs one analysis_time to read).
+      planeSliceContext = mode === 'altitude'
+        ? { mission_id: comp.mission_id, level: comp.level, product: comp.product, analysis_time: comp.detail.analysis_time, field: comp.field }
+        : null;
     }
+    updatePlaneSliceAvailability();
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1676,6 +1716,11 @@ async function plotSweep() {
       isoTime: isVert ? null : singleIsoTime(sweep.mission_id, sweep.analysis_time),
     });
     render(sweep, isVert);
+    // A plane slice needs a single analysis time's whole volume to cut
+    // through, so it's only meaningful for a plain (non-composite) xy/xy_rel
+    // sweep, never a vert_inbound/vert_outbound profile.
+    planeSliceContext = isVert ? null : { mission_id: sweep.mission_id, level: sweep.level, product: sweep.product, analysis_time: sweep.analysis_time, field: sweep.field };
+    updatePlaneSliceAvailability();
     setStatus(null, '');
   } catch (e) {
     setStatus('error', e.message);
@@ -1686,6 +1731,18 @@ async function plotSweep() {
 
 let lastSweep = null;
 let lastIsVert = false;
+
+// ── Plane slice tool ─────────────────────────────────────────────────────
+// Lets a user click two points on the 2D CAPPI heatmap to cut an arbitrary
+// vertical cross-section through that analysis time's full volume (GET
+// /v1/tdr/plane_slice), instead of only the fixed along/across-track
+// vert_inbound/vert_outbound cuts. Only available when the currently
+// rendered #plot is a single analysis time's plain xy/xy_rel sweep (a
+// composite mosaics multiple times/levels together, so "a plane through
+// this volume" wouldn't mean anything for it — see updatePlaneSliceAvailability).
+let planeSliceContext = null; // {mission_id, level, product, analysis_time, field} or null
+let planeSliceToolActive = false;
+let planeSlicePoints = []; // [{x,y}, ...] up to 2, in the plot's km-from-center frame
 
 // Converts the loaded satellite basemap's lat/lon bounds into a Plotly
 // `layout.images` entry positioned in the same km-from-storm-center frame
@@ -1798,7 +1855,143 @@ function render(sweep, isVert) {
     });
   }
 
-  Plotly.newPlot('plot', traces, layout, { responsive: true, displaylogo: false });
+  Plotly.newPlot('plot', traces, layout, { responsive: true, displaylogo: false }).then(() => {
+    // Plotly.newPlot tears down and rebuilds the plot's event target each
+    // call, so click handlers from a previous render() don't survive —
+    // re-attach every time rather than once at page load.
+    $('plot').removeAllListeners?.('plotly_click');
+    $('plot').on('plotly_click', onMainPlotClick);
+  });
+}
+
+// ── Plane slice tool ─────────────────────────────────────────────────────
+
+// Shows/hides the "Plane slice" panel based on whether the plot currently
+// on screen is something a plane slice makes sense against (a single
+// analysis time's plain xy/xy_rel sweep — see the state comment above).
+// Called both reactively (view/product/time-mosaic controls change) and
+// after a plot successfully loads.
+function updatePlaneSliceAvailability() {
+  const available = !!planeSliceContext;
+  $('fs-planeslice').style.display = available ? '' : 'none';
+  if (!available) {
+    planeSliceToolActive = false;
+    planeSlicePoints = [];
+    $('planeslice-panel').style.display = 'none';
+  }
+  updatePlaneSliceStatus();
+}
+
+function updatePlaneSliceStatus(state) {
+  $('btn-planeslice-toggle').textContent = planeSliceToolActive ? 'Cancel plane slice' : 'Draw plane slice';
+  const status = $('planeslice-status');
+  if (!planeSliceToolActive) {
+    status.textContent = '';
+  } else if (state === 'loading') {
+    status.textContent = 'Fetching cross-section…';
+  } else if (state === 'error') {
+    status.textContent = 'Failed to fetch cross-section — see the error above. Click two new points to retry.';
+  } else if (planeSlicePoints.length === 0) {
+    status.textContent = 'Click a start point on the plot.';
+  } else if (planeSlicePoints.length === 1) {
+    status.textContent = 'Click an end point on the plot.';
+  } else {
+    status.textContent = 'Click two new points to redraw.';
+  }
+  $('btn-planeslice-clear').style.display = $('planeslice-panel').style.display !== 'none' ? '' : 'none';
+}
+
+function redrawPlaneSliceOverlay() {
+  const shapes = [];
+  const annotations = [];
+  planeSlicePoints.forEach((p, i) => {
+    shapes.push({
+      type: 'circle', xref: 'x', yref: 'y',
+      x0: p.x - 4, x1: p.x + 4, y0: p.y - 4, y1: p.y + 4,
+      line: { color: '#ffdd55', width: 2 }, fillcolor: 'rgba(255,221,85,0.35)',
+    });
+    annotations.push({
+      x: p.x, y: p.y, text: i === 0 ? 'A' : 'B', showarrow: false, yshift: 16,
+      font: { color: '#ffdd55', size: 12, weight: 'bold' },
+    });
+  });
+  if (planeSlicePoints.length === 2) {
+    const [a, b] = planeSlicePoints;
+    shapes.push({
+      type: 'line', xref: 'x', yref: 'y', x0: a.x, y0: a.y, x1: b.x, y1: b.y,
+      line: { color: '#ffdd55', width: 2 },
+    });
+  }
+  Plotly.relayout('plot', { shapes, annotations });
+}
+
+function onMainPlotClick(ev) {
+  if (!planeSliceToolActive || !planeSliceContext) return;
+  const pt = ev.points && ev.points[0];
+  if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return;
+  if (planeSlicePoints.length >= 2) planeSlicePoints = [];
+  planeSlicePoints.push({ x: pt.x, y: pt.y });
+  redrawPlaneSliceOverlay();
+  if (planeSlicePoints.length === 2) {
+    fetchPlaneSlice();
+  } else {
+    updatePlaneSliceStatus();
+  }
+}
+
+async function fetchPlaneSlice() {
+  if (!planeSliceContext || planeSlicePoints.length !== 2) return;
+  const [a, b] = planeSlicePoints;
+  const params = new URLSearchParams({
+    mission_id: planeSliceContext.mission_id,
+    level: planeSliceContext.level,
+    product: planeSliceContext.product,
+    analysis_time: planeSliceContext.analysis_time,
+    field: planeSliceContext.field,
+    x0: a.x, y0: a.y, x1: b.x, y1: b.y, n: 150,
+  });
+  updatePlaneSliceStatus('loading');
+  try {
+    const cut = await getJSON(`/v1/tdr/plane_slice?${params.toString()}`);
+    renderPlaneSlice(cut);
+    updatePlaneSliceStatus('done');
+  } catch (e) {
+    setStatus('error', e.message);
+    updatePlaneSliceStatus('error');
+  }
+}
+
+function renderPlaneSlice(cut) {
+  $('planeslice-panel').style.display = 'flex';
+  const distKm = cut.x.length ? cut.x[cut.x.length - 1] : 0;
+  $('planeslice-info-bar').innerHTML = `
+    <span>Field: <b>${cut.field}</b> (${cut.units})</span>
+    <span>Cut length: <b>${distKm.toFixed(1)} km</b></span>
+    <span>A → B: <b>(${cut.endpoints.x0.toFixed(0)}, ${cut.endpoints.y0.toFixed(0)})</b> to
+      <b>(${cut.endpoints.x1.toFixed(0)}, ${cut.endpoints.y1.toFixed(0)})</b> km</span>
+  `;
+
+  const isDark = getEffectiveTheme() === 'dark';
+  const fg = isDark ? '#e8e8e8' : '#262626';
+  const grid = isDark ? '#3a3a3a' : '#d9d9d9';
+  const paper = isDark ? '#1c1c1c' : '#ffffff';
+
+  const trace = {
+    type: 'heatmap',
+    x: cut.x, y: cut.y, z: cut.data,
+    zmin: cut.zmin, zmax: cut.zmax, colorscale: cut.colorscale,
+    colorbar: { title: { text: cut.units, side: 'right' } },
+    hovertemplate: 'along cut %{x:.1f} km<br>height %{y:.2f} km<br>%{z:.1f} ' + cut.units + '<extra></extra>',
+  };
+  const layout = {
+    paper_bgcolor: paper,
+    plot_bgcolor: paper,
+    font: { color: fg, family: 'inherit', size: 12 },
+    margin: { l: 60, r: 20, t: 10, b: 50 },
+    xaxis: { title: 'Distance along cut (km), A → B', gridcolor: grid, zerolinecolor: grid },
+    yaxis: { title: 'Height (km)', gridcolor: grid, zerolinecolor: grid },
+  };
+  Plotly.newPlot('plot-planeslice', [trace], layout, { responsive: true, displaylogo: false });
 }
 
 // ── Theme toggle (auto -> dark -> light -> auto) ─────────────────────────
@@ -1847,6 +2040,18 @@ $('sel-level').addEventListener('change', populateProducts);
 $('sel-product').addEventListener('change', populateTimes);
 $('sel-time').addEventListener('change', applyViewVisibility);
 $('chk-altitude-composite').addEventListener('change', applyViewVisibility);
+$('btn-planeslice-toggle').addEventListener('click', () => {
+  planeSliceToolActive = !planeSliceToolActive;
+  planeSlicePoints = [];
+  if (!planeSliceToolActive) Plotly.relayout('plot', { shapes: [], annotations: [] });
+  updatePlaneSliceStatus();
+});
+$('btn-planeslice-clear').addEventListener('click', () => {
+  planeSlicePoints = [];
+  $('planeslice-panel').style.display = 'none';
+  Plotly.relayout('plot', { shapes: [], annotations: [] });
+  updatePlaneSliceStatus();
+});
 $('sel-3d-style').addEventListener('change', () => { if (lastVolume) buildVolumeScene(lastVolume); });
 
 $('product-help-btn').addEventListener('click', openHelpModal);
