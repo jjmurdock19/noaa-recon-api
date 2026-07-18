@@ -795,10 +795,15 @@ install_timers() {
     log_step "Installing nightly archive-update and cache-cleanup timers"
     local rust_bin="${INSTALL_DIR}/target/release/noaa-recon-api"
     local py="${INSTALL_DIR}/.venv/bin/python3"
+    # TDR ingest is a rust-only subcommand (no scripts/ingest_tdr.py exists —
+    # TDR was added after the python variant was frozen), so its timer/service
+    # only get installed for the rust variant.
+    local svcs=(storm-archive-update recon-met-update goes-nc-cache-cleanup)
+    [[ "$VARIANT" == "rust" ]] && svcs+=(tdr-update)
     local svc
-    for svc in storm-archive-update recon-met-update goes-nc-cache-cleanup; do
+    for svc in "${svcs[@]}"; do
         # Storms + cache cleanup are native subcommands in the rust variant;
-        # recon MET is Python in both variants.
+        # recon MET is Python in both variants; TDR is rust-only.
         local desc after="After=network.target" execstart
         case "$svc" in
             storm-archive-update)
@@ -810,6 +815,9 @@ install_timers() {
             goes-nc-cache-cleanup)
                 desc="cleanup of GOES netCDF cache files older than 1 day"; after=""
                 if [[ "$VARIANT" == "rust" ]]; then execstart="${rust_bin} clean-nc-cache"; else execstart="${py} scripts/clear_nc_cache.py"; fi ;;
+            tdr-update)
+                desc="TDR (tail Doppler radar) archive update"; after=""
+                execstart="${rust_bin} ingest-tdr" ;;
         esac
         $SUDO tee "/etc/systemd/system/${svc}.service" >/dev/null <<TIMER_SVC_EOF
 [Unit]
@@ -827,10 +835,16 @@ Group=${RUN_USER}
 WantedBy=multi-user.target
 TIMER_SVC_EOF
     done
-    $SUDO cp "${INSTALL_DIR}/deploy/storm-archive-update.timer" "${INSTALL_DIR}/deploy/recon-met-update.timer" "${INSTALL_DIR}/deploy/goes-nc-cache-cleanup.timer" /etc/systemd/system/
+    local timer_files=("${INSTALL_DIR}/deploy/storm-archive-update.timer" "${INSTALL_DIR}/deploy/recon-met-update.timer" "${INSTALL_DIR}/deploy/goes-nc-cache-cleanup.timer")
+    local timer_names="storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer"
+    if [[ "$VARIANT" == "rust" ]]; then
+        timer_files+=("${INSTALL_DIR}/deploy/tdr-update.timer")
+        timer_names="${timer_names} tdr-update.timer"
+    fi
+    $SUDO cp "${timer_files[@]}" /etc/systemd/system/
     $SUDO systemctl daemon-reload
-    $SUDO systemctl enable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer >&2
-    log_ok "nightly timers enabled (03:15, 03:45, and 04:15 server time)"
+    $SUDO systemctl enable --now $timer_names >&2
+    log_ok "nightly timers enabled (03:15, 03:45, 04:00 [rust only], and 04:15 server time)"
 }
 
 install_cli_wrapper() {
@@ -969,11 +983,12 @@ cmd_uninstall() {
     ask_yesno "Continue?" n || { echo "Cancelled." >&2; exit 0; }
 
     $SUDO systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
-    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer 2>/dev/null || true
+    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer tdr-update.timer 2>/dev/null || true
     $SUDO rm -f "/etc/systemd/system/${SERVICE_NAME}.service" \
                 /etc/systemd/system/storm-archive-update.service /etc/systemd/system/storm-archive-update.timer \
                 /etc/systemd/system/recon-met-update.service /etc/systemd/system/recon-met-update.timer \
-                /etc/systemd/system/goes-nc-cache-cleanup.service /etc/systemd/system/goes-nc-cache-cleanup.timer
+                /etc/systemd/system/goes-nc-cache-cleanup.service /etc/systemd/system/goes-nc-cache-cleanup.timer \
+                /etc/systemd/system/tdr-update.service /etc/systemd/system/tdr-update.timer
     $SUDO systemctl daemon-reload
 
     $SUDO rm -f "/etc/nginx/conf.d/${SERVICE_NAME}.conf" "/etc/nginx/snippets/${SERVICE_NAME}.conf"
