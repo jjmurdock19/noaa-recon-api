@@ -3,7 +3,7 @@
 **Open-source HTTP API for archival GOES satellite imagery, NOAA Tail
 Doppler Radar data, storm tracks, and aircraft reconaissance data.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: CC0-1.0](https://img.shields.io/badge/License-CC0_1.0-lightgrey.svg)](http://creativecommons.org/publicdomain/zero/1.0/)
 [![Live API](https://img.shields.io/badge/API-live-brightgreen)](https://joshmurdock.net/api/docs)
 
 **[API.md](API.md)** — full endpoint reference
