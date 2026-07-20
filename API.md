@@ -63,6 +63,9 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | `GET /v1/tdr/{year}/{storm_name}` | 🟢 Live |
 | `GET /v1/tdr/mission/{mission_id}` | 🟢 Live |
 | `GET /v1/tdr/sweep` | 🟢 Live (post-2021 Cartesian-grid files only — see below) |
+| `GET /v1/tdr/volume` | 🟢 Live |
+| `GET /v1/tdr/composite` (`mode=altitude`, `mode=time`, `mode=time_volume`) | 🟢 Live |
+| `GET /v1/tdr/plane_slice` | 🟢 Live |
 | `GET /v1/raw/netcdf` | 🟡 Planned |
 | `GET /demo/netcdf-three/` (static 3D client) | 🟢 Live (sample data only until raw passthrough ships) |
 | `GET /` (admin console) + `/v1/admin/*` | 🟢 Live (login required, see README) |
@@ -697,6 +700,197 @@ curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&
 - `400` — unknown `field` for the given `product`, or a pre-2021
   lat/lon-gridded file (unsupported schema — see above).
 - `502` — the upstream NOAA host couldn't be reached to fetch the source file.
+
+---
+
+## `GET /v1/tdr/volume` 🟢
+
+The 3D counterpart to `/tdr/sweep`: fetches one `xy`/`xy_rel` file (same
+fetch/cache path as `/tdr/sweep`) and reads its **entire CAPPI level axis**
+instead of slicing out a single altitude — every level for one analysis
+time, shaped for a volumetric renderer (the dashboard's Three.js viewer
+raymarches this directly). No `z` parameter, since there's no single level
+to pick.
+
+### Query parameters
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `mission_id` | string | *required* | e.g. `20240630I1`. |
+| `product` | string | *required* | `xy` or `xy_rel` only — a vertical profile (`vert_*`) has no level axis to volume-render. |
+| `analysis_time` | string | *required* | `HHMM`, matching one of the mission's indexed analysis times. |
+| `field` | string | *required* | `reflectivity`, `radial_wind`, `tangential_wind`, `u`, `v`, `w`, `vort`, `wind_speed`. |
+| `level` | string | resolved | `1b` or `2`. Defaults to `2` if that mission has a Level 2 file, else `1b`. |
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/volume?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity"
+```
+
+```json
+{
+  "mission_id": "20240630I1",
+  "storm_name": "BERYL",
+  "level": "2",
+  "product": "xy",
+  "analysis_time": "1201",
+  "field": "reflectivity",
+  "x": [-249.0, "...", 249.0],
+  "y": [-249.0, "...", 249.0],
+  "levels_km": [0.5, 1.0, "...", 18.0],
+  "data": [["...one 250x250 plane per level, null where no data..."]],
+  "colorscale": [[0.0, "#04e9e7"], ["...", "..."], [1.0, "#ffffff"]],
+  "zmin": 0.0,
+  "zmax": 70.0,
+  "units": "dBZ",
+  "origin_lat": 10.53,
+  "origin_lon": -53.96
+}
+```
+
+- `data[level][row][col]` — `level` indexes `levels_km`, `row` indexes `y`,
+  `col` indexes `x`. Same north-up-map and `null`-for-no-coverage
+  conventions as `/tdr/sweep`.
+- Error responses are the same shape as `/tdr/sweep`'s (`404`/`400`/`502`),
+  plus `400` if `product` isn't `xy`/`xy_rel`.
+
+---
+
+## `GET /v1/tdr/composite` 🟢
+
+Two ways to flatten a mission's TDR data into one image, both reusing the
+sweep-response shape so a client can render either with the exact same
+heatmap code as `/tdr/sweep` — pick with `mode`:
+
+| `mode` | What it does |
+|---|---|
+| `altitude` | Collapses one analysis time's whole level axis into a single "composite reflectivity"-style plane — max value per x/y column. Requires `analysis_time`. |
+| `time` | Mosaics one CAPPI level across *every* analysis time in the mission into one storm-centered image. Each file's grid is re-centered on wherever the storm was *at that analysis time* — this reads each file's `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE`, converts them to a local km offset from the first (earliest) usable file's origin, and forward-scatters every sweep onto one shared output grid sized to the union of them all. Needs at least 2 analysis times with an origin to align by. |
+| `time_volume` | The 3D counterpart to `mode=time`: instead of collapsing to one CAPPI level first, mosaics **every** level, same storm-center alignment, run once per level — a genuine 3D composite shaped like `/tdr/volume` rather than sweep-shaped. |
+
+Where two sweeps land on the same output cell in `mode=time`/`time_volume`,
+they're genuinely combined, not overlaid last-write-wins: **max** for
+`reflectivity` (the standard composite-reflectivity convention), **mean**
+for every other field (so one extreme analysis time doesn't dominate a
+wind/vorticity composite). The resolved mode is echoed back in
+`detail.combine_mode`.
+
+### Query parameters
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `mission_id` | string | *required* | |
+| `product` | string | *required* | `xy` or `xy_rel`. `xy_rel` is the physically cleaner choice for `mode=time`/`time_volume` since its wind fields already have storm motion removed. |
+| `field` | string | *required* | Same field list as `/tdr/sweep`/`/tdr/volume`. |
+| `mode` | string | *required* | `altitude`, `time`, or `time_volume`. |
+| `analysis_time` | string | required for `mode=altitude` | Ignored for `time`/`time_volume` (they use every indexed time). |
+| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. |
+| `z` | float | `2.0` | `mode=time` only — which CAPPI level to mosaic. Ignored for `mode=time_volume` (mosaics every level) and `mode=altitude` (collapses every level). |
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product=xy&field=reflectivity&mode=altitude&analysis_time=1201"
+curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product=xy_rel&field=reflectivity&mode=time&z=2.0"
+curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product=xy_rel&field=reflectivity&mode=time_volume"
+```
+
+`mode=altitude`/`mode=time` response (sweep-shaped):
+
+```json
+{
+  "mission_id": "20240630I1",
+  "storm_name": "Beryl",
+  "level": "2",
+  "product": "xy_rel",
+  "field": "reflectivity",
+  "mode": "time",
+  "detail": {
+    "z_km": 2.0,
+    "analysis_times_used": ["1201", "1215", "..."],
+    "reference_origin": {"lat": 10.53, "lon": -53.96},
+    "combine_mode": "max"
+  },
+  "x": ["..."], "y": ["..."], "data": [["..."]],
+  "origin_lat": 10.53, "origin_lon": -53.96,
+  "colorscale": [["..."]], "zmin": 0.0, "zmax": 70.0, "units": "dBZ"
+}
+```
+
+`mode=time_volume` response (volume-shaped, adds `levels_km` and a 3D
+`data`, same layout as `/tdr/volume`):
+
+```json
+{
+  "mode": "time_volume",
+  "detail": {
+    "analysis_times_used": ["1201", "1215", "..."],
+    "reference_origin": {"lat": 10.53, "lon": -53.96},
+    "combine_mode": "max"
+  },
+  "levels_km": [0.5, 1.0, "..."],
+  "data": [["...one mosaicked plane per level..."]],
+  "origin_lat": 10.53, "origin_lon": -53.96
+}
+```
+
+### Error responses
+
+- `400` — unknown `mode`; unknown `product` (not `xy`/`xy_rel`); missing
+  `analysis_time` for `mode=altitude`; fewer than 2 analysis times had an
+  `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE` to align by (`time`/`time_volume`);
+  fewer than 2 analysis times share a common CAPPI level grid
+  (`time_volume` only).
+- `404` — unknown `mission_id`, or no matching files on record.
+- `502` — the upstream NOAA host couldn't be reached.
+
+---
+
+## `GET /v1/tdr/plane_slice` 🟢
+
+An arbitrary vertical cross-section through one analysis time's `xy`/
+`xy_rel` volume, cut between two points a client picks on the horizontal
+CAPPI image — not just the fixed along/across-track cuts baked into the
+`vert_inbound`/`vert_outbound` products. Reads the whole volume (same as
+`/tdr/volume`) and bilinearly interpolates every level along the requested
+line, so the cross-section is smooth regardless of the line's angle
+through the grid.
+
+### Query parameters
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `mission_id` | string | *required* | |
+| `product` | string | *required* | `xy` or `xy_rel` only. |
+| `analysis_time` | string | *required* | |
+| `field` | string | *required* | Same field list as `/tdr/volume`. |
+| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. |
+| `x0`, `y0`, `x1`, `y1` | float | *required* | The cut line's two endpoints, in the same km-from-origin coordinate system a prior `/tdr/sweep` or `/tdr/volume` response's `x`/`y` use — pass through coordinates a user clicked on that plot directly. |
+| `n` | int | `100` | How many evenly-spaced points to sample along the line. Clamped to at least 2. |
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/plane_slice?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&x0=-50&y0=0&x1=50&y1=0&n=150"
+```
+
+```json
+{
+  "mission_id": "20240630I1",
+  "storm_name": "BERYL",
+  "level": "2",
+  "product": "xy",
+  "analysis_time": "1201",
+  "field": "reflectivity",
+  "endpoints": {"x0": -50.0, "y0": 0.0, "x1": 50.0, "y1": 0.0},
+  "x": [0.0, "...along-line km, 0 to the line's length...", 141.4],
+  "y": [0.5, 1.0, "...levels_km..."],
+  "data": [["...one row per level, one column per sampled point..."]],
+  "colorscale": [["..."]],
+  "zmin": 0.0, "zmax": 70.0, "units": "dBZ",
+  "origin_lat": 10.53, "origin_lon": -53.96
+}
+```
+
+- `x` is distance in km along the cut line from `(x0, y0)`; `y` is CAPPI
+  altitude in km (same as `/tdr/volume`'s `levels_km`). `data[row][col]`
+  — row indexes `y`/altitude, col indexes `x`/along-line distance.
+- Error responses are the same shape as `/tdr/volume`'s.
 
 ---
 

@@ -190,13 +190,17 @@ Python-specific ones).
 
 **Status:** Undergoing active development. Storm tracks, the recon archive
 (read *and* ingest), single-band IR satellite tiles (bands 7/9/13), and the
-full TDR pipeline (mission/file index, ingest, and sweep slice rendering)
-are fully implemented and verified against live NOAA data on this branch.
-Reflectance-band tiles (2/3/5) and the composite products are still in the
-works, along with the raw-netCDF passthrough (`501 Not Implemented`) — see
-"Roadmap" below. TDR sweep rendering covers both the post-2021 Cartesian
-grid schema and the pre-2021 lons/lats-gridded schema — see "TDR archive"
-below.
+full TDR pipeline (mission/file index, ingest, and sweep/volume/composite/
+plane_slice rendering) are fully implemented and verified against live NOAA
+data on this branch. Reflectance-band tiles (2/3/5) and the satellite
+composite products (`sandwich`/`geocolor`) are still in the works, along
+with the raw-netCDF passthrough (`501 Not Implemented`) — see "Roadmap"
+below. TDR slicing covers both the post-2021 Cartesian grid schema and the
+pre-2021 lons/lats-gridded schema — see "TDR archive" below. Beyond a
+single 2D slice, `GET /v1/tdr/volume` reads a whole CAPPI level axis for
+volumetric rendering, `GET /v1/tdr/composite` flattens a mission into one
+altitude- or time-mosaicked image, and `GET /v1/tdr/plane_slice` cuts an
+arbitrary vertical cross-section through a volume.
 
 ## Sources
 
@@ -406,12 +410,12 @@ flowchart LR
 
     subgraph "noaa-recon-api (Rust / axum)"
         D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
-        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep"]
+        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep, /v1/tdr/volume<br/>/v1/tdr/composite, /v1/tdr/plane_slice"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
         H["crates/server services/goes.rs<br/>(decode + S3 fetch)"]
-        K["crates/core render.rs/colormap.rs/sweep.rs<br/>(WASM-safe: projection + colorize + slicing)"]
-        L["services/tdr_ingest.rs<br/>(crawl + index, no downloads)<br/>services/tdr_nc.rs (fetch + slice, on demand)"]
+        K["crates/core render.rs/colormap.rs/sweep.rs<br/>(WASM-safe: projection + colorize + slicing + geo mosaic)"]
+        L["services/tdr_ingest.rs<br/>(crawl + index, no downloads)<br/>services/tdr_nc.rs (fetch + slice/volume/composite, on demand)"]
     end
 
     I[(NOAA S3<br/>noaa-goes16/17/18/19)]
@@ -816,12 +820,16 @@ crates/
                                    (paint_project, "Real bugs" #3), NaN gap-fill, NaN-aware smoothing,
                                    colorize -> RGBA. render_full_disk()/render_bbox() are the two
                                    entry points; the server calls these with an already-decoded array.
-      sweep.rs                       TDR sweep slicing for GET /v1/tdr/sweep: cappi_slice() (one
-                                   x/y plane from a flattened x,y,level,time array),
+      sweep.rs                       TDR slicing for GET /v1/tdr/sweep|volume|composite|plane_slice:
+                                   cappi_slice() (one x/y plane from a flattened x,y,level,time array),
                                    vertical_profile_slice() (the radius/height plane from a vert_* file),
-                                   and colorscale_for_field() (dBZ / wind-speed / diverging-wind
-                                   defaults). Pure index math + a lookup table, no I/O — tdr_nc.rs
-                                   in the server crate does the netCDF decode and hands it a flat array.
+                                   colorscale_for_field() (dBZ / wind-speed / diverging-wind defaults),
+                                   latlon_offset_km()/geo_mosaic()/combine_mode_for_field() (storm-center
+                                   alignment + max/mean cell-combine for composite's mode=time/
+                                   time_volume), and plane_slice() (bilinear cross-section along an
+                                   arbitrary line through a volume, for GET /v1/tdr/plane_slice). Pure
+                                   index math + a lookup table, no I/O — tdr_nc.rs in the server crate
+                                   does the netCDF decode and hands it a flat array.
   server/                       noaa-recon-api — the axum binary; every native/C dependency lives here
     src/
       main.rs                      Entry point: with no args, boots the HTTP server (CORS, request-
@@ -854,7 +862,11 @@ crates/
                                    from main.rs's subcommand dispatch, not from these routers).
         tdr.rs                         Mission/file discovery (years/:year/mission, same
                                    ingest-logic-lives-in-services/ split as storms.rs/recon.rs) AND
-                                   /tdr/sweep (fetch/cache -> tdr_nc.rs -> slice -> JSON). All live.
+                                   sweep/volume/composite/plane_slice (fetch/cache -> tdr_nc.rs ->
+                                   slice -> JSON). composite's mode=time/time_volume mosaic every
+                                   analysis time via crates/core sweep.rs's geo_mosaic(); plane_slice
+                                   cuts an arbitrary line through a volume via sweep.rs's plane_slice().
+                                   All live.
         raw.rs                          501 stub, same message as the Python branch.
         health.rs
       services/
@@ -877,12 +889,15 @@ crates/
                                    downloads a netCDF file. Storm-name resolution piggybacks on
                                    recon_met.sqlite where possible, since TDR and recon MET mission_ids
                                    use the identical YYYYMMDDAI scheme. Called by `ingest-tdr`.
-        tdr_nc.rs                         GET /v1/tdr/sweep's fetch/decode half: downloads + gunzips one
-                                   indexed product file lazily on first request (cached under
-                                   cache/tdr_nc/, same on-demand pattern as goes.rs's cache/goes_nc/,
-                                   just without its job/poll ceremony — these files are far smaller),
-                                   then reads the requested field and hands the flat array to
-                                   crates/core's sweep.rs for the actual slicing.
+        tdr_nc.rs                         Fetch/decode half of GET /v1/tdr/sweep|volume|composite|
+                                   plane_slice: downloads + gunzips one indexed product file lazily on
+                                   first request (cached under cache/tdr_nc/, same on-demand pattern as
+                                   goes.rs's cache/goes_nc/, just without its job/poll ceremony — these
+                                   files are far smaller), then reads the requested field via
+                                   read_xy_slice()/read_vert_slice() (one plane), read_xy_volume() (the
+                                   whole level axis), or read_xy_altitude_composite() (max-projected
+                                   across levels), handing the flat array to crates/core's sweep.rs for
+                                   the actual slicing/mosaicking.
         goes.rs                          S3 list/fetch (reqwest + quick-xml) + netCDF decode (the
                                    netcdf crate — mask/scale handling is manual, unlike netCDF4-python;
                                    see RUST.md's "critical decode gotcha") + PNG encode, single-band and

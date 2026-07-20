@@ -118,7 +118,8 @@ curl localhost:8000/v1/recon/mission/<id>
 | `GET /v1/health` | ✅ ported |
 | `/v1/storms/*` (years, list, track, nearest) | ✅ ported (read path) |
 | `/v1/recon/*` (years, missions, mission detail, **source download stream**) | ✅ ported (read path) |
-| `/v1/tdr/*`, `/v1/raw/netcdf` | ✅ ported (501 stubs, same as Python) |
+| `/v1/tdr/*` (years, missions, mission detail, sweep, volume, composite, plane_slice) | ✅ ported & verified (full pipeline: mission/file index, netCDF fetch/cache, 2D/3D slicing) |
+| `/v1/raw/netcdf` | ⏳ 501 stub, same as Python |
 | `/llms.txt`, `/cache`, `/demo/netcdf-three`, console static at `/` | ✅ ported |
 | request logging + `stats` counter | ✅ ported |
 | API-token store (SQLite, PBKDF2/SHA-256) | ✅ ported + unit-tested |
