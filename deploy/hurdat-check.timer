@@ -1,0 +1,24 @@
+# See hurdat-check.service for install instructions — install both files
+# together, then enable/start only the .timer (it pulls in the .service each
+# time it fires). ExecStart should run `noaa-recon-api check-hurdat`.
+#
+# Weekly, not nightly: NOAA reissues a basin's HURDAT2 best-track file only a
+# handful of times a year, so checking more often just wastes a request
+# against the NHC directory listing. The check itself is cheap (one small
+# HTML page per basin) — it only downloads and re-ingests a HURDAT2 file when
+# the listing shows a newer one than what's already recorded in the
+# hurdat_sources table. When it does, that re-ingest transparently replaces
+# any ATCF-sourced rows for the seasons the new release now covers (upsert by
+# atcf_id — see services/storms.rs::check_hurdat_updates). This is what
+# closes the gap from issue #11: previously the HURDAT2 URLs were hardcoded
+# to specific dated filenames, so picking up a new NOAA release required a
+# manual code change.
+[Unit]
+Description=Weekly check for updated HURDAT2 best-track releases
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

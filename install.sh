@@ -799,12 +799,16 @@ install_timers() {
     # TDR was added after the python variant was frozen), so its timer/service
     # only get installed for the rust variant.
     local svcs=(storm-archive-update recon-met-update goes-nc-cache-cleanup)
-    [[ "$VARIANT" == "rust" ]] && svcs+=(tdr-update)
+    # TDR ingest and the HURDAT2 release check are both rust-only subcommands
+    # (no scripts/ingest_tdr.py or scripts/check_hurdat.py exist — they were
+    # added after the python variant was frozen), so their timer/service only
+    # get installed for the rust variant.
+    [[ "$VARIANT" == "rust" ]] && svcs+=(tdr-update hurdat-check)
     local svc
     for svc in "${svcs[@]}"; do
         # Storms + cache cleanup are native subcommands in the rust variant;
-        # recon MET is Python in both variants; TDR is rust-only.
-        local desc after="After=network.target" execstart
+        # recon MET is Python in both variants; TDR + hurdat-check are rust-only.
+        local desc after="After=network.target" execstart freq="Nightly"
         case "$svc" in
             storm-archive-update)
                 desc="storm track archive (HURDAT2 + ATCF) update"
@@ -818,10 +822,13 @@ install_timers() {
             tdr-update)
                 desc="TDR (tail Doppler radar) archive update"; after=""
                 execstart="${rust_bin} ingest-tdr" ;;
+            hurdat-check)
+                desc="check for an updated HURDAT2 best-track release (see issue #11)"; after=""; freq="Weekly"
+                execstart="${rust_bin} check-hurdat" ;;
         esac
         $SUDO tee "/etc/systemd/system/${svc}.service" >/dev/null <<TIMER_SVC_EOF
 [Unit]
-Description=Nightly ${desc}
+Description=${freq} ${desc}
 ${after}
 
 [Service]
@@ -838,13 +845,13 @@ TIMER_SVC_EOF
     local timer_files=("${INSTALL_DIR}/deploy/storm-archive-update.timer" "${INSTALL_DIR}/deploy/recon-met-update.timer" "${INSTALL_DIR}/deploy/goes-nc-cache-cleanup.timer")
     local timer_names="storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer"
     if [[ "$VARIANT" == "rust" ]]; then
-        timer_files+=("${INSTALL_DIR}/deploy/tdr-update.timer")
-        timer_names="${timer_names} tdr-update.timer"
+        timer_files+=("${INSTALL_DIR}/deploy/tdr-update.timer" "${INSTALL_DIR}/deploy/hurdat-check.timer")
+        timer_names="${timer_names} tdr-update.timer hurdat-check.timer"
     fi
     $SUDO cp "${timer_files[@]}" /etc/systemd/system/
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now $timer_names >&2
-    log_ok "nightly timers enabled (03:15, 03:45, 04:00 [rust only], and 04:15 server time)"
+    log_ok "nightly timers enabled (03:15, 03:45, 04:00 [rust only], and 04:15 server time); hurdat-check runs weekly (Sun 02:00, rust only)"
 }
 
 install_cli_wrapper() {
@@ -983,12 +990,13 @@ cmd_uninstall() {
     ask_yesno "Continue?" n || { echo "Cancelled." >&2; exit 0; }
 
     $SUDO systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
-    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer tdr-update.timer 2>/dev/null || true
+    $SUDO systemctl disable --now storm-archive-update.timer recon-met-update.timer goes-nc-cache-cleanup.timer tdr-update.timer hurdat-check.timer 2>/dev/null || true
     $SUDO rm -f "/etc/systemd/system/${SERVICE_NAME}.service" \
                 /etc/systemd/system/storm-archive-update.service /etc/systemd/system/storm-archive-update.timer \
                 /etc/systemd/system/recon-met-update.service /etc/systemd/system/recon-met-update.timer \
                 /etc/systemd/system/goes-nc-cache-cleanup.service /etc/systemd/system/goes-nc-cache-cleanup.timer \
-                /etc/systemd/system/tdr-update.service /etc/systemd/system/tdr-update.timer
+                /etc/systemd/system/tdr-update.service /etc/systemd/system/tdr-update.timer \
+                /etc/systemd/system/hurdat-check.service /etc/systemd/system/hurdat-check.timer
     $SUDO systemctl daemon-reload
 
     $SUDO rm -f "/etc/nginx/conf.d/${SERVICE_NAME}.conf" "/etc/nginx/snippets/${SERVICE_NAME}.conf"

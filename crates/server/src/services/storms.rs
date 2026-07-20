@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS track_points (
     pressure_mb INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_track_storm_dt ON track_points(storm_id, datetime_utc);
+
+-- Tracks which HURDAT2 file (per basin) is currently reflected in `storms`,
+-- so check_hurdat_updates can tell a fresh NOAA release apart from one it's
+-- already ingested without re-downloading the file every time it checks.
+CREATE TABLE IF NOT EXISTS hurdat_sources (
+    basin TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    last_modified TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+);
 ";
 
 /// A storm header row (subset selected by the query helpers).
@@ -175,6 +185,14 @@ const HURDAT_URLS: [(&str, &str); 2] = [
     ("EP", "https://www.nhc.noaa.gov/data/hurdat/hurdat2-nepac-1949-2023-042624.txt"),
 ];
 const ATCF_BASINS: [(&str, &str); 3] = [("AL", "al"), ("EP", "ep"), ("CP", "cp")];
+
+// ── Weekly HURDAT2 release check ────────────────────────────────────────────
+// NHC republishes each basin's HURDAT2 file under a new, dated filename every
+// time it reconciles a season's best track (see check_hurdat_updates below).
+// There's no CP entry here because NHC doesn't publish a HURDAT2 file for the
+// central Pacific — CP storms stay ATCF-only, same as today.
+const HURDAT_INDEX_URL: &str = "https://www.nhc.noaa.gov/data/hurdat/";
+const HURDAT_BASIN_PREFIXES: [(&str, &str); 2] = [("AL", "1851"), ("EP", "nepac")];
 
 fn status_label(status: &str) -> &str {
     match status {
@@ -373,6 +391,108 @@ fn parse_atcf_bdeck(text: &str, basin: &str, num: &str, year: i64) -> Option<Par
     })
 }
 
+/// The newest HURDAT2 file NHC currently publishes for one basin.
+struct HurdatFile {
+    basin: &'static str,
+    filename: String,
+    url: String,
+    /// The directory listing's "Last modified" column, e.g. "2026-02-27 20:08".
+    /// Kept as the raw zero-padded string — it sorts and compares correctly as
+    /// text without needing to be parsed into a real datetime.
+    last_modified: String,
+}
+
+/// Parses NHC's Apache-style directory listing at `HURDAT_INDEX_URL` and picks
+/// the most-recently-modified `.txt` file per basin (`discover_latest_hurdat`).
+/// NHC keeps every historical reissue of a basin's file online (e.g. three
+/// different `hurdat2-1851-2022-*.txt` reprocessings), so filename alone
+/// doesn't identify "current" — the listing's own "Last modified" column does.
+async fn discover_latest_hurdat(client: &reqwest::Client) -> anyhow::Result<Vec<HurdatFile>> {
+    let html = client
+        .get(HURDAT_INDEX_URL)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let mut out = Vec::new();
+    for (basin, prefix) in HURDAT_BASIN_PREFIXES {
+        let (filename, last_modified) = latest_hurdat_from_html(&html, prefix)?
+            .ok_or_else(|| anyhow::anyhow!("no hurdat2-{prefix}-*.txt file found in {HURDAT_INDEX_URL} listing"))?;
+        out.push(HurdatFile { basin, url: format!("{HURDAT_INDEX_URL}{filename}"), filename, last_modified });
+    }
+    Ok(out)
+}
+
+/// Picks the most-recently-modified `hurdat2-{prefix}-*.txt` entry out of a
+/// directory listing's HTML (`(filename, last_modified)`, or `None` if the
+/// basin has no matching entry). Split out from `discover_latest_hurdat` so
+/// the parsing itself can be unit-tested against a static HTML fixture,
+/// without a network call.
+fn latest_hurdat_from_html(html: &str, prefix: &str) -> anyhow::Result<Option<(String, String)>> {
+    let pattern = format!(
+        r#"href="(hurdat2-{prefix}-[^"]+\.txt)">[^<]*</a></td><td align="right">(\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}})"#
+    );
+    let re = regex::Regex::new(&pattern)?;
+    Ok(re
+        .captures_iter(html)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .max_by(|a, b| a.1.cmp(&b.1)))
+}
+
+fn known_hurdat_filename(conn: &Connection, basin: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT filename FROM hurdat_sources WHERE basin = ?1", [basin], |r| r.get(0))
+        .optional()
+}
+
+fn record_hurdat_source(conn: &Connection, file: &HurdatFile) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO hurdat_sources (basin, filename, last_modified, checked_at) VALUES (?1,?2,?3,?4) \
+         ON CONFLICT(basin) DO UPDATE SET \
+         filename=excluded.filename, last_modified=excluded.last_modified, checked_at=excluded.checked_at",
+        rusqlite::params![file.basin, file.filename, file.last_modified, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn touch_hurdat_checked_at(conn: &Connection, basin: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE hurdat_sources SET checked_at = ?2 WHERE basin = ?1",
+        rusqlite::params![basin, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Weekly release check (`check_hurdat_updates`): cheap when NOAA hasn't
+/// published anything new (one small directory-listing fetch per basin),
+/// expensive only when it has. `upsert_storm` is keyed by `atcf_id`
+/// (`{basin}{num}{year}` — identical whether the row came from HURDAT2 or
+/// ATCF), so re-ingesting a basin's HURDAT2 file here transparently replaces
+/// any ATCF-sourced rows for seasons the new release now covers — that's the
+/// "prefer HURDAT once it's available" behavior from issue #11.
+pub async fn check_hurdat_updates(db_path: &Path) -> anyhow::Result<Value> {
+    let conn = get_connection(db_path)?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
+
+    let mut result = serde_json::Map::new();
+    for file in discover_latest_hurdat(&client).await? {
+        if known_hurdat_filename(&conn, file.basin)?.as_deref() == Some(file.filename.as_str()) {
+            touch_hurdat_checked_at(&conn, file.basin)?;
+            result.insert(file.basin.to_string(), json!({ "updated": false, "filename": file.filename }));
+            continue;
+        }
+        let text = client.get(&file.url).send().await?.error_for_status()?.text().await?;
+        let n = ingest_basin(&conn, &text)?;
+        record_hurdat_source(&conn, &file)?;
+        result.insert(
+            file.basin.to_string(),
+            json!({ "updated": true, "filename": file.filename, "storms_ingested": n }),
+        );
+    }
+    Ok(json!({ "hurdat_check": result }))
+}
+
 /// Extract b-deck filenames for one basin/year from a directory listing's HTML
 /// (`list_atcf_filenames`).
 fn list_atcf_filenames(dir_html: &str, basin_prefix: &str, year: i64, gz: bool) -> Vec<String> {
@@ -557,6 +677,56 @@ mod tests {
         // live (non-gz) variant
         let html2 = r#"<a href="bal012026.dat">x</a>"#;
         assert_eq!(list_atcf_filenames(html2, "al", 2026, false), vec!["bal012026.dat"]);
+    }
+
+    #[test]
+    fn hurdat_listing_picks_newest_by_last_modified_not_filename() {
+        // Trimmed fixture of the real Apache autoindex at nhc.noaa.gov/data/hurdat/.
+        // Three AL reissues for the same season, deliberately out of filename
+        // order, plus an "hurdat2-atl-*" variant and a "-format-" PDF that must
+        // NOT match the AL pattern.
+        let html = r#"
+<tr><td><a href="hurdat2-1851-2022-040723.txt">x</a></td><td align="right">2023-04-07 14:59  </td></tr>
+<tr><td><a href="hurdat2-1851-2024-040225.txt">x</a></td><td align="right">2025-04-02 12:00  </td></tr>
+<tr><td><a href="hurdat2-1851-2025-02272026.txt">x</a></td><td align="right">2026-02-27 20:08  </td></tr>
+<tr><td><a href="hurdat2-atl-1851-2023-042624.txt">x</a></td><td align="right">2024-04-26 09:00  </td></tr>
+<tr><td><a href="hurdat2-format-atl-1851-2021.pdf">x</a></td><td align="right">2021-01-01 00:00  </td></tr>
+<tr><td><a href="hurdat2-nepac-1949-2025-02272026.txt">x</a></td><td align="right">2026-02-27 20:09  </td></tr>
+"#;
+        assert_eq!(
+            latest_hurdat_from_html(html, "1851").unwrap(),
+            Some(("hurdat2-1851-2025-02272026.txt".to_string(), "2026-02-27 20:08".to_string()))
+        );
+        assert_eq!(
+            latest_hurdat_from_html(html, "nepac").unwrap(),
+            Some(("hurdat2-nepac-1949-2025-02272026.txt".to_string(), "2026-02-27 20:09".to_string()))
+        );
+        assert_eq!(latest_hurdat_from_html(html, "cp").unwrap(), None);
+    }
+
+    #[test]
+    fn hurdat_source_roundtrip_tracks_the_latest_filename() {
+        let conn = get_connection(Path::new(":memory:")).unwrap();
+        assert_eq!(known_hurdat_filename(&conn, "AL").unwrap(), None);
+
+        let v1 = HurdatFile {
+            basin: "AL",
+            filename: "hurdat2-1851-2024-040225.txt".to_string(),
+            url: "https://example.invalid/hurdat2-1851-2024-040225.txt".to_string(),
+            last_modified: "2025-04-02 12:00".to_string(),
+        };
+        record_hurdat_source(&conn, &v1).unwrap();
+        assert_eq!(known_hurdat_filename(&conn, "AL").unwrap(), Some(v1.filename.clone()));
+
+        // A later release for the same basin overwrites the recorded filename.
+        let v2 = HurdatFile {
+            basin: "AL",
+            filename: "hurdat2-1851-2025-02272026.txt".to_string(),
+            url: "https://example.invalid/hurdat2-1851-2025-02272026.txt".to_string(),
+            last_modified: "2026-02-27 20:08".to_string(),
+        };
+        record_hurdat_source(&conn, &v2).unwrap();
+        assert_eq!(known_hurdat_filename(&conn, "AL").unwrap(), Some(v2.filename));
     }
 
     #[test]

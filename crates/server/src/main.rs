@@ -51,11 +51,12 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("ingest-storms") => return cmd_ingest_storms(&paths).await,
+        Some("check-hurdat") => return cmd_check_hurdat(&paths).await,
         Some("ingest-recon") => return cmd_ingest_recon(&paths, &args).await,
         Some("ingest-tdr") => return cmd_ingest_tdr(&paths, &args).await,
         Some("clean-nc-cache") => return cmd_clean_nc_cache(&paths, &args),
         Some("--help" | "-h") => {
-            eprintln!("usage: noaa-recon-api [ingest-storms | ingest-recon [--years Y,Y] [--force] | ingest-tdr [--years Y,Y] [--force] | clean-nc-cache [--max-age-hours N]]\n  (no subcommand: run the HTTP server)");
+            eprintln!("usage: noaa-recon-api [ingest-storms | check-hurdat | ingest-recon [--years Y,Y] [--force] | ingest-tdr [--years Y,Y] [--force] | clean-nc-cache [--max-age-hours N]]\n  (no subcommand: run the HTTP server)");
             return Ok(());
         }
         Some(other) => anyhow::bail!("unknown subcommand '{other}' (try --help)"),
@@ -169,6 +170,15 @@ async fn main() -> anyhow::Result<()> {
 async fn cmd_ingest_storms(paths: &Paths) -> anyhow::Result<()> {
     println!("Ingesting storm-track archive (HURDAT2 + ATCF) — this usually takes ~10s...");
     let summary = services::storms::run_ingest(&paths.storms_db).await?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+/// `check-hurdat` subcommand — weekly release check (deploy/hurdat-check.timer).
+/// Cheap when NOAA hasn't published anything new; only re-ingests a basin when
+/// its HURDAT2 file has actually changed. See storms::check_hurdat_updates.
+async fn cmd_check_hurdat(paths: &Paths) -> anyhow::Result<()> {
+    let summary = services::storms::check_hurdat_updates(&paths.storms_db).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }

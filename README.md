@@ -568,6 +568,25 @@ missed run (host was down) fires on next boot instead of waiting a full
 day. Visible in Cockpit's Services page like any other systemd unit —
 search "storm-archive-update" to check last-run status.
 
+Separately, `check-hurdat` (rust variant only) watches for NOAA reissuing a
+basin's official HURDAT2 best-track file — the reconciled version of a
+season that starts out sourced from provisional ATCF data. See
+[`crates/server/src/services/storms.rs`](crates/server/src/services/storms.rs)'s
+`check_hurdat_updates` for the mechanism: it's a cheap check (one small NHC
+directory-listing fetch per basin) that only downloads and re-ingests a
+HURDAT2 file when the listing shows a newer one than what's already
+recorded — the re-ingest then transparently replaces any ATCF-sourced rows
+for the seasons the new release covers (same `atcf_id`-keyed upsert
+`ingest-storms` uses). `install.sh` wires this up as its own weekly timer
+(Sun 02:00 server local time, `deploy/hurdat-check.timer`) so it doesn't
+wait on the nightly `ingest-storms` run:
+
+```bash
+sudo cp deploy/hurdat-check.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hurdat-check.timer
+```
+
 ### Recon MET archive
 
 `data/recon_met.sqlite` (the `GET /v1/recon/*` backing store) is populated

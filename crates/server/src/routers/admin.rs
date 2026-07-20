@@ -456,7 +456,12 @@ async fn start_archive_update(
     Path(archive): Path<String>,
     Query(q): Query<ArchiveUpdateQuery>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_superuser(&jar)?;
+    // Storms/recon-MET/TDR ingest is incremental and non-destructive (see
+    // services/archive_update.rs), so moderators — not just superusers — are
+    // trusted to trigger it. Only superuser/moderator accounts can hold a
+    // console session at all (tokens::verify_admin_login), so require_login
+    // here is exactly "moderator or superuser", not "anyone with a session".
+    auth::require_login(&jar)?;
     if state.archive_update.is_running(&archive) {
         return Err(ApiError::conflict("An update for this archive is already in progress"));
     }

@@ -506,6 +506,16 @@ latest advisory for any storm currently active; see the README's
 `atcf_id` and replaces its own track points, so re-running is always safe
 whether triggered by the timer or by hand.
 
+That same upsert is what lets a season move from ATCF to HURDAT2: once NHC
+republishes a basin's official HURDAT2 file, re-ingesting it overwrites the
+provisional ATCF-sourced rows for the seasons it now covers, `atcf_id` for
+`atcf_id`. The rust variant watches for that release automatically — a
+separate weekly timer (`deploy/hurdat-check.timer`, `check-hurdat`
+subcommand) checks NHC's HURDAT2 directory listing and only re-ingests a
+basin when it finds a newer file than the one already recorded. See
+`check_hurdat_updates` in
+[`crates/server/src/services/storms.rs`](crates/server/src/services/storms.rs).
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/storms/years` | Every year with at least one storm on record. |
