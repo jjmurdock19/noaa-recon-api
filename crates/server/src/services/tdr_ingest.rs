@@ -34,10 +34,12 @@
 //! recon MET missions (confirmed against a live crawl of both hosts), so a
 //! mission already reconciled to a storm there doesn't need re-deriving.
 
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use chrono::{Datelike, Utc};
+use flate2::read::GzDecoder;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -50,6 +52,45 @@ const LEVEL2_BASE: &str = "https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/leve
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const UNKNOWN_STORM: &str = "Unknown";
 const TRAINING_BUCKET_NAME: &str = "Training / Research";
+
+/// Where a mission's storm name came from, lowest→highest confidence. Ranking
+/// is what lets a re-crawl *upgrade* a name (jobfile → recon) without ever
+/// downgrading a confirmed one. `Level2`/`Recon` are "confirmed" (storm pinned
+/// by a QC'd path or a track-match against the storms DB); `Unknown`/`Jobfile`
+/// are provisional and keep the mission `pending` so it self-heals later.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StormSource {
+    Unknown = 0,
+    Jobfile = 1,
+    Level2 = 2,
+    Recon = 3,
+}
+
+impl StormSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            StormSource::Unknown => "unknown",
+            StormSource::Jobfile => "jobfile",
+            StormSource::Level2 => "level2",
+            StormSource::Recon => "recon",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "jobfile" => StormSource::Jobfile,
+            "level2" => StormSource::Level2,
+            "recon" => StormSource::Recon,
+            _ => StormSource::Unknown,
+        }
+    }
+
+    /// Confirmed = storm attribution is trustworthy and the mission is no
+    /// longer `pending`. Only a Level 2 path or a recon-MET track-match count.
+    fn confirmed(self) -> bool {
+        self >= StormSource::Level2
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -226,16 +267,83 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
-/// Best available storm name/id for a mission: a recon MET reconciliation
-/// (already haversine-matched against the storms DB) beats a Level 2
-/// directory name, which beats whatever this DB already had on file, which
-/// beats "Unknown".
+/// The storm name + ATCF id lifted from a Level 1b mission dir's own
+/// `*_jobfile.tar.gz`. The gzip wraps a tiny (~1.6 KB) tar whose `jobfile.xml`
+/// member is a single line like
+/// `<flight id="20251030H1" mission="3113A MELISSA" storm="AL132025" …>`.
+/// Because tar stores member *contents* uncompressed, the gunzipped bytes carry
+/// those attributes verbatim — so we gunzip and regex them straight out rather
+/// than pull in a tar reader for one 1.6 KB blob. This is the ONLY in-directory
+/// source of the storm name for a Level 1b mission (no plaintext index exists),
+/// which is exactly what lets a radar-only mission that landed before its recon
+/// MET data get a real (if still provisional) name instead of "Unknown".
+async fn fetch_jobfile_storm(
+    http: &reqwest::Client,
+    mission_url: &str,
+    hrefs: &[String],
+) -> Option<(String, Option<String>)> {
+    let job_href = hrefs.iter().find(|h| h.to_lowercase().ends_with("_jobfile.tar.gz"))?;
+    let name = job_href.rsplit('/').next().unwrap_or(job_href);
+    let gz = fetch_bytes(http, &format!("{mission_url}{name}")).await?;
+    let mut text = String::new();
+    // The tar's binary headers aren't valid UTF-8, so read as bytes then
+    // lossy-decode — the `<flight …>` line we want is plain ASCII regardless.
+    let mut buf = Vec::new();
+    GzDecoder::new(&gz[..]).read_to_end(&mut buf).ok()?;
+    text.push_str(&String::from_utf8_lossy(&buf));
+    parse_jobfile_storm(&text)
+}
+
+/// Pulls `(storm_name, atcf_id)` from a gunzipped jobfile tar's text (the
+/// `<flight mission="…" storm="…">` line). Split out for unit testing.
+fn parse_jobfile_storm(text: &str) -> Option<(String, Option<String>)> {
+    static MISSION_RE: OnceLock<Regex> = OnceLock::new();
+    static STORM_RE: OnceLock<Regex> = OnceLock::new();
+    let mission_re = MISSION_RE.get_or_init(|| Regex::new(r#"mission="([^"]*)""#).unwrap());
+    let storm_re = STORM_RE.get_or_init(|| Regex::new(r#"storm="([A-Za-z]{2}\d{6})""#).unwrap());
+
+    let mission_val = mission_re.captures(text)?.get(1)?.as_str().trim().to_string();
+    // "3113A MELISSA" → the name is everything after the leading flight-number
+    // token; a training/ferry jobfile is just the number with no name → skip.
+    let mut parts = mission_val.split_whitespace();
+    let _flight_num = parts.next()?;
+    let name_raw = parts.collect::<Vec<_>>().join(" ");
+    if name_raw.is_empty() {
+        return None;
+    }
+    let name = title_case(&name_raw);
+    if name.len() < 2 || is_junk_storm_name(&name) {
+        return None;
+    }
+    let atcf = storm_re.captures(text).map(|c| c[1].to_uppercase());
+    Some((name, atcf))
+}
+
+fn is_junk_storm_name(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "TEST" | "NONE" | "N/A" | "UNKNOWN" | "FERRY" | "TRAINING" | "INVEST" | "SURVEY" | "RECON" | "CYCLONE"
+    )
+}
+
+/// Best available `(storm_name, storm_id, source)` for a mission, picked by
+/// confidence rank so a re-crawl can *upgrade* a provisional name but never
+/// downgrades a confirmed one:
+///   recon MET track-match  >  Level 2 path  >  jobfile guess  >  what this DB
+///   already resolved  >  "Unknown".
+/// `jobfile` is the `(name, atcf)` already parsed from the mission dir (only
+/// Level 1b dirs carry one), passed in because the fetch is async and this is
+/// sync. The returned `source` drives the `pending` flag: anything below
+/// Level 2 stays pending so it keeps re-resolving until recon data lands.
 fn resolve_storm(
     recon_conn: &Connection,
     tdr_conn: &Connection,
     mission_id: &str,
     level2_storm_slug: Option<&str>,
-) -> rusqlite::Result<(String, Option<String>)> {
+    jobfile: Option<(String, Option<String>)>,
+) -> rusqlite::Result<(String, Option<String>, StormSource)> {
+    let mut candidates: Vec<(StormSource, String, Option<String>)> = Vec::new();
+
     let recon_hit: Option<(String, Option<String>)> = recon_conn
         .query_row(
             "SELECT storm_name, storm_id FROM missions WHERE mission_id = ?1",
@@ -245,16 +353,36 @@ fn resolve_storm(
         .optional()?;
     if let Some((name, id)) = recon_hit {
         if !name.eq_ignore_ascii_case(TRAINING_BUCKET_NAME) {
-            return Ok((name, id));
+            candidates.push((StormSource::Recon, name, id));
         }
     }
     if let Some(slug) = level2_storm_slug {
-        return Ok((title_case(slug), None));
+        candidates.push((StormSource::Level2, title_case(slug), None));
     }
-    let existing: Option<String> = tdr_conn
-        .query_row("SELECT storm_name FROM missions WHERE mission_id = ?1", [mission_id], |r| r.get(0))
+    if let Some((name, id)) = jobfile {
+        candidates.push((StormSource::Jobfile, name, id));
+    }
+    // Whatever this DB already had — carried in at its stored rank so a prior
+    // recon/level2 confirmation is never lost to a later jobfile-only re-crawl.
+    let existing: Option<(String, Option<String>, String)> = tdr_conn
+        .query_row(
+            "SELECT storm_name, storm_id, storm_source FROM missions WHERE mission_id = ?1",
+            [mission_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()?;
-    Ok((existing.unwrap_or_else(|| UNKNOWN_STORM.to_string()), None))
+    if let Some((name, id, src)) = existing {
+        if !name.eq_ignore_ascii_case(UNKNOWN_STORM) {
+            candidates.push((StormSource::from_str(&src), name, id));
+        }
+    }
+
+    // Highest rank wins; on a tie the later push (existing) wins, keeping its id.
+    Ok(candidates
+        .into_iter()
+        .max_by_key(|(s, _, _)| *s)
+        .map(|(s, n, i)| (n, i, s))
+        .unwrap_or_else(|| (UNKNOWN_STORM.to_string(), None, StormSource::Unknown)))
 }
 
 fn now_unix() -> i64 {
@@ -282,17 +410,22 @@ async fn harvest_mission_dir(
     level2_storm_slug: Option<&str>,
     force: bool,
 ) -> anyhow::Result<bool> {
-    let already: i64 = conn
+    let (already, pending): (i64, i64) = conn
         .query_row(
             match level {
-                Level::L1b => "SELECT has_level1b FROM missions WHERE mission_id = ?1",
-                Level::L2 => "SELECT has_level2 FROM missions WHERE mission_id = ?1",
+                Level::L1b => "SELECT has_level1b, pending FROM missions WHERE mission_id = ?1",
+                Level::L2 => "SELECT has_level2, pending FROM missions WHERE mission_id = ?1",
             },
             [mission_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or(0);
-    if already != 0 && !force {
+        .unwrap_or((0, 0));
+    // Skip the crawl only when this level is already indexed AND the storm is
+    // already confirmed. A `pending` mission (radar in, storm not yet pinned)
+    // is deliberately re-crawled every run so it self-heals the moment its
+    // recon MET data uploads — that's the whole fix for the "landed as Unknown"
+    // case. `force` overrides regardless.
+    if already != 0 && !force && pending == 0 {
         return Ok(false);
     }
 
@@ -315,7 +448,16 @@ async fn harvest_mission_dir(
         })
         .collect();
 
-    let (storm_name, storm_id) = resolve_storm(recon_conn, conn, mission_id, level2_storm_slug)?;
+    // Only Level 1b dirs carry a jobfile; a Level 2 mission's storm is already
+    // pinned by its path, so don't spend the fetch there.
+    let jobfile = if level == Level::L1b {
+        fetch_jobfile_storm(http, mission_url, &hrefs).await
+    } else {
+        None
+    };
+    let (storm_name, storm_id, source) =
+        resolve_storm(recon_conn, conn, mission_id, level2_storm_slug, jobfile)?;
+    let pending_flag: i64 = if source.confirmed() { 0 } else { 1 };
     let (aircraft, tail_num) = aircraft_from_mission_id(mission_id);
     let fetched_at = now_unix();
 
@@ -325,20 +467,28 @@ async fn harvest_mission_dir(
             Level::L1b => (1, 0),
             Level::L2 => (0, 1),
         };
+        // `resolve_storm` already folded the existing row in by confidence
+        // rank, so `excluded.*` is the best name/source — write it straight
+        // (no CASE): an upgrade lands, and a same-or-lower re-crawl re-writes
+        // the identical value. storm_id keeps a previously-found ATCF if this
+        // pass didn't supply one.
         conn.execute(
             "INSERT INTO missions \
-             (mission_id, year, aircraft, tail_num, storm_name, storm_id, has_level1b, has_level2, fetched_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             (mission_id, year, aircraft, tail_num, storm_name, storm_id, has_level1b, has_level2, \
+              storm_source, pending, fetched_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
              ON CONFLICT(mission_id) DO UPDATE SET \
                aircraft=excluded.aircraft, tail_num=excluded.tail_num, \
-               storm_name=CASE WHEN missions.storm_name = ?10 THEN excluded.storm_name ELSE missions.storm_name END, \
-               storm_id=COALESCE(missions.storm_id, excluded.storm_id), \
+               storm_name=excluded.storm_name, \
+               storm_id=COALESCE(excluded.storm_id, missions.storm_id), \
+               storm_source=excluded.storm_source, \
+               pending=excluded.pending, \
                has_level1b=MAX(missions.has_level1b, excluded.has_level1b), \
                has_level2=MAX(missions.has_level2, excluded.has_level2), \
                fetched_at=excluded.fetched_at",
             rusqlite::params![
                 mission_id, year, aircraft, tail_num, storm_name, storm_id,
-                level1b_flag, level2_flag, fetched_at, UNKNOWN_STORM,
+                level1b_flag, level2_flag, source.as_str(), pending_flag, fetched_at,
             ],
         )?;
 
@@ -476,9 +626,102 @@ pub async fn run_ingest(
     }))
 }
 
+/// Re-run storm resolution for missions whose attribution isn't confirmed
+/// (`pending`/`Unknown`), or an explicit `mission_ids` list, by force-crawling
+/// each one's Level 1b dir + jobfile and re-checking the recon MET DB. This is
+/// what the admin console's "fix pending TDR" and per-flight buttons call:
+/// once a flight's recon MET data finally uploads (and recon ingest has run),
+/// this promotes the mission out of the pending/Unknown bucket to its real
+/// storm. Nothing here re-crawls the recon archive itself — run recon ingest
+/// (or the per-mission recon re-ingest) first if the recon data is what's
+/// missing.
+pub async fn reresolve_missions(
+    tdr_db: &Path,
+    recon_met_db: &Path,
+    mission_ids: Option<Vec<String>>,
+) -> anyhow::Result<Value> {
+    let conn = tdr::get_connection(tdr_db)?;
+    let recon_conn = recon_met::get_connection(recon_met_db)?;
+    let http = client()?;
+
+    let targets: Vec<(String, i64)> = match mission_ids {
+        Some(ids) => ids.into_iter().filter_map(|id| mission_year(&id).map(|y| (id, y))).collect(),
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT mission_id, year FROM missions WHERE pending = 1 OR storm_name = 'Unknown'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.filter_map(|r| r.ok()).collect()
+        }
+    };
+
+    let (mut reresolved, mut confirmed, mut errors) = (0i64, 0i64, 0i64);
+    let mut results = Vec::new();
+    for (mission_id, year) in &targets {
+        let mission_url = format!("{LEVEL1B_BASE}/{mission_id}/");
+        match harvest_mission_dir(
+            &http, &conn, &recon_conn, mission_id, *year, Level::L1b, &mission_url, None, true,
+        )
+        .await
+        {
+            Ok(_) => {
+                reresolved += 1;
+                if let Ok(Some(m)) = tdr::get_mission(&conn, mission_id) {
+                    if !m.pending {
+                        confirmed += 1;
+                    }
+                    results.push(json!({
+                        "mission_id": mission_id,
+                        "storm_name": m.storm_name,
+                        "storm_source": m.storm_source,
+                        "pending": m.pending,
+                    }));
+                }
+            }
+            Err(e) => {
+                tracing::error!("{mission_id}: re-resolve failed: {e}");
+                errors += 1;
+            }
+        }
+    }
+
+    Ok(json!({
+        "targeted": targets.len(),
+        "reresolved": reresolved,
+        "now_confirmed": confirmed,
+        "errors": errors,
+        "missions": results,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_storm_from_jobfile_xml() {
+        let text = r#"<flight id="20251030H1" mission="3113A MELISSA" storm="AL132025" mode="0"><start3D>174741</start3D></flight>"#;
+        let (name, atcf) = parse_jobfile_storm(text).unwrap();
+        assert_eq!(name, "Melissa");
+        assert_eq!(atcf.as_deref(), Some("AL132025"));
+    }
+
+    #[test]
+    fn jobfile_without_storm_name_is_none() {
+        // ferry/training jobfile: mission is just the flight number, no name.
+        assert!(parse_jobfile_storm(r#"<flight id="20250101H1" mission="0101A" storm="">"#).is_none());
+        assert!(parse_jobfile_storm(r#"<flight mission="0101A FERRY">"#).is_none());
+        assert!(parse_jobfile_storm("no flight element here").is_none());
+    }
+
+    #[test]
+    fn storm_source_ranks_recon_over_jobfile() {
+        assert!(StormSource::Recon > StormSource::Level2);
+        assert!(StormSource::Level2 > StormSource::Jobfile);
+        assert!(StormSource::Jobfile > StormSource::Unknown);
+        assert!(StormSource::Level2.confirmed());
+        assert!(!StormSource::Jobfile.confirmed());
+        assert!(!StormSource::Unknown.confirmed());
+    }
 
     #[test]
     fn parses_xy_and_vert_products() {

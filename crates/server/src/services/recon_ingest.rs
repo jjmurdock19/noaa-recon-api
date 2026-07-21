@@ -889,6 +889,60 @@ pub async fn run_ingest(
     Ok(Value::Object(summary))
 }
 
+/// Re-ingest a single recon MET mission (crawl its `acdata/{year}/MET/{id}/`
+/// dir, download + decimate its netCDF, extract its storm name) and then run
+/// the reconciliation passes so the freshly-ingested mission gets track-matched
+/// against the storms DB. Backs the admin console's per-flight "pull recon
+/// data" button — the recon half of recovering a radar-only flight that landed
+/// before its MET data uploaded. `force`-harvests so an already-known mission
+/// is still refreshed.
+pub async fn reingest_mission(
+    recon_db: &Path,
+    storms_db: &Path,
+    mission_id: &str,
+) -> anyhow::Result<Value> {
+    let year: i64 = mission_id
+        .get(0..4)
+        .and_then(|y| y.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("mission_id '{mission_id}' has no leading YYYY"))?;
+    let conn = recon_met::get_connection(recon_db)?;
+    let http = client(HTTP_TIMEOUT_SECS)?;
+    let nc_http = client(NC_TIMEOUT_SECS)?;
+
+    let harvested = harvest_mission(&http, &nc_http, &conn, year, mission_id, true).await?;
+
+    // Same reconciliation passes as run_ingest, so the new mission is matched
+    // to a storm rather than left in the training bucket.
+    let storms_conn = storms::get_connection(storms_db)?;
+    clean_null_island_observations(&conn)?;
+    apply_manual_storm_name_corrections(&conn)?;
+    migrate_unknown_storm_names(&conn)?;
+    rename_legacy_training_bucket(&conn)?;
+    reconcile_storm_ids(&conn)?;
+    reconcile_mismatched_storm_names(&conn, &storms_conn)?;
+    reconcile_junk_storm_buckets(&conn, &storms_conn)?;
+
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT storm_name, storm_id FROM missions WHERE mission_id = ?1",
+            [mission_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let (storm_name, storm_id) = match row {
+        Some((n, i)) => (Some(n), i),
+        None => (None, None),
+    };
+
+    Ok(json!({
+        "mission_id": mission_id,
+        "harvested": harvested,
+        "found": storm_name.is_some(),
+        "storm_name": storm_name,
+        "storm_id": storm_id,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

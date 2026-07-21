@@ -452,6 +452,13 @@
         </div>
 
         <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
+          <button class="primary-btn" id="tdr-pending-refresh-btn" title="List TDR flights whose storm isn't confirmed yet — radar that arrived before the recon MET data which pins the storm (e.g. a fresh flight filed as Unknown)">Pending / unattributed TDR flights</button>
+          <button class="primary-btn" id="tdr-reresolve-all-btn" title="Re-resolve every pending flight against current recon data. Run Force update: Recon MET first if the recon data itself was what was missing.">Re-resolve all pending</button>
+          <span class="status-text" id="tdr-pending-status"></span>
+        </div>
+        <div id="tdr-pending-table" style="margin-top:8px;"></div>
+
+        <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
             <span class="field-label">Database</span>
             <select id="db-view-type">
@@ -1883,6 +1890,97 @@ document.getElementById('tdr-backfill-btn').addEventListener('click', () => {
         return;
     }
     startArchiveUpdate('tdr', 'tdr-backfill-btn', 'tdr-backfill-status', years);
+});
+
+// ── Pending / unattributed TDR flights ──────────────────────────────────
+// Flights whose radar landed before their recon MET data, so the archiver
+// filed them as Unknown / a provisional jobfile guess (see tdr_ingest.rs).
+// This panel lets an operator see them and recover each one's storm.
+async function refreshTdrPending() {
+    const statusEl = document.getElementById('tdr-pending-status');
+    statusEl.textContent = 'Loading…';
+    statusEl.className = 'status-text working';
+    try {
+        const res = await api('/v1/admin/tdr/pending');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'failed');
+        renderTdrPending(data.missions || []);
+        statusEl.textContent = `${data.count} pending flight(s)`;
+        statusEl.className = 'status-text ' + (data.count ? '' : 'ok');
+    } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        statusEl.className = 'status-text err';
+    }
+}
+
+function renderTdrPending(missions) {
+    const tableEl = document.getElementById('tdr-pending-table');
+    if (!missions.length) {
+        tableEl.innerHTML = '<p style="color:var(--text-muted); font-size:12px;">No pending flights — every indexed TDR mission has a confirmed storm.</p>';
+        return;
+    }
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const rows = missions.map((m) => {
+        const levels = [m.has_level1b ? '1b' : null, m.has_level2 ? '2' : null].filter(Boolean).join('+');
+        return `<tr>
+          <td>${esc(m.mission_id)}</td>
+          <td>${esc(m.storm_name)}</td>
+          <td>${esc(m.storm_source)}</td>
+          <td>${esc(m.aircraft)}</td>
+          <td>${esc(levels)}</td>
+          <td><button class="primary-btn tdr-reresolve-one" data-mid="${esc(m.mission_id)}" title="Pull this flight's recon MET data (if it uploaded after the radar) and re-resolve its storm">Pull recon &amp; re-resolve</button></td>
+        </tr>`;
+    }).join('');
+    tableEl.innerHTML = `<div class="table-scroll"><table>
+        <thead><tr><th>Mission</th><th>Storm (provisional)</th><th>Source</th><th>Aircraft</th><th>Levels</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+    tableEl.querySelectorAll('.tdr-reresolve-one').forEach((btn) => {
+        btn.addEventListener('click', () => reresolveOneTdr(btn.dataset.mid, btn));
+    });
+}
+
+async function reresolveOneTdr(missionId, btn) {
+    const statusEl = document.getElementById('tdr-pending-status');
+    btn.disabled = true;
+    statusEl.textContent = `Re-resolving ${missionId}… (crawling recon MET — may take a moment)`;
+    statusEl.className = 'status-text working';
+    try {
+        const res = await api(`/v1/admin/tdr/mission/${encodeURIComponent(missionId)}/reresolve`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'failed');
+        const r = (data.tdr && data.tdr.missions && data.tdr.missions[0]) || {};
+        statusEl.textContent = `${missionId} → ${r.storm_name || '?'} (${r.pending ? 'still pending — recon not found yet' : 'confirmed'})`;
+        statusEl.className = 'status-text ' + (r.pending ? '' : 'ok');
+        refreshTdrPending();
+        refreshStatus();
+    } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        statusEl.className = 'status-text err';
+        btn.disabled = false;
+    }
+}
+
+document.getElementById('tdr-pending-refresh-btn').addEventListener('click', refreshTdrPending);
+document.getElementById('tdr-reresolve-all-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('tdr-reresolve-all-btn');
+    const statusEl = document.getElementById('tdr-pending-status');
+    btn.disabled = true;
+    statusEl.textContent = 'Re-resolving all pending flights…';
+    statusEl.className = 'status-text working';
+    try {
+        const res = await api('/v1/admin/tdr/reresolve', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'failed');
+        statusEl.textContent = `Done — ${data.now_confirmed}/${data.targeted} now confirmed, ${data.errors} error(s)`;
+        statusEl.className = 'status-text ok';
+        refreshTdrPending();
+        refreshStatus();
+    } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        statusEl.className = 'status-text err';
+    } finally {
+        btn.disabled = false;
+    }
 });
 
 // ── Database viewer — browse storms/recon MET by year -> storm ─────────

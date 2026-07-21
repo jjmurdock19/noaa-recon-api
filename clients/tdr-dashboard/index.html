@@ -249,6 +249,7 @@
 
   <div id="plot-area">
     <div id="status"></div>
+    <div id="data-disclaimer" style="display:none"></div>
     <div id="info-bar" style="display:none"></div>
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
     <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
@@ -483,6 +484,7 @@ function legWindowFor(unixTime) {
 
 async function loadMissionFiles(missionId) {
   $('fs-product').style.display = 'none';
+  $('data-disclaimer').style.display = 'none';
   // A new mission means any previously loaded satellite basemap / flight
   // track is for the wrong storm/time — drop it rather than leaving a
   // stale control visible.
@@ -583,6 +585,45 @@ function currentView() { return $('sel-view').value; }
 
 function isVolumeCapableProduct(product) { return product === 'xy' || product.startsWith('xy_'); }
 
+// ── Data-level disclaimer banner ──────────────────────────────────────────
+// Copy is grounded in the AOML TDR dataset README: Level 1b is generated
+// onboard by automated QC/synthesis and archived as-is (no human review);
+// Level 2 is reprocessed on the ground post-season and individually inspected.
+// Shown above the plot and swapped whenever the selected source level changes,
+// so a user always sees the QC state of the data they're actually looking at.
+const TDR_README_URL = 'https://www.aoml.noaa.gov/wp-content/uploads/2023/04/README_radar_dataset.pdf';
+const TDR_HRD_URL = 'https://www.aoml.noaa.gov/our-research/hurricane-research-division/real-time-doppler-radar/';
+const TDR_POLICY_URL = 'https://www.aoml.noaa.gov/wp-content/uploads/2021/06/Guide-to-AOML_HRD-Data-Accessibility.pdf';
+const DATA_LEVEL_INFO = {
+  '1b': {
+    label: 'Level 1b — real-time, automated QC only (not human-reviewed)',
+    accent: '#b26a00',
+    bg: 'rgba(178,106,0,0.10)',
+    body: 'Generated onboard the aircraft during the flight by automated quality-control and wind-synthesis software, then transmitted to the ground and archived as-is with no human review. Provisional and intended for situational awareness — NOAA/HRD strongly advises performing your own quality control before research use. Not an official forecast product.',
+  },
+  '2': {
+    label: 'Level 2 — post-season, quality-controlled (research-grade)',
+    accent: '#2e7d32',
+    bg: 'rgba(46,125,50,0.10)',
+    body: 'Reprocessed on the ground after the hurricane season and individually inspected by NOAA/HRD to meet basic standards for research use. Departures from the real-time (Level 1b) settings are documented, and some flagged analyses should not be used. Recommended for research; still review the data-use policy and apply your own QC as needed.',
+  },
+};
+
+function updateDataDisclaimer() {
+  const el = $('data-disclaimer');
+  const sel = $('sel-level');
+  const info = sel ? DATA_LEVEL_INFO[sel.value] : null;
+  if (!info) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  el.innerHTML = `<div style="border:1px solid ${info.accent}; border-left:4px solid ${info.accent}; background:${info.bg}; border-radius:4px; padding:8px 12px; margin-bottom:8px; font-size:12px; line-height:1.5; color:var(--text);">`
+    + `<div style="font-weight:600; color:${info.accent}; margin-bottom:2px;">${info.label}</div>`
+    + `<div style="color:var(--text-muted);">${info.body}</div>`
+    + `<div style="margin-top:5px;">Further reading: `
+    + `<a href="${TDR_README_URL}" target="_blank" rel="noopener">dataset README (PDF)</a> · `
+    + `<a href="${TDR_HRD_URL}" target="_blank" rel="noopener">HRD Real-Time Doppler Radar</a> · `
+    + `<a href="${TDR_POLICY_URL}" target="_blank" rel="noopener">data-use policy</a></div></div>`;
+}
+
 function populateLevels() {
   const levels = distinct(missionFiles.map(f => f.level)).sort(); // "1b" < "2"
   const selLevel = $('sel-level');
@@ -602,6 +643,7 @@ function populateProducts() {
   // `xy` is by far the most commonly used product — default to it instead
   // of whatever sorts first alphabetically (vert_inbound, otherwise).
   if (products.includes('xy')) selProduct.value = 'xy';
+  updateDataDisclaimer();
   populateTimes();
 }
 

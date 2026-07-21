@@ -34,6 +34,18 @@ CREATE TABLE IF NOT EXISTS missions (
     storm_id    TEXT,
     has_level1b INTEGER NOT NULL DEFAULT 0,
     has_level2  INTEGER NOT NULL DEFAULT 0,
+    -- Where storm_name currently came from, and whether that source is
+    -- confirmed. Rank low->high: 'unknown' < 'jobfile' < 'level2' < 'recon'.
+    -- 'jobfile' is the storm name lifted from the Level 1b mission dir's own
+    -- `*_jobfile.tar.gz` (see tdr_ingest.rs) — a real name, but only
+    -- *provisional* until the recon MET archive (which lands later) confirms
+    -- the storm by track-matching, or a Level 2 (post-season) copy appears.
+    storm_source TEXT NOT NULL DEFAULT 'unknown',
+    -- 1 = radar is indexed but storm attribution is NOT yet confirmed by the
+    -- recon MET archive or a Level 2 path (i.e. storm_source is 'unknown' or
+    -- 'jobfile'). Pending missions are the ones a re-crawl keeps re-resolving
+    -- so they self-heal once recon data uploads — see tdr_ingest.rs.
+    pending     INTEGER NOT NULL DEFAULT 0,
     fetched_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tdr_missions_year ON missions(year);
@@ -81,6 +93,8 @@ pub struct Mission {
     pub storm_id: Option<String>,
     pub has_level1b: bool,
     pub has_level2: bool,
+    pub storm_source: String,
+    pub pending: bool,
 }
 
 impl Mission {
@@ -94,6 +108,8 @@ impl Mission {
             storm_id: row.get("storm_id")?,
             has_level1b: row.get::<_, i64>("has_level1b")? != 0,
             has_level2: row.get::<_, i64>("has_level2")? != 0,
+            storm_source: row.get("storm_source")?,
+            pending: row.get::<_, i64>("pending")? != 0,
         })
     }
 }
@@ -153,7 +169,24 @@ pub fn get_connection(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Additive column migrations for DBs created before `storm_source`/`pending`
+/// existed (`CREATE TABLE IF NOT EXISTS` never alters an existing table). A
+/// duplicate-column error just means the migration already ran, so it's
+/// swallowed. Back-fills `pending` for rows already sitting at 'Unknown' so
+/// the self-healing re-crawl (see tdr_ingest.rs) picks them up on the next run.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let _ = conn.execute("ALTER TABLE missions ADD COLUMN storm_source TEXT NOT NULL DEFAULT 'unknown'", []);
+    let _ = conn.execute("ALTER TABLE missions ADD COLUMN pending INTEGER NOT NULL DEFAULT 0", []);
+    conn.execute(
+        "UPDATE missions SET pending = 1, storm_source = 'unknown' \
+         WHERE storm_name = 'Unknown' AND pending = 0",
+        [],
+    )?;
+    Ok(())
 }
 
 pub fn list_years(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
@@ -192,6 +225,20 @@ pub fn list_missions_for_storm(
 pub fn get_mission(conn: &Connection, mission_id: &str) -> rusqlite::Result<Option<Mission>> {
     conn.query_row("SELECT * FROM missions WHERE mission_id = ?1", [mission_id], Mission::from_row)
         .optional()
+}
+
+/// Missions whose storm attribution isn't confirmed yet — radar is indexed but
+/// the recon MET archive (or a Level 2 path) hasn't pinned the storm, so the
+/// name is still 'Unknown' or a provisional jobfile guess. This is what the
+/// admin console lists so an operator can see (and re-resolve) flights that
+/// arrived before their recon data — see tdr_ingest::reresolve_missions.
+pub fn list_pending(conn: &Connection) -> rusqlite::Result<Vec<Mission>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM missions WHERE pending = 1 OR storm_name = 'Unknown' \
+         ORDER BY year DESC, mission_id",
+    )?;
+    let rows = stmt.query_map([], Mission::from_row)?;
+    rows.collect()
 }
 
 pub fn get_mission_files(conn: &Connection, mission_id: &str) -> rusqlite::Result<Vec<FileRecord>> {

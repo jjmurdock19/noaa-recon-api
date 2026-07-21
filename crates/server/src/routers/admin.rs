@@ -40,6 +40,11 @@ pub fn router() -> Router<AppState> {
         .route("/admin/self-update/check", post(self_update_check))
         .route("/admin/self-update/apply", post(self_update_apply).get(self_update_job))
         .route("/admin/archive-update/:archive", post(start_archive_update).get(get_archive_update))
+        // TDR storm re-resolution: list flights whose storm isn't confirmed
+        // yet, re-resolve them all, or pull one flight's recon data + re-resolve.
+        .route("/admin/tdr/pending", get(tdr_pending))
+        .route("/admin/tdr/reresolve", post(tdr_reresolve_pending))
+        .route("/admin/tdr/mission/:mission_id/reresolve", post(tdr_reresolve_mission))
         // Bulk prefetch depends on a piece not ported to Rust yet:
         .route("/admin/prefetch", post(not_ported).get(not_ported))
 }
@@ -490,6 +495,85 @@ async fn get_archive_update(
         .job(&archive)
         .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
     Ok(Json(job))
+}
+
+// ── TDR storm re-resolution ───────────────────────────────────────────────────
+// Recovers flights whose radar arrived before their recon MET data, so the TDR
+// archiver had filed them as "Unknown" / a provisional jobfile guess. See
+// services/tdr_ingest.rs (self-healing crawl) and services/tdr.rs (the
+// `pending` flag). All three are moderator-or-superuser (require_login), same
+// trust level as the archive-update buttons.
+
+/// Flights whose storm attribution isn't confirmed yet — the console's
+/// "pending TDR missions" table.
+async fn tdr_pending(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let rows = tdr::list_pending(&conn)?;
+    let missions: Vec<Value> = rows
+        .iter()
+        .map(|m| {
+            json!({
+                "mission_id": m.mission_id,
+                "year": m.year,
+                "aircraft": m.aircraft,
+                "storm_name": m.storm_name,
+                "storm_id": m.storm_id,
+                "storm_source": m.storm_source,
+                "pending": m.pending,
+                "has_level1b": m.has_level1b,
+                "has_level2": m.has_level2,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "count": missions.len(), "missions": missions })))
+}
+
+/// Re-resolve every pending/Unknown flight against current data (recon DB +
+/// jobfile). Run "Force update: Recon MET" first if the recon data itself is
+/// what was missing — this pass doesn't re-crawl the recon archive.
+async fn tdr_reresolve_pending(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    let tdr_db = state.paths.tdr_db.clone();
+    let recon_db = state.paths.recon_met_db.clone();
+    // Both ingest fns hold non-Send rusqlite connections across .await, so drive
+    // the future on a blocking thread (same pattern as archive_update::start).
+    let res = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current()
+            .block_on(crate::services::tdr_ingest::reresolve_missions(&tdr_db, &recon_db, None))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("re-resolve task panicked: {e}")))?
+    .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    Ok(Json(res))
+}
+
+/// Pull one flight's recon MET data (in case it uploaded after the radar) and
+/// re-resolve its TDR storm from the refreshed data. The per-flight "update
+/// this mission's recon data" button.
+async fn tdr_reresolve_mission(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Path(mission_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    auth::require_login(&jar)?;
+    let tdr_db = state.paths.tdr_db.clone();
+    let recon_db = state.paths.recon_met_db.clone();
+    let storms_db = state.paths.storms_db.clone();
+    let mid = mission_id.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(async move {
+            let recon =
+                crate::services::recon_ingest::reingest_mission(&recon_db, &storms_db, &mid).await?;
+            let tdr = crate::services::tdr_ingest::reresolve_missions(&tdr_db, &recon_db, Some(vec![mid.clone()]))
+                .await?;
+            Ok::<Value, anyhow::Error>(json!({ "recon": recon, "tdr": tdr }))
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("re-resolve task panicked: {e}")))?
+    .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
+    Ok(Json(res))
 }
 
 // ── Not-yet-ported jobs ───────────────────────────────────────────────────────
