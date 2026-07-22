@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/tdr/volume", get(get_volume))
         .route("/tdr/composite", get(get_composite))
         .route("/tdr/plane_slice", get(get_plane_slice))
+        .route("/tdr/centers", get(get_centers))
         .route("/tdr/:year", get(list_storms_for_year))
         .route("/tdr/:year/*storm_name", get(list_missions_for_storm))
 }
@@ -696,5 +697,114 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
         "units": cs.units,
         "origin_lat": volume.origin_lat,
         "origin_lon": volume.origin_lon,
+    })))
+}
+
+#[derive(Deserialize)]
+struct CentersQuery {
+    mission_id: String,
+    /// `"1b"` or `"2"` — same default rule as `SweepQuery::level`.
+    level: Option<String>,
+    /// `xy` or `xy_rel` — the center is derived from the wind volume, so a
+    /// vertical profile (no level axis) isn't valid. Defaults to `xy`.
+    product: Option<String>,
+    analysis_time: String,
+    /// Annulus (km) the azimuthal-mean tangential wind is evaluated over —
+    /// should bracket the radius of maximum wind. Default 2–50 km.
+    rmin_km: Option<f32>,
+    rmax_km: Option<f32>,
+    /// How far (km) from the grid origin the search may wander. Default 50.
+    max_offset_km: Option<f32>,
+    /// A level whose best azimuthal-mean tangential wind is below this (m/s)
+    /// is reported center-less. Default 3.
+    min_tangential_wind_ms: Option<f32>,
+    /// Level-to-level continuity radius (km): each level is searched within
+    /// this distance of the neighbouring level's accepted center. Default 12.
+    continuity_km: Option<f32>,
+}
+
+/// `GET /v1/tdr/centers` — the TDR-derived storm center at *each* CAPPI
+/// altitude for one analysis time. The gridded synthesis only stores one
+/// `ORIGIN_LATITUDE/LONGITUDE` for the whole volume, but a real vortex tilts
+/// with height, so this recomputes the center level-by-level from the analysis
+/// `U`/`V` wind field: at each level, the point that maximizes the azimuthal-
+/// mean tangential wind — the most symmetric cyclonic circulation, HRD's
+/// center criterion (see [`noaa_recon_core::sweep::tangential_wind_centers`]).
+/// Returns `[{level_km, lat, lon, x_km, y_km, tangential_wind_ms, rmw_km}]`,
+/// center fields `null` at levels with no coherent circulation.
+async fn get_centers(State(state): State<AppState>, Query(q): Query<CentersQuery>) -> ApiResult<Json<Value>> {
+    let product = q.product.clone().unwrap_or_else(|| "xy".into());
+    let conn = tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db)?;
+    let (mission, file, level) =
+        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &product, &q.analysis_time)?;
+    drop(conn);
+
+    let cache_dir = state.paths.cache_root.join("tdr_nc");
+    let cache_key = format!("{}_{level}_{}_{}", q.mission_id, product, q.analysis_time);
+    let nc_path = tdr_nc::fetch_and_cache(&cache_dir, &file.source_url, &cache_key)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
+
+    let params = noaa_recon_core::sweep::CenterParams {
+        rmin_km: q.rmin_km.unwrap_or(2.0),
+        rmax_km: q.rmax_km.unwrap_or(50.0),
+        max_offset_km: q.max_offset_km.unwrap_or(50.0),
+        min_vtan_ms: q.min_tangential_wind_ms.unwrap_or(3.0),
+        min_points: 30,
+        continuity_km: q.continuity_km.unwrap_or(12.0),
+    };
+
+    // Read both wind volumes and locate the centers off-thread (netCDF decode +
+    // the per-level search are blocking, non-Send work).
+    let (centers, origin_lat, origin_lon, storm_attr) = tokio::task::spawn_blocking(move || {
+        let u = tdr_nc::read_xy_volume(&nc_path, "u")?;
+        let v = tdr_nc::read_xy_volume(&nc_path, "v")?;
+        let centers =
+            noaa_recon_core::sweep::tangential_wind_centers(&u.data, &v.data, &u.x, &u.y, &u.levels, &params);
+        Ok::<_, anyhow::Error>((centers, u.origin_lat, u.origin_lon, u.storm_name_attr))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("center-finding task panicked: {e}")))?
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let centers_json: Vec<Value> = centers
+        .iter()
+        .map(|c| {
+            let (lat, lon) = match (c.x_km, c.y_km, origin_lat, origin_lon) {
+                (Some(x), Some(y), Some(la), Some(lo)) => {
+                    let (lat, lon) = noaa_recon_core::sweep::latlon_from_offset_km(x, y, la, lo);
+                    (Some(lat), Some(lon))
+                }
+                _ => (None, None),
+            };
+            json!({
+                "level_km": c.level_km,
+                "lat": lat,
+                "lon": lon,
+                "x_km": c.x_km,
+                "y_km": c.y_km,
+                "tangential_wind_ms": c.vtan_ms,
+                "rmw_km": c.rmw_km,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "mission_id": mission.mission_id,
+        "storm_name": storm_attr.unwrap_or(mission.storm_name),
+        "product": product,
+        "level": level,
+        "analysis_time": q.analysis_time,
+        "method": "per-level center maximizing azimuthal-mean tangential wind (from U/V)",
+        "origin_lat": origin_lat,
+        "origin_lon": origin_lon,
+        "params": {
+            "rmin_km": params.rmin_km,
+            "rmax_km": params.rmax_km,
+            "max_offset_km": params.max_offset_km,
+            "min_tangential_wind_ms": params.min_vtan_ms,
+            "continuity_km": params.continuity_km,
+        },
+        "centers": centers_json,
     })))
 }

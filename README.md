@@ -202,6 +202,58 @@ volumetric rendering, `GET /v1/tdr/composite` flattens a mission into one
 altitude- or time-mosaicked image, and `GET /v1/tdr/plane_slice` cuts an
 arbitrary vertical cross-section through a volume.
 
+### TDR-derived storm centers (`GET /v1/tdr/centers`)
+
+The gridded TDR synthesis stores a **single** storm center for the whole
+volume — the `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE` global attributes the km grid
+was built around. But a real tropical cyclone's circulation center **tilts with
+height**, so a single origin can't describe it. `GET /v1/tdr/centers` derives
+the center *per CAPPI altitude* from the analysis wind field, returning one
+`{level_km, lat, lon, x_km, y_km, tangential_wind_ms, rmw_km}` per level (center
+fields `null` where no coherent center was found).
+
+**Criterion (HRD-style).** At each level the storm center is the point that
+maximizes the azimuthal-mean **tangential** wind computed from the `U`/`V`
+components over an annulus (default 2–50 km) — i.e. the most symmetric cyclonic
+circulation. An off-center guess folds radial flow into the tangential average
+and lowers it, so the maximizing point is the circulation center. The tangential
+component about a candidate `(cx, cy)` is `(V·dx − U·dy)/r`, positive for
+NH-cyclonic (counter-clockwise) rotation. The search is a deterministic
+coarse-to-fine grid refinement down to ~100 m; the radius of maximum wind
+(`rmw_km`) is the radius bin where that azimuthal-mean tangential wind peaks.
+
+**Continuity + robustness.** Fitting each level independently lets a weak layer
+lock onto an outer rainband's rotation, so the derivation is two-stage:
+
+1. Fit every level independently over the full search domain, discarding
+   **edge-pinned** fits — a center jammed against the `±max_offset_km` search
+   boundary (it wanted to drift further), or an `rmw` pinned at the outer
+   annulus edge (the annulus never contained the wind maximum, so the "vortex"
+   is really large-scale flow). The surviving level with the strongest symmetric
+   tangential wind is the **anchor** — the height where the circulation is best
+   defined.
+2. Propagate outward from the anchor (up, then down), re-fitting each level only
+   within `continuity_km` (default 12 km) of the neighbour just accepted, so the
+   center track follows the vortex's smooth tilt instead of hopping. A level
+   whose constrained fit is weak or still edge-pinned comes back center-less, but
+   the last good center keeps seeding the next level so one data-poor layer
+   doesn't break the chain.
+
+If no level yields a trustworthy anchor — a weak or disorganized storm — every
+level comes back center-less **by design**, rather than publishing noise.
+Validated against Hurricane Sam (2021): a tight, continuously-tilting center
+track with a compact ~13–15 km RMW and ~40 m/s low-level tangential winds
+weakening with height; the same defaults on a weak, disorganized system return
+only a sparse handful of centers.
+
+**Tuning** (all optional query params): `rmin_km`/`rmax_km` (annulus, bracket
+the RMW), `max_offset_km` (how far from the grid origin to search),
+`min_tangential_wind_ms` (below which a level is center-less), and
+`continuity_km` (level-to-level search radius). The center math is pure array
+work in `crates/core/src/sweep.rs` (`tangential_wind_centers`, WASM-safe and
+unit-tested); the endpoint in `routers/tdr.rs` reads the two wind volumes and
+maps each `(x_km, y_km)` offset back to lat/lon via the file's origin.
+
 ## Sources
 
 All data served by this API is fetched and cached from publicly-accessible NOAA data sources. Exact
@@ -410,7 +462,7 @@ flowchart LR
 
     subgraph "noaa-recon-api (Rust / axum)"
         D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
-        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep, /v1/tdr/volume<br/>/v1/tdr/composite, /v1/tdr/plane_slice"]
+        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep, /v1/tdr/volume<br/>/v1/tdr/composite, /v1/tdr/plane_slice<br/>/v1/tdr/centers"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
         H["crates/server services/goes.rs<br/>(decode + S3 fetch)"]
@@ -820,14 +872,17 @@ crates/
                                    (paint_project, "Real bugs" #3), NaN gap-fill, NaN-aware smoothing,
                                    colorize -> RGBA. render_full_disk()/render_bbox() are the two
                                    entry points; the server calls these with an already-decoded array.
-      sweep.rs                       TDR slicing for GET /v1/tdr/sweep|volume|composite|plane_slice:
+      sweep.rs                       TDR slicing for GET /v1/tdr/sweep|volume|composite|plane_slice|centers:
                                    cappi_slice() (one x/y plane from a flattened x,y,level,time array),
                                    vertical_profile_slice() (the radius/height plane from a vert_* file),
                                    colorscale_for_field() (dBZ / wind-speed / diverging-wind defaults),
                                    latlon_offset_km()/geo_mosaic()/combine_mode_for_field() (storm-center
                                    alignment + max/mean cell-combine for composite's mode=time/
-                                   time_volume), and plane_slice() (bilinear cross-section along an
-                                   arbitrary line through a volume, for GET /v1/tdr/plane_slice). Pure
+                                   time_volume), plane_slice() (bilinear cross-section along an
+                                   arbitrary line through a volume, for GET /v1/tdr/plane_slice), and
+                                   tangential_wind_centers() (per-altitude storm center = point maximizing
+                                   azimuthal-mean tangential wind, anchor + continuity propagation, for
+                                   GET /v1/tdr/centers — see "TDR-derived storm centers" above). Pure
                                    index math + a lookup table, no I/O — tdr_nc.rs in the server crate
                                    does the netCDF decode and hands it a flat array.
   server/                       noaa-recon-api — the axum binary; every native/C dependency lives here
