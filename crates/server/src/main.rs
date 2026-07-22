@@ -75,6 +75,14 @@ async fn main() -> anyhow::Result<()> {
     let cookie_key = auth::derive_cookie_key(&creds.secret_key);
     let state = AppState::new(paths, cookie_key);
 
+    // TDR read connections open the index read-only and never run DDL, so the
+    // schema (and the one-time rebuild off the old storm_name/storm_source/
+    // pending layout) must be applied up front here — before any handler opens
+    // a read connection. init_db is the sole owner of the TDR schema now.
+    if let Err(e) = services::tdr::init_db(&state.paths.tdr_db) {
+        tracing::warn!("TDR DB init/migration failed: {e}");
+    }
+
     // One-time: seed the first superuser from admin_credentials.json if the
     // tokens table is empty (main.py's _migrate_legacy_admin startup hook).
     if let Ok(conn) = services::tokens::get_connection(&state.paths.auth_db) {
@@ -247,7 +255,7 @@ async fn cmd_ingest_tdr(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         }
     }
     println!("Ingesting TDR archive (crawl Level 1b + Level 2, build local index)...");
-    let summary = services::tdr_ingest::run_ingest(&paths.tdr_db, &paths.recon_met_db, years, force).await?;
+    let summary = services::tdr_ingest::run_ingest(&paths.tdr_db, years, force).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }

@@ -149,9 +149,8 @@ pub fn start(
         "tdr" => {
             let state = state.clone();
             let tdr_db = paths.tdr_db.clone();
-            let recon_db = paths.recon_met_db.clone();
             tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current().block_on(run_tdr(state, tdr_db, recon_db, years));
+                tokio::runtime::Handle::current().block_on(run_tdr(state, tdr_db, years));
             });
         }
         _ => unreachable!(),
@@ -176,8 +175,8 @@ async fn run_recon(state: Arc<ArchiveUpdateState>, recon_db: PathBuf, storms_db:
 /// an explicit `years` (from the console's backfill control) reaches further
 /// back, same as `ingest-tdr --years`. `force` is always `false` here —
 /// still just "run it now", not "reprocess everything already indexed".
-async fn run_tdr(state: Arc<ArchiveUpdateState>, tdr_db: PathBuf, recon_db: PathBuf, years: Option<Vec<i64>>) {
-    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, &recon_db, years, false)
+async fn run_tdr(state: Arc<ArchiveUpdateState>, tdr_db: PathBuf, years: Option<Vec<i64>>) {
+    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, years, false)
         .await
         .map_err(|e| e.to_string());
     state.finish("tdr", result);

@@ -600,9 +600,13 @@ different hosts and QC lineage:
 A mission can appear at either level, both, or (rarely) neither yet.
 `mission_id` (`YYYYMMDDAI`) uses the exact same scheme as the recon MET
 archive's mission IDs — see "Recon MET archive" above — so storm-name
-resolution piggybacks on whatever that archive already reconciled for the
-same ID rather than re-deriving it from scratch; a Level 2 directory name is
-the fallback, then "Unknown".
+resolution is done **live at read time** by looking the mission ID up in the
+recon MET index, not stored as an association. Recon's storm name wins; if the
+mission isn't in the recon index yet, the ingest-time label (the Level 2
+directory name, or the Level 1b jobfile's storm name) is the fallback, then
+"Unknown". Because it's recomputed per request, a TDR flight that lands before
+its recon data self-resolves the moment recon ingest catches up — no backfill
+step.
 
 This phase only indexes file **metadata** (mission → product → source URL)
 — it never downloads a netCDF file. Actual decode/slice rendering
@@ -611,7 +615,7 @@ This phase only indexes file **metadata** (mission → product → source URL)
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/tdr/years` | Every year with at least one indexed TDR mission. |
-| `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. Missions not yet reconciled to a storm are grouped under `storm_name: "Unknown"`. |
+| `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. `storm_name` is resolved live from the recon index by mission ID; missions not found there fall back to their ingest-time label, or are grouped under `storm_name: "Unknown"` if there's none. |
 | `GET /v1/tdr/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, has_level1b, has_level2}[]`. |
 | `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., file_count, files: [{level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}]}`. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). |
 

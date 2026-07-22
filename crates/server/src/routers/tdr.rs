@@ -32,7 +32,9 @@ pub fn router() -> Router<AppState> {
 }
 
 fn conn(state: &AppState) -> ApiResult<rusqlite::Connection> {
-    Ok(tdr::get_connection(&state.paths.tdr_db)?)
+    // Read connection: opens tdr.sqlite and ATTACHes the recon index so storm
+    // identity resolves live in the mission queries — see tdr::get_connection.
+    Ok(tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db)?)
 }
 
 async fn list_years(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -165,7 +167,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
         )));
     }
 
-    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let conn = conn(&state)?;
     let mission = tdr::get_mission(&conn, &q.mission_id)?
         .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {}", q.mission_id)))?;
     let level = q.level.unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
@@ -258,7 +260,7 @@ fn resolve_mission_and_file(
 }
 
 async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>) -> ApiResult<Json<Value>> {
-    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let conn = conn(&state)?;
     let (mission, file, level) =
         resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time)?;
 
@@ -350,7 +352,7 @@ struct CompositeQuery {
 ///   from one analysis time shouldn't dominate the composite) — never a
 ///   last-write-wins overlay.
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
-    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let conn = conn(&state)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
 
     if q.mode == "time_volume" {
@@ -644,7 +646,7 @@ struct PlaneSliceQuery {
 /// smooth regardless of the line's angle through the grid — not just
 /// snapped to the nearest existing column.
 async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSliceQuery>) -> ApiResult<Json<Value>> {
-    let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    let conn = conn(&state)?;
     let (mission, file, level) =
         resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time)?;
 

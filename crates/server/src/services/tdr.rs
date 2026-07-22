@@ -3,9 +3,10 @@
 //! Schema note: TDR `mission_id`s (`YYYYMMDDAI`) use the *exact same* scheme as
 //! the recon MET archive (see recon_met.rs) — same year/date/aircraft-letter/
 //! flight-sequence convention, confirmed against a live crawl of both hosts.
-//! That means storm-name resolution for TDR can piggyback on whatever
-//! `recon_met.missions` already knows for the same `mission_id`, rather than
-//! re-running PDF/netCDF reconciliation from scratch — see `tdr_ingest.rs`.
+//! That means storm identity for TDR is resolved *live at read time* by LEFT
+//! JOINing `recon.missions` on the shared `mission_id`, rather than storing a
+//! denormalized name and re-crawling to reconcile it — see `get_connection`
+//! (which ATTACHes the recon DB) and `tdr_ingest.rs`.
 //!
 //! Two source levels, same file-naming convention, different hosts and QC
 //! lineage (see the AOML TDR README this was built against):
@@ -30,26 +31,19 @@ CREATE TABLE IF NOT EXISTS missions (
     year        INTEGER NOT NULL,
     aircraft    TEXT,
     tail_num    TEXT,
-    storm_name  TEXT NOT NULL,
+    -- Ingest-time storm-name *fallback* only — the jobfile name (Level 1b) or
+    -- path slug (Level 2) captured at crawl time. Storm identity served to
+    -- callers is resolved live from the attached recon index (see
+    -- `get_connection`); this is what a read falls back to when recon has no
+    -- row for the mission yet. No `storm_source`/`pending` reconciliation
+    -- machine exists anymore — the join *is* the reconciliation.
+    storm_label TEXT,
     storm_id    TEXT,
     has_level1b INTEGER NOT NULL DEFAULT 0,
     has_level2  INTEGER NOT NULL DEFAULT 0,
-    -- Where storm_name currently came from, and whether that source is
-    -- confirmed. Rank low->high: 'unknown' < 'jobfile' < 'level2' < 'recon'.
-    -- 'jobfile' is the storm name lifted from the Level 1b mission dir's own
-    -- `*_jobfile.tar.gz` (see tdr_ingest.rs) — a real name, but only
-    -- *provisional* until the recon MET archive (which lands later) confirms
-    -- the storm by track-matching, or a Level 2 (post-season) copy appears.
-    storm_source TEXT NOT NULL DEFAULT 'unknown',
-    -- 1 = radar is indexed but storm attribution is NOT yet confirmed by the
-    -- recon MET archive or a Level 2 path (i.e. storm_source is 'unknown' or
-    -- 'jobfile'). Pending missions are the ones a re-crawl keeps re-resolving
-    -- so they self-heal once recon data uploads — see tdr_ingest.rs.
-    pending     INTEGER NOT NULL DEFAULT 0,
     fetched_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tdr_missions_year ON missions(year);
-CREATE INDEX IF NOT EXISTS idx_tdr_missions_year_storm ON missions(year, storm_name);
 
 CREATE TABLE IF NOT EXISTS files (
     id                 INTEGER PRIMARY KEY,
@@ -89,12 +83,13 @@ pub struct Mission {
     pub year: i64,
     pub aircraft: Option<String>,
     pub tail_num: Option<String>,
+    /// Resolved storm name — `COALESCE(recon.storm_name, storm_label, 'Unknown')`
+    /// produced by the read queries, never a stored column. See `MISSION_SELECT`.
     pub storm_name: String,
+    /// Resolved storm id — `COALESCE(recon.storm_id, storm_id)`.
     pub storm_id: Option<String>,
     pub has_level1b: bool,
     pub has_level2: bool,
-    pub storm_source: String,
-    pub pending: bool,
 }
 
 impl Mission {
@@ -108,8 +103,6 @@ impl Mission {
             storm_id: row.get("storm_id")?,
             has_level1b: row.get::<_, i64>("has_level1b")? != 0,
             has_level2: row.get::<_, i64>("has_level2")? != 0,
-            storm_source: row.get("storm_source")?,
-            pending: row.get::<_, i64>("pending")? != 0,
         })
     }
 }
@@ -165,29 +158,108 @@ impl LegRecord {
     }
 }
 
-pub fn get_connection(db_path: &Path) -> rusqlite::Result<Connection> {
+/// The WRITE path (startup init + ingest). Opens `db_path`, turns foreign keys
+/// on, applies the current `SCHEMA`, and runs the one-time table rebuild for
+/// pre-change DBs (`storm_name`/`storm_source`/`pending` → `storm_label`). This
+/// is the only place the schema is created/migrated — read connections
+/// deliberately never touch DDL, so `init_db` must run at startup before any
+/// `get_connection` opens.
+pub fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
-    migrate(&conn)?;
+    migrate_rebuild(&conn)?;
     Ok(conn)
 }
 
-/// Additive column migrations for DBs created before `storm_source`/`pending`
-/// existed (`CREATE TABLE IF NOT EXISTS` never alters an existing table). A
-/// duplicate-column error just means the migration already ran, so it's
-/// swallowed. Back-fills `pending` for rows already sitting at 'Unknown' so
-/// the self-healing re-crawl (see tdr_ingest.rs) picks them up on the next run.
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    let _ = conn.execute("ALTER TABLE missions ADD COLUMN storm_source TEXT NOT NULL DEFAULT 'unknown'", []);
-    let _ = conn.execute("ALTER TABLE missions ADD COLUMN pending INTEGER NOT NULL DEFAULT 0", []);
-    conn.execute(
-        "UPDATE missions SET pending = 1, storm_source = 'unknown' \
-         WHERE storm_name = 'Unknown' AND pending = 0",
-        [],
-    )?;
-    Ok(())
+/// The READ path used by every handler. Opens `tdr_db` read-only and ATTACHes
+/// the recon index as `recon` so storm identity can be resolved live in a LEFT
+/// JOIN (see `MISSION_SELECT`) — the whole point of dropping the stored
+/// association. It runs no DDL/migration/UPDATE and is set `query_only` so it
+/// can never write either database.
+///
+/// Dependency: this assumes `recon.missions` exists (it's created and populated
+/// by recon ingest and is always present in `data/recon_met.sqlite`). SQLite
+/// creates/opens the file on ATTACH, and the LEFT JOIN degrades gracefully — a
+/// missing recon row for a mission just yields NULLs that COALESCE down to
+/// `storm_label`/'Unknown' — but the `recon.missions` *table* must exist for
+/// the join to parse, which it does in this repo.
+pub fn get_connection(tdr_db: &Path, recon_db: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(tdr_db)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Path as a bound string (lossy is fine — these are ASCII repo paths).
+    let recon_str = recon_db.to_string_lossy();
+    conn.execute("ATTACH DATABASE ?1 AS recon", [recon_str.as_ref()])?;
+    // Belt-and-braces: this connection must never mutate either DB.
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
 }
+
+/// One-time rebuild of the `missions` table for DBs created under the old
+/// schema (denormalized `storm_name` + the `storm_source`/`pending`
+/// reconciliation columns). The index is fully re-crawlable, so rather than a
+/// column-by-column dance we detect any old marker column via
+/// `PRAGMA table_info` and, if present, do SQLite's recommended table rebuild:
+/// copy into a fresh table on the new schema (folding the old `storm_name` into
+/// `storm_label`, dropping the sentinel 'Unknown'), drop the old table, rename.
+/// Foreign keys are turned off around the rebuild per SQLite's guidance (the
+/// `files`/`legs` FKs reference `missions(mission_id)`), then back on. A fresh
+/// DB created straight from `SCHEMA` has no marker column and is left untouched.
+fn migrate_rebuild(conn: &Connection) -> rusqlite::Result<()> {
+    let needs_rebuild = {
+        let mut stmt = conn.prepare("PRAGMA table_info(missions)")?;
+        let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+        cols.iter().any(|c| c == "storm_name" || c == "storm_source" || c == "pending")
+    };
+    if !needs_rebuild {
+        return Ok(());
+    }
+
+    // FK enforcement can't change inside a transaction, so toggle it outside.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let res = conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE missions_new (
+             mission_id  TEXT PRIMARY KEY,
+             year        INTEGER NOT NULL,
+             aircraft    TEXT,
+             tail_num    TEXT,
+             storm_label TEXT,
+             storm_id    TEXT,
+             has_level1b INTEGER NOT NULL DEFAULT 0,
+             has_level2  INTEGER NOT NULL DEFAULT 0,
+             fetched_at  INTEGER NOT NULL
+         );
+         INSERT INTO missions_new
+             (mission_id, year, aircraft, tail_num, storm_label, storm_id, has_level1b, has_level2, fetched_at)
+         SELECT mission_id, year, aircraft, tail_num, NULLIF(storm_name, 'Unknown'), storm_id,
+                has_level1b, has_level2, fetched_at
+         FROM missions;
+         DROP TABLE missions;
+         ALTER TABLE missions_new RENAME TO missions;
+         CREATE INDEX IF NOT EXISTS idx_tdr_missions_year ON missions(year);
+         COMMIT;",
+    );
+    // Restore FK enforcement regardless of outcome; roll back a failed rebuild.
+    if res.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    res
+}
+
+/// The resolved-identity SELECT shared by every mission read. Storm identity is
+/// computed live at read time by LEFT JOINing the ATTACHed recon index on the
+/// shared `mission_id`, falling back to the ingest-time `storm_label`, then
+/// 'Unknown'. Read connections carry `recon` (see `get_connection`); the write
+/// connection never runs these.
+const MISSION_SELECT: &str = "\
+    SELECT t.mission_id, t.year, t.aircraft, t.tail_num, \
+           COALESCE(recon.storm_name, t.storm_label, 'Unknown') AS storm_name, \
+           COALESCE(recon.storm_id, t.storm_id) AS storm_id, \
+           t.has_level1b, t.has_level2 \
+    FROM missions t \
+    LEFT JOIN recon.missions recon ON recon.mission_id = t.mission_id";
 
 pub fn list_years(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
     let mut stmt = conn.prepare("SELECT DISTINCT year FROM missions ORDER BY year")?;
@@ -196,9 +268,16 @@ pub fn list_years(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
 }
 
 pub fn list_storms_for_year(conn: &Connection, year: i64) -> rusqlite::Result<Vec<StormSummary>> {
+    // Group by the *resolved* name (recon → storm_label → 'Unknown'), so two
+    // missions that resolve to the same storm via recon collapse into one row
+    // even if their stored labels differ.
     let mut stmt = conn.prepare(
-        "SELECT storm_name, COUNT(*) AS mission_count, MAX(storm_id) AS storm_id \
-         FROM missions WHERE year = ?1 GROUP BY storm_name ORDER BY storm_name",
+        "SELECT COALESCE(recon.storm_name, t.storm_label, 'Unknown') AS storm_name, \
+                COUNT(*) AS mission_count, \
+                MAX(COALESCE(recon.storm_id, t.storm_id)) AS storm_id \
+         FROM missions t \
+         LEFT JOIN recon.missions recon ON recon.mission_id = t.mission_id \
+         WHERE t.year = ?1 GROUP BY storm_name ORDER BY storm_name",
     )?;
     let rows = stmt.query_map([year], |r| {
         Ok(StormSummary {
@@ -215,30 +294,26 @@ pub fn list_missions_for_storm(
     year: i64,
     storm_name: &str,
 ) -> rusqlite::Result<Vec<Mission>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM missions WHERE year = ?1 AND storm_name = ?2 COLLATE NOCASE ORDER BY mission_id",
-    )?;
+    // Match against the resolved name, not a stored column — mirrors how
+    // `list_storms_for_year` groups, so the storm links there round-trip here.
+    let sql = format!(
+        "{MISSION_SELECT} \
+         WHERE t.year = ?1 \
+           AND COALESCE(recon.storm_name, t.storm_label, 'Unknown') = ?2 COLLATE NOCASE \
+         ORDER BY t.mission_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![year, storm_name], Mission::from_row)?;
     rows.collect()
 }
 
 pub fn get_mission(conn: &Connection, mission_id: &str) -> rusqlite::Result<Option<Mission>> {
-    conn.query_row("SELECT * FROM missions WHERE mission_id = ?1", [mission_id], Mission::from_row)
-        .optional()
-}
-
-/// Missions whose storm attribution isn't confirmed yet — radar is indexed but
-/// the recon MET archive (or a Level 2 path) hasn't pinned the storm, so the
-/// name is still 'Unknown' or a provisional jobfile guess. This is what the
-/// admin console lists so an operator can see (and re-resolve) flights that
-/// arrived before their recon data — see tdr_ingest::reresolve_missions.
-pub fn list_pending(conn: &Connection) -> rusqlite::Result<Vec<Mission>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM missions WHERE pending = 1 OR storm_name = 'Unknown' \
-         ORDER BY year DESC, mission_id",
-    )?;
-    let rows = stmt.query_map([], Mission::from_row)?;
-    rows.collect()
+    conn.query_row(
+        &format!("{MISSION_SELECT} WHERE t.mission_id = ?1"),
+        [mission_id],
+        Mission::from_row,
+    )
+    .optional()
 }
 
 pub fn get_mission_files(conn: &Connection, mission_id: &str) -> rusqlite::Result<Vec<FileRecord>> {

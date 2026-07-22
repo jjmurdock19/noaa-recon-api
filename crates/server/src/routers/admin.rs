@@ -40,11 +40,6 @@ pub fn router() -> Router<AppState> {
         .route("/admin/self-update/check", post(self_update_check))
         .route("/admin/self-update/apply", post(self_update_apply).get(self_update_job))
         .route("/admin/archive-update/:archive", post(start_archive_update).get(get_archive_update))
-        // TDR storm re-resolution: list flights whose storm isn't confirmed
-        // yet, re-resolve them all, or pull one flight's recon data + re-resolve.
-        .route("/admin/tdr/pending", get(tdr_pending))
-        .route("/admin/tdr/reresolve", post(tdr_reresolve_pending))
-        .route("/admin/tdr/mission/:mission_id/reresolve", post(tdr_reresolve_mission))
         // Bulk prefetch depends on a piece not ported to Rust yet:
         .route("/admin/prefetch", post(not_ported).get(not_ported))
 }
@@ -133,37 +128,86 @@ fn file_bytes(p: &FsPath) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Read-only diagnostics for the console. Deliberately fault-tolerant: a single
+/// locked/missing/corrupt database (or an unreadable cache dir) degrades *that*
+/// section to `null` with an `error` string and flips `healthy` to false — it
+/// never 500s the whole endpoint. That matters because a status poll runs while
+/// nightly ingest jobs may be holding a write lock; a transient `SQLITE_BUSY` on
+/// one DB shouldn't blank the entire console. All byte totals come from
+/// `file_bytes`/`dir_stats`, which are infallible (missing path → 0), so the
+/// size cards always render even when a row-count query fails.
 async fn status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
     auth::require_login(&jar)?;
-    let sat = sat_cache(&state)?;
-    let sat_stats = sat.stats();
-    let sat_bytes = sat_stats["bytes"].as_u64().unwrap_or(0);
+    let mut healthy = true;
+
+    // Satellite render cache — degrade to `{ "error": … }` if the cache dir
+    // can't be opened/read.
+    let (satellite, sat_bytes) = match sat_cache(&state) {
+        Ok(cache) => {
+            let stats = cache.stats();
+            let bytes = stats["bytes"].as_u64().unwrap_or(0);
+            (stats, bytes)
+        }
+        Err(e) => {
+            healthy = false;
+            (json!({ "error": e.detail }), 0)
+        }
+    };
     let (nc_count, nc_bytes) = dir_stats(&nc_dir(&state));
     let cache_total = sat_bytes + nc_bytes;
 
-    let storms_conn = storms::get_connection(&state.paths.storms_db)?;
-    let storm_count: i64 = storms_conn.query_row("SELECT COUNT(*) FROM storms", [], |r| r.get(0))?;
-    let recon_conn = recon_met::get_connection(&state.paths.recon_met_db)?;
-    let mission_count: i64 = recon_conn.query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))?;
-    let tdr_conn = tdr::get_connection(&state.paths.tdr_db)?;
-    let tdr_mission_count: i64 = tdr_conn.query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))?;
+    // Each DB section: bytes are always available (file size on disk); the row
+    // count is a query that may fail, in which case the count is `null` and an
+    // `error` is attached rather than propagating a 500.
+    let count_section = |conn: rusqlite::Result<rusqlite::Connection>, sql: &str, bytes: u64, count_key: &str| -> Value {
+        match conn.and_then(|c| c.query_row(sql, [], |r| r.get::<_, i64>(0))) {
+            Ok(n) => json!({ "bytes": bytes, count_key: n }),
+            Err(e) => json!({ "bytes": bytes, count_key: Value::Null, "error": format!("database error: {e}") }),
+        }
+    };
 
     let storms_bytes = file_bytes(&state.paths.storms_db);
     let recon_bytes = file_bytes(&state.paths.recon_met_db);
     let tdr_bytes = file_bytes(&state.paths.tdr_db);
     let db_total = storms_bytes + recon_bytes + tdr_bytes;
 
+    let storms = count_section(
+        storms::get_connection(&state.paths.storms_db),
+        "SELECT COUNT(*) FROM storms",
+        storms_bytes,
+        "storm_count",
+    );
+    let recon_met = count_section(
+        recon_met::get_connection(&state.paths.recon_met_db),
+        "SELECT COUNT(*) FROM missions",
+        recon_bytes,
+        "mission_count",
+    );
+    // TDR read connection attaches the recon DB; a plain COUNT doesn't touch it,
+    // but we go through the same read path so a broken attach surfaces here too.
+    let tdr = count_section(
+        tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db),
+        "SELECT COUNT(*) FROM missions",
+        tdr_bytes,
+        "mission_count",
+    );
+    for section in [&satellite, &storms, &recon_met, &tdr] {
+        if section.get("error").is_some() {
+            healthy = false;
+        }
+    }
+
     Ok(Json(json!({
-        "healthy": true,
+        "healthy": healthy,
         "cache": {
-            "satellite": sat_stats,
+            "satellite": satellite,
             "goes_nc": { "file_count": nc_count, "bytes": nc_bytes },
             "total_bytes": cache_total,
         },
         "databases": {
-            "storms": { "bytes": storms_bytes, "storm_count": storm_count },
-            "recon_met": { "bytes": recon_bytes, "mission_count": mission_count },
-            "tdr": { "bytes": tdr_bytes, "mission_count": tdr_mission_count },
+            "storms": storms,
+            "recon_met": recon_met,
+            "tdr": tdr,
             "total_bytes": db_total,
         },
         "grand_total_bytes": cache_total + db_total,
@@ -495,85 +539,6 @@ async fn get_archive_update(
         .job(&archive)
         .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
     Ok(Json(job))
-}
-
-// ── TDR storm re-resolution ───────────────────────────────────────────────────
-// Recovers flights whose radar arrived before their recon MET data, so the TDR
-// archiver had filed them as "Unknown" / a provisional jobfile guess. See
-// services/tdr_ingest.rs (self-healing crawl) and services/tdr.rs (the
-// `pending` flag). All three are moderator-or-superuser (require_login), same
-// trust level as the archive-update buttons.
-
-/// Flights whose storm attribution isn't confirmed yet — the console's
-/// "pending TDR missions" table.
-async fn tdr_pending(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
-    let conn = tdr::get_connection(&state.paths.tdr_db)?;
-    let rows = tdr::list_pending(&conn)?;
-    let missions: Vec<Value> = rows
-        .iter()
-        .map(|m| {
-            json!({
-                "mission_id": m.mission_id,
-                "year": m.year,
-                "aircraft": m.aircraft,
-                "storm_name": m.storm_name,
-                "storm_id": m.storm_id,
-                "storm_source": m.storm_source,
-                "pending": m.pending,
-                "has_level1b": m.has_level1b,
-                "has_level2": m.has_level2,
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "count": missions.len(), "missions": missions })))
-}
-
-/// Re-resolve every pending/Unknown flight against current data (recon DB +
-/// jobfile). Run "Force update: Recon MET" first if the recon data itself is
-/// what was missing — this pass doesn't re-crawl the recon archive.
-async fn tdr_reresolve_pending(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
-    let tdr_db = state.paths.tdr_db.clone();
-    let recon_db = state.paths.recon_met_db.clone();
-    // Both ingest fns hold non-Send rusqlite connections across .await, so drive
-    // the future on a blocking thread (same pattern as archive_update::start).
-    let res = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current()
-            .block_on(crate::services::tdr_ingest::reresolve_missions(&tdr_db, &recon_db, None))
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("re-resolve task panicked: {e}")))?
-    .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
-    Ok(Json(res))
-}
-
-/// Pull one flight's recon MET data (in case it uploaded after the radar) and
-/// re-resolve its TDR storm from the refreshed data. The per-flight "update
-/// this mission's recon data" button.
-async fn tdr_reresolve_mission(
-    State(state): State<AppState>,
-    jar: SignedCookieJar,
-    Path(mission_id): Path<String>,
-) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
-    let tdr_db = state.paths.tdr_db.clone();
-    let recon_db = state.paths.recon_met_db.clone();
-    let storms_db = state.paths.storms_db.clone();
-    let mid = mission_id.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(async move {
-            let recon =
-                crate::services::recon_ingest::reingest_mission(&recon_db, &storms_db, &mid).await?;
-            let tdr = crate::services::tdr_ingest::reresolve_missions(&tdr_db, &recon_db, Some(vec![mid.clone()]))
-                .await?;
-            Ok::<Value, anyhow::Error>(json!({ "recon": recon, "tdr": tdr }))
-        })
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("re-resolve task panicked: {e}")))?
-    .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
-    Ok(Json(res))
 }
 
 // ── Not-yet-ported jobs ───────────────────────────────────────────────────────
