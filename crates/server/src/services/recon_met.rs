@@ -117,7 +117,7 @@ pub struct MissionSummary {
 }
 
 pub fn get_connection(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let conn = crate::services::db::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)

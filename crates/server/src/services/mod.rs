@@ -5,6 +5,7 @@
 
 pub mod archive_update;
 pub mod cache;
+pub mod db;
 pub mod downloads;
 pub mod goes;
 pub mod hdf5_zstd;

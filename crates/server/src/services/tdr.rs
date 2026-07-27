@@ -165,7 +165,7 @@ impl LegRecord {
 /// deliberately never touch DDL, so `init_db` must run at startup before any
 /// `get_connection` opens.
 pub fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let conn = crate::services::db::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
     migrate_rebuild(&conn)?;
@@ -185,11 +185,15 @@ pub fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
 /// `storm_label`/'Unknown' — but the `recon.missions` *table* must exist for
 /// the join to parse, which it does in this repo.
 pub fn get_connection(tdr_db: &Path, recon_db: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(tdr_db)?;
+    let conn = crate::services::db::open(tdr_db)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // Path as a bound string (lossy is fine — these are ASCII repo paths).
     let recon_str = recon_db.to_string_lossy();
     conn.execute("ATTACH DATABASE ?1 AS recon", [recon_str.as_ref()])?;
+    // WAL is stored in the file header, so this is only load-bearing the
+    // first time this file is ever opened by anything — but it's cheap
+    // enough to not worry about ordering against recon_met's own get_connection.
+    conn.pragma_update(Some(rusqlite::DatabaseName::Attached("recon")), "journal_mode", "WAL")?;
     // Belt-and-braces: this connection must never mutate either DB.
     conn.pragma_update(None, "query_only", "ON")?;
     Ok(conn)

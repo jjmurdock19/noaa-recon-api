@@ -220,7 +220,7 @@ fn now() -> i64 {
 /// Read/write safe on an already-migrated database; the destructive migration
 /// lives in `init_db`, which runs once at startup.
 pub fn get_connection(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let conn = crate::services::db::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
@@ -815,7 +815,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
 /// destructive DDL so a status poll during nightly ingest can't collide with a
 /// table rebuild.
 pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+    let conn = crate::services::db::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
     migrate_roles_to_permissions(&conn)?;
