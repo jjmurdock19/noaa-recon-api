@@ -95,10 +95,11 @@ When enabled:
   custom header. The token gate only applies to the JSON endpoint that
   *starts* a render; its resulting cache key isn't guessable without
   already having called that gated endpoint.
-- Any token works regardless of role — a superuser/moderator's own token
-  (the same one that doubles as part of their console login) is just as
-  valid an `Authorization: Bearer` value as a plain API key issued to a
-  third party.
+- Any non-revoked token works — a console account's own token (the same
+  one that doubles as part of their login) is just as valid an
+  `Authorization: Bearer` value as a plain API key issued to a third
+  party. Console *permissions* gate the admin console only; they have no
+  bearing on public-API access.
 
 Get a token from whoever runs the instance (admin console → API
 management → Tokens). There is no self-service signup.
@@ -936,14 +937,60 @@ run the nightly ingest on demand instead of waiting for the timer. Static
 page at `app/console/index.html`, calling the `/v1/admin/*` JSON endpoints
 below.
 
-Every console user has their own account (username + password) with one
-of two roles — see "API management" below for how accounts/tokens are
-created:
+Every console user has their own account (username + password) and their
+own set of **explicit permissions**, each one independently switchable —
+there are no role groups. See "API management" below for how accounts are
+created and permissions granted.
 
-- **superuser** — everything, including the API management pane (tokens,
-  login log, the public-auth toggle) and triggering self-update.
-- **moderator** — everything *except* API management and self-update
-  (cache, logs, databases, archive-rebuild triggers, usage log).
+| Permission | Unlocks |
+|---|---|
+| `console.access` | Logging in at all. Without it, valid credentials still fail. |
+| `status.view` | System status and database size/record cards. |
+| `logs.view` | The application log tail. |
+| `db.view` | The database browser (year -> storm -> track points/missions). |
+| `cache.view` | Listing cached rendered tiles and raw netCDF downloads. |
+| `cache.delete` | Deleting cache entries, individually or all at once. |
+| `archive.update` | Triggering the storms / recon MET / TDR ingest jobs. |
+| `tiles.render` | Submitting one-off render queries and bulk prefetch jobs. |
+| `selfupdate.check` | Seeing update status and checking GitHub for new commits. |
+| `selfupdate.apply` | Pulling new code and restarting the process. |
+| `users.view` | Reading the account/token list. |
+| `users.manage` | Creating, editing, deleting and regenerating accounts and tokens. |
+| `authconfig.manage` | Turning public-API authentication on and off. |
+| `loginlog.view` | Reading the login log (reveals other admins' usernames and IPs). |
+| `logs.clear` | Wiping the login and activity logs. |
+
+One account — the operator's, `jjmurdock` on the canonical deployment —
+carries a **superuser** flag instead: an implicit grant of every
+permission, including any added in future releases. Only a superuser can
+grant that flag, create another superuser, or edit an account that holds
+one, so delegating `users.manage` doesn't hand over the deployment. The
+last active superuser can't be deleted, revoked or demoted, and nobody can
+change their own permissions.
+
+Permissions are read from the database on **every** admin request, not
+baked into the session cookie — granting or revoking one takes effect on
+that person's next click, without them logging out. The same is true of
+revoking an account: it ends the live session rather than waiting for it
+to expire.
+
+**Everything a signed-in operator changes is recorded** to the activity
+log (`/v1/admin/usage-log`, `source=admin`) against their username and IP:
+account creation/edit/deletion, permission and superuser changes, cache
+deletions, database update triggers, self-update runs, the public-auth
+toggle, log clears, and login/logout. Read-only requests are deliberately
+not recorded — the console polls status, logs and cache listings every few
+seconds, and those rows would bury the trail.
+
+Upgrading from the old three-role model converts each account in place:
+`jjmurdock` keeps the superuser flag; every other superuser is granted all
+15 permissions explicitly (so individual ones can be taken away); each
+moderator is granted the 8 they could actually use before
+(`console.access`, `status.view`, `logs.view`, `db.view`, `cache.view`,
+`cache.delete`, `archive.update`, `tiles.render`); `regular` API keys get
+none, as they never had console access. Moderators deliberately do **not**
+carry over log clearing, which the old build allowed via a plain
+logged-in check — the activity log is now the audit trail.
 
 The very first account is bootstrapped automatically from the legacy
 single-shared-admin credentials file (`admin_credentials.json`, gitignored,
@@ -960,9 +1007,10 @@ https://joshmurdock.net/api/
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/v1/admin/public-stats` | GET | **No login required.** Shown on the console's login screen so anyone can see basic health before authenticating: `{healthy, uptime_seconds, calls_last_hour, total_calls}`. Deliberately excludes cache/storage figures — those stay behind login in `/status` below. In-memory counters, reset on process restart. |
-| `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie and returns `{status, role, username}`, or `401`. Every attempt (success or failure) is recorded to the login log. |
+| `/v1/admin/login` | POST | `{username, password}` JSON body → sets session cookie and returns `{status, username, token_id, is_superuser, permissions}`, or `401`. Requires `console.access`. Every attempt (success or failure) is recorded to the login log; successes also land in the activity log. |
 | `/v1/admin/logout` | POST | Clears the session. |
-| `/v1/admin/whoami` | GET | `{authenticated: bool, role, username}` — no login required, used by the console to decide whether to show the login form and which sections a given role should see. |
+| `/v1/admin/whoami` | GET | `{authenticated: bool, username, owner_name, token_id, is_superuser, permissions}` — no login required. The console renders its own sections from this. Reads the live account row, not the cookie, so a permission change shows up on the next poll. |
+| `/v1/admin/permissions` | GET | The permission catalog: `{permissions: [{key, description}]}`. Any logged-in account. The console's account editor renders from this rather than a hardcoded copy. |
 | `/v1/admin/status` | GET | Cache stats (`satellite`/`goes_nc` file count + bytes + total) **and** database stats: `databases.storms` (`bytes`, `storm_count`), `databases.recon_met` (`bytes`, `mission_count`), a `databases.total_bytes`, and a `grand_total_bytes` across everything. |
 | `/v1/admin/cache/satellite` | GET | List every cached rendered-tile entry — **every field the render pipeline wrote** (key, status, band, cmap, satellite, sat_lon, scan_start, bounds, center, width_km, resolution_km, png_url, size, modified), not a curated subset, so the console's preview pane has everything without a second round-trip. |
 | `/v1/admin/cache/satellite/{key}` | DELETE | Delete one entry's `.png`/`.json`/`.lock` files. |
@@ -977,23 +1025,25 @@ https://joshmurdock.net/api/
 | `/v1/admin/archive-update/{archive}` | POST | Force-run the storms or recon MET nightly ingest immediately — `archive` is `storms` or `recon_met`. Same code path as the systemd timer (`storms.run_ingest()` / `recon_met.run_ingest()`), just triggered on demand for data that hasn't been picked up yet. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). |
 | `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done, started_at, finished_at, summary, error}`. |
 | `/v1/admin/self-update/status` | GET | Cached "is an update available" check plus any in-progress apply job. |
-| `/v1/admin/self-update/check` | POST | **Superuser only.** Force an immediate GitHub check, bypassing the periodic timer. |
-| `/v1/admin/self-update/apply` | POST | **Superuser only.** Pull the latest code and restart the process. |
+| `/v1/admin/self-update/check` | POST | Needs `selfupdate.check`. Force an immediate GitHub check, bypassing the periodic timer. |
+| `/v1/admin/self-update/apply` | POST | Needs `selfupdate.apply`. Pull the latest code and restart the process. |
 | `/v1/admin/self-update/apply` | GET | Poll the in-progress apply job (same as `/self-update/status`'s `job` field). |
 
-### API management (superuser only, except usage log)
+### API management
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/v1/admin/tokens` | GET | List every token/account (role, owner, username, timestamps, revoked) — never the raw secret or password. |
-| `/v1/admin/tokens` | POST | Create a token. `{role, owner_name, owner_email?, notes?, username?, password?}` — `username`/`password` required unless `role` is `regular`. Returns the raw token **once**; it can't be retrieved again (only regenerated, invalidating the old one). |
-| `/v1/admin/tokens/{id}` | PATCH | Edit `owner_name`/`owner_email`/`notes`/`revoked`/`username`/`password`. |
-| `/v1/admin/tokens/{id}` | DELETE | Permanently delete. Usage/login log entries keep their own snapshot of owner/role/username, so history isn't lost. |
-| `/v1/admin/tokens/{id}/regenerate` | POST | Issue a new secret for an existing token, invalidating the old one. Same one-time-reveal behavior as create. |
-| `/v1/admin/login-log` | GET | `?limit=` (default 200, max 1000) most recent console login attempts — username, role, success/failure, IP, user agent, timestamp. Superuser-only since it reveals other admins' usernames/IPs. |
-| `/v1/admin/usage-log` | GET | `?token_id=&limit=` (default 200, max 1000) most recent public-API calls — owner, role, endpoint, method, status code, IP, timestamp. Visible to moderators too (it's usage data, not a permissions surface). Empty unless auth is enabled and at least one token has been used. |
-| `/v1/admin/auth-config` | GET | `{enabled: bool}` — whether the public API currently requires a token. |
-| `/v1/admin/auth-config` | POST | `{enabled: bool}` — flip it. Takes effect immediately, no restart. |
+| Endpoint | Method | Permission | Purpose |
+|---|---|---|---|
+| `/v1/admin/tokens` | GET | `users.view` | List every account/token (owner, username, `is_superuser`, `permissions`, timestamps, revoked) — never the raw secret or password. |
+| `/v1/admin/tokens` | POST | `users.manage` | Create an account. `{owner_name, owner_email?, notes?, username?, password?, permissions?, is_superuser?}`. Supply `username`+`password` together for a console account, or neither for an API-only key; permissions and `is_superuser` are rejected on a key. `is_superuser` needs a superuser. Returns the raw token **once**; it can't be retrieved again (only regenerated, invalidating the old one). |
+| `/v1/admin/tokens/{id}` | PATCH | `users.manage` | Edit `owner_name`/`owner_email`/`notes`/`revoked`/`username`/`password`, and set `permissions` (an array replacing the whole grant set) or `is_superuser`. Superuser-flagged accounts, and the flag itself, need a superuser. Rejects changing your own permissions or access, and demoting/revoking the last superuser. |
+| `/v1/admin/tokens/{id}` | DELETE | `users.manage` | Permanently delete; the account's grants go with it. Activity/login log entries keep their own snapshot of owner and username, so history isn't lost. |
+| `/v1/admin/tokens/{id}/regenerate` | POST | `users.manage` | Issue a new secret for an existing token, invalidating the old one. Same one-time-reveal behavior as create. |
+| `/v1/admin/login-log` | GET | `loginlog.view` | `?limit=` (default 200, max 1000) most recent console login attempts — username, success/failure, IP, user agent, timestamp. Gated because it reveals other admins' usernames and IPs. |
+| `/v1/admin/login-log` | DELETE | `logs.clear` | Wipe it. Recorded to the activity log. |
+| `/v1/admin/usage-log` | GET | any login | `?token_id=&limit=&source=` (default 200, max 1000). `source=admin` returns console actions (with an `action` verb and a plain-English `detail`), `source=api` returns public-API calls made with a bearer token (with `status_code`), omitted or `all` returns both. Readable by anyone who can reach the console — it's the activity feed, and it carries no secrets. |
+| `/v1/admin/usage-log` | DELETE | `logs.clear` | Wipe it. Recorded to the activity log afterwards, so the trail always names whoever emptied it. |
+| `/v1/admin/auth-config` | GET | `authconfig.manage` | `{enabled: bool}` — whether the public API currently requires a token. |
+| `/v1/admin/auth-config` | POST | `authconfig.manage` | `{enabled: bool}` — flip it. Takes effect immediately, no restart. |
 
 ### Bulk prefetch
 

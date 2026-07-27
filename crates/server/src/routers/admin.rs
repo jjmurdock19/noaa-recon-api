@@ -1,7 +1,14 @@
-//! Port of `app/routers/admin.py` — console API: status, logs, cache browsing/
-//! deletion. Login/session live here too. Archive-update and self-update jobs
-//! run as detached background tasks polled by the console; bulk-prefetch still
-//! depends on a piece not ported to Rust, so it returns 501 for now.
+//! Console API: status, logs, cache browsing/deletion. Login/session live here
+//! too. Archive-update and self-update jobs run as detached background tasks
+//! polled by the console; bulk-prefetch still depends on a piece not ported to
+//! Rust, so it returns 501 for now.
+//!
+//! Every handler resolves the signed-in operator with `auth::require_permission`
+//! (never a bare "is logged in" check), and every handler that changes state
+//! writes an entry to the usage log naming who did it — see
+//! `tokens::log_admin_action`. Read handlers deliberately don't: the console
+//! polls status, logs and cache listings every few seconds, so recording reads
+//! would bury the actions under the console's own traffic.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path as FsPath, PathBuf};
@@ -28,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/login", post(login))
         .route("/admin/logout", post(logout))
         .route("/admin/whoami", get(whoami))
+        .route("/admin/permissions", get(permission_catalog))
         .route("/admin/status", get(status))
         .route("/admin/logs", get(get_logs))
         .route("/admin/cache/satellite", get(list_satellite_cache).delete(clear_satellite_cache))
@@ -57,6 +65,29 @@ fn iso(t: SystemTime) -> Option<String> {
     Some(DateTime::<Utc>::from(t).to_rfc3339())
 }
 
+/// Record a state-changing console action against the operator who made it.
+/// `endpoint` uses the route template (`…/{key}`) rather than the concrete path
+/// so the log groups by action; the concrete target is in `detail`.
+fn audit(
+    state: &AppState,
+    user: &tokens::Token,
+    action: &str,
+    detail: Option<&str>,
+    endpoint: &str,
+    method: &str,
+    headers: &HeaderMap,
+) {
+    tokens::log_admin_action(
+        &state.paths.auth_db,
+        user,
+        action,
+        detail,
+        endpoint,
+        method,
+        auth::client_ip(headers).as_deref(),
+    );
+}
+
 // ── Public status (no login) ─────────────────────────────────────────────────
 async fn public_stats(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(state.stats.public()).unwrap())
@@ -72,42 +103,78 @@ async fn login(
     let username = body.get("username").and_then(Value::as_str).unwrap_or("").to_string();
     let password = body.get("password").and_then(Value::as_str).unwrap_or("");
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let ip = auth::client_ip(&headers);
 
     let conn = tokens::get_connection(&state.paths.auth_db)?;
     let row = tokens::verify_admin_login(&conn, &username, password)?;
-    tokens::record_login(&conn, &username, row.as_ref(), row.is_some(), None, user_agent)?;
+    tokens::record_login(&conn, &username, row.as_ref(), row.is_some(), ip.as_deref(), user_agent)?;
 
     let row = row.ok_or_else(|| {
         ApiError::new(axum::http::StatusCode::UNAUTHORIZED, "Invalid username or password")
     })?;
+    tokens::record_admin_action(&conn, &row, "auth.login", None, "/v1/admin/login", "POST", ip.as_deref())?;
+
+    // The cookie carries identity only; permissions are re-read per request.
     let session = Session {
         authenticated: true,
-        role: Some(row.role.clone()),
         username: row.username.clone(),
         token_id: Some(row.id),
     };
     let jar = auth::write_session(jar, &session);
     Ok((
         jar,
-        Json(json!({ "status": "ok", "role": row.role, "username": row.username, "token_id": row.id })),
+        Json(json!({
+            "status": "ok",
+            "username": row.username,
+            "token_id": row.id,
+            "is_superuser": row.is_superuser,
+            "permissions": row.effective_permissions(),
+        })),
     ))
 }
 
-async fn logout(jar: SignedCookieJar) -> (SignedCookieJar, Json<Value>) {
+async fn logout(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> (SignedCookieJar, Json<Value>) {
+    // Logging out is recorded when we can still say who did it; an already-
+    // expired session just clears the cookie.
+    if let Ok(user) = auth::require_login(&state, &jar) {
+        tokens::log_admin_action(
+            &state.paths.auth_db, &user, "auth.logout", None,
+            "/v1/admin/logout", "POST", auth::client_ip(&headers).as_deref(),
+        );
+    }
     (auth::clear_session(jar), Json(json!({ "status": "ok" })))
 }
 
-async fn whoami(jar: SignedCookieJar) -> Json<Value> {
-    let s = auth::read_session(&jar);
-    if !s.is_authenticated() {
-        return Json(json!({ "authenticated": false }));
+/// Identity + the live permission set the console renders itself from. Reads
+/// the account row rather than the cookie, so a permission change shows up on
+/// the next poll without the operator logging out and back in.
+async fn whoami(State(state): State<AppState>, jar: SignedCookieJar) -> Json<Value> {
+    match auth::require_login(&state, &jar) {
+        Ok(user) => Json(json!({
+            "authenticated": true,
+            "username": user.username,
+            "owner_name": user.owner_name,
+            "token_id": user.id,
+            "is_superuser": user.is_superuser,
+            "permissions": user.effective_permissions(),
+        })),
+        Err(_) => Json(json!({ "authenticated": false })),
     }
-    Json(json!({
-        "authenticated": true,
-        "role": s.role,
-        "username": s.username,
-        "token_id": s.token_id,
-    }))
+}
+
+/// The permission catalog (key + description) so the console's account editor
+/// renders from server truth instead of a hardcoded copy of the list.
+async fn permission_catalog(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_login(&state, &jar)?;
+    let entries: Vec<Value> = tokens::PERMISSIONS
+        .iter()
+        .map(|(key, description)| json!({ "key": key, "description": description }))
+        .collect();
+    Ok(Json(json!({ "permissions": entries })))
 }
 
 // ── Status / cache stats ──────────────────────────────────────────────────────
@@ -137,7 +204,7 @@ fn file_bytes(p: &FsPath) -> u64 {
 /// `file_bytes`/`dir_stats`, which are infallible (missing path → 0), so the
 /// size cards always render even when a row-count query fails.
 async fn status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "status.view")?;
     let mut healthy = true;
 
     // Satellite render cache — degrade to `{ "error": … }` if the cache dir
@@ -255,7 +322,7 @@ async fn get_logs(
     jar: SignedCookieJar,
     Query(q): Query<LogQuery>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "logs.view")?;
     let max_bytes = q.max_bytes.clamp(1024, 1_000_000);
     let Some(log_file) = find_log_file(&state.paths.repo_root.join("logs")) else {
         return Ok(Json(json!({ "text": "", "offset": 0, "reset": true })));
@@ -278,7 +345,7 @@ async fn get_logs(
 
 // ── Cache browsing / deletion ─────────────────────────────────────────────────
 async fn list_satellite_cache(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "cache.view")?;
     let cache = sat_cache(&state)?;
     let mut entries: Vec<Value> = Vec::new();
     for key in cache.list_keys() {
@@ -303,22 +370,39 @@ async fn list_satellite_cache(State(state): State<AppState>, jar: SignedCookieJa
 async fn delete_satellite_cache_entry(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    let user = auth::require_permission(&state, &jar, "cache.delete")?;
     let freed = sat_cache(&state)?.delete(&key);
+    audit(
+        &state, &user, "cache.delete_tile",
+        Some(&format!("deleted rendered tile '{key}' ({freed} bytes)")),
+        "/v1/admin/cache/satellite/{key}", "DELETE", &headers,
+    );
     Ok(Json(json!({ "status": "ok", "bytes_freed": freed })))
 }
 
-async fn clear_satellite_cache(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+async fn clear_satellite_cache(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let user = auth::require_permission(&state, &jar, "cache.delete")?;
     let cache = sat_cache(&state)?;
-    let freed: u64 = cache.list_keys().iter().map(|k| cache.delete(k)).sum();
+    let keys = cache.list_keys();
+    let count = keys.len();
+    let freed: u64 = keys.iter().map(|k| cache.delete(k)).sum();
+    audit(
+        &state, &user, "cache.clear_tiles",
+        Some(&format!("cleared the rendered tile cache ({count} entries, {freed} bytes)")),
+        "/v1/admin/cache/satellite", "DELETE", &headers,
+    );
     Ok(Json(json!({ "status": "ok", "bytes_freed": freed })))
 }
 
 async fn list_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "cache.view")?;
     let dir = nc_dir(&state);
     let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -367,7 +451,7 @@ async fn get_goes_nc_info(
     jar: SignedCookieJar,
     Path(filename): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "cache.view")?;
     let path = safe_nc_path(&state, &filename)?;
     let size = file_bytes(&path);
     let mut info = goes::nc_info(&path).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -380,18 +464,28 @@ async fn get_goes_nc_info(
 async fn delete_goes_nc_entry(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(filename): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    let user = auth::require_permission(&state, &jar, "cache.delete")?;
     let path = safe_nc_path(&state, &filename)?;
     let freed = file_bytes(&path);
     std::fs::remove_file(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+    audit(
+        &state, &user, "cache.delete_nc",
+        Some(&format!("deleted raw netCDF '{filename}' ({freed} bytes)")),
+        "/v1/admin/cache/goes_nc/{filename}", "DELETE", &headers,
+    );
     Ok(Json(json!({ "status": "ok", "bytes_freed": freed })))
 }
 
-async fn clear_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
-    let (_, before) = dir_stats(&nc_dir(&state));
+async fn clear_goes_nc_cache(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let user = auth::require_permission(&state, &jar, "cache.delete")?;
+    let (count, before) = dir_stats(&nc_dir(&state));
     if let Ok(rd) = std::fs::read_dir(nc_dir(&state)) {
         for e in rd.flatten() {
             if e.metadata().map(|m| m.is_file()).unwrap_or(false) {
@@ -399,6 +493,11 @@ async fn clear_goes_nc_cache(State(state): State<AppState>, jar: SignedCookieJar
             }
         }
     }
+    audit(
+        &state, &user, "cache.clear_nc",
+        Some(&format!("cleared the raw netCDF cache ({count} files, {before} bytes)")),
+        "/v1/admin/cache/goes_nc", "DELETE", &headers,
+    );
     Ok(Json(json!({ "status": "ok", "bytes_freed": before })))
 }
 
@@ -415,7 +514,7 @@ struct BranchQuery {
 }
 
 async fn self_update_status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "selfupdate.check")?;
     Ok(Json(json!({
         "check": state.self_update.get_cached_check(),
         "job": state.self_update.job.lock().unwrap().clone(),
@@ -424,7 +523,7 @@ async fn self_update_status(State(state): State<AppState>, jar: SignedCookieJar)
 
 /// Backs the console's branch-selector dropdown.
 async fn self_update_branches(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "selfupdate.check")?;
     let branches = crate::services::self_update::list_remote_branches(&state.paths.repo_root)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("Failed to list branches: {e}")))?;
@@ -441,9 +540,15 @@ async fn self_update_branches(State(state): State<AppState>, jar: SignedCookieJa
 async fn self_update_check(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Query(q): Query<BranchQuery>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_superuser(&jar)?;
+    let user = auth::require_permission(&state, &jar, "selfupdate.check")?;
+    audit(
+        &state, &user, "selfupdate.check",
+        Some(&format!("checked branch '{}' for updates", q.branch.as_deref().unwrap_or("(current)"))),
+        "/v1/admin/self-update/check", "POST", &headers,
+    );
     match crate::services::self_update::check_for_update(&state.paths.repo_root, q.branch.as_deref()).await {
         Ok(result) => {
             state.self_update.set_cached_check(Some(result), None);
@@ -459,9 +564,10 @@ async fn self_update_check(
 async fn self_update_apply(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Query(q): Query<BranchQuery>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_superuser(&jar)?;
+    let user = auth::require_permission(&state, &jar, "selfupdate.apply")?;
     {
         let mut job = state.self_update.job.lock().unwrap();
         if crate::services::self_update::IN_PROGRESS_STATUSES.contains(&job["status"].as_str().unwrap_or("")) {
@@ -474,6 +580,14 @@ async fn self_update_apply(
             "branch": q.branch, "build_log": "",
         });
     }
+    audit(
+        &state, &user, "selfupdate.apply",
+        Some(&format!(
+            "started update + restart on branch '{}'",
+            q.branch.as_deref().unwrap_or("(current)")
+        )),
+        "/v1/admin/self-update/apply", "POST", &headers,
+    );
     let repo_root = state.paths.repo_root.clone();
     let su_state = state.self_update.clone();
     tokio::spawn(crate::services::self_update::apply_update(repo_root, su_state, q.branch));
@@ -481,7 +595,7 @@ async fn self_update_apply(
 }
 
 async fn self_update_job(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "selfupdate.check")?;
     Ok(Json(state.self_update.job.lock().unwrap().clone()))
 }
 
@@ -502,15 +616,11 @@ struct ArchiveUpdateQuery {
 async fn start_archive_update(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(archive): Path<String>,
     Query(q): Query<ArchiveUpdateQuery>,
 ) -> ApiResult<Json<Value>> {
-    // Storms/recon-MET/TDR ingest is incremental and non-destructive (see
-    // services/archive_update.rs), so moderators — not just superusers — are
-    // trusted to trigger it. Only superuser/moderator accounts can hold a
-    // console session at all (tokens::verify_admin_login), so require_login
-    // here is exactly "moderator or superuser", not "anyone with a session".
-    auth::require_login(&jar)?;
+    let user = auth::require_permission(&state, &jar, "archive.update")?;
     if state.archive_update.is_running(&archive) {
         return Err(ApiError::conflict("An update for this archive is already in progress"));
     }
@@ -523,8 +633,17 @@ async fn start_archive_update(
                 .collect::<ApiResult<Vec<i64>>>()
         })
         .transpose()?;
+    let year_note = years
+        .as_ref()
+        .map(|y| format!(" for year(s) {}", y.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",")))
+        .unwrap_or_default();
     let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive, years)
         .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
+    audit(
+        &state, &user, "archive.update",
+        Some(&format!("started the '{archive}' database update{year_note}")),
+        "/v1/admin/archive-update/{archive}", "POST", &headers,
+    );
     Ok(Json(job))
 }
 
@@ -533,7 +652,7 @@ async fn get_archive_update(
     jar: SignedCookieJar,
     Path(archive): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+    auth::require_permission(&state, &jar, "archive.update")?;
     let job = state
         .archive_update
         .job(&archive)
@@ -542,8 +661,8 @@ async fn get_archive_update(
 }
 
 // ── Not-yet-ported jobs ───────────────────────────────────────────────────────
-async fn not_ported(jar: SignedCookieJar) -> ApiResult<Json<Value>> {
-    auth::require_login(&jar)?;
+async fn not_ported(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResult<Json<Value>> {
+    auth::require_permission(&state, &jar, "tiles.render")?;
     Err(ApiError::not_implemented(
         "This console job (bulk prefetch / archive-update) isn't ported to the Rust build yet. \
          Archive ingest is still run via the Python scripts.",

@@ -124,10 +124,11 @@ force-refresh buttons) gated behind a login. The installer generates a
 random password for you by default — **it's shown once, at the very
 end, so save it somewhere** (a password manager, a sticky note, whatever
 you'd trust with any other admin password). This account becomes your
-first **superuser** — from the console's API management pane you can
-create additional superuser/moderator accounts (their own username/
-password) or plain API-key tokens for other people, each tracked in the
-login/usage logs.
+first **superuser**, holding every permission implicitly — from the
+console's API management pane you can create additional console accounts
+(their own username/password, with permissions ticked on individually) or
+plain API-key tokens for other people, each tracked in the login and
+activity logs.
 
 **"Require an API token for the public data endpoints?"**
 Off by default — the satellite/storms/recon/tdr/raw endpoints stay open

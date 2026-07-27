@@ -221,14 +221,31 @@
     .col-preview, .col-archive, .col-add, .col-api { max-width: none; width: 100%; position: static; }
   }
 
-  /* Role badges (tokens table, login/usage log) — same palette as the
-     existing status-text ok/err/working classes, just as pill-shaped
-     spans since a role is a fixed label, not a transient state. */
-  .role-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .role-badge.superuser { background: var(--error); color: #fff; }
-  .role-badge.moderator { background: var(--warning); color: #000; }
-  .role-badge.regular { background: var(--btn-neutral-hover); color: var(--text); }
+  /* Access badges (accounts table, usage log) — same palette as the existing
+     status-text ok/err/working classes, just as pill-shaped spans since the
+     label is a fixed fact about the account, not a transient state. */
+  .access-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .access-badge.superuser { background: var(--error); color: #fff; }
+  .access-badge.console { background: var(--warning); color: #000; }
+  .access-badge.apikey { background: var(--btn-neutral-hover); color: var(--text); }
+  .access-badge.none { background: var(--btn-neutral-bg); color: var(--text-faint); }
   .revoked-row { opacity: 0.5; }
+
+  /* Per-account permission editor — a grid of checkboxes that expands under
+     the account's row, so the table stays scannable until you open one. */
+  .perm-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 4px 14px; padding: 10px 4px 4px;
+  }
+  .perm-grid label { display: flex; align-items: flex-start; gap: 6px; font-size: 11px; cursor: pointer; }
+  .perm-grid input { margin-top: 2px; }
+  .perm-grid .perm-key { font-weight: 600; }
+  .perm-grid .perm-desc { color: var(--text-muted); }
+  .perm-editor-row > td { background: var(--bg-hover); }
+  .perm-summary { color: var(--text-muted); }
+  /* Console actions stand out from ordinary API traffic in the shared feed. */
+  .usage-admin td { background: var(--bg-hover); }
+  .usage-action { font-weight: 600; }
 
   /* Scrolling frames for cache tables so a large cache doesn't blow up the page.
      overflow-x here is what lets a table wider than its column scroll in
@@ -410,12 +427,12 @@
     </div>
 
     <div class="col-archive">
-      <section>
+      <section id="status-section">
         <h2>Status</h2>
         <div class="stat-row" id="status-cards"></div>
       </section>
 
-      <section>
+      <section id="app-log-section">
         <h2>
           <span>Log <span class="field-label">logs/app.log</span></span>
           <span>
@@ -426,10 +443,11 @@
         <div id="log-terminal"></div>
       </section>
 
-      <section>
+      <section id="databases-section">
         <h2>Databases</h2>
         <div class="stat-row" id="db-stat-cards"></div>
 
+        <div id="archive-update-controls">
         <div class="row" style="margin-top:14px;">
           <button class="primary-btn" id="storms-update-btn">Force update: Storm Tracks</button>
           <span class="status-text" id="storms-update-status"></span>
@@ -450,7 +468,9 @@
           <button class="primary-btn" id="tdr-backfill-btn" title="Crawl only the given years — same incremental, non-destructive ingest as Force update, just reaching further back than the default last-2-years window">Backfill TDR years</button>
           <span class="status-text" id="tdr-backfill-status"></span>
         </div>
+        </div>
 
+        <div id="db-viewer-controls">
         <div class="row" style="margin-top:16px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
             <span class="field-label">Database</span>
@@ -477,9 +497,10 @@
             <tbody id="db-view-body"></tbody>
           </table>
         </div>
+        </div>
       </section>
 
-      <section>
+      <section id="tile-cache-section">
         <h2>
           Rendered tile cache
           <button class="clear-btn" id="clear-satellite-btn">Clear all</button>
@@ -495,7 +516,7 @@
         </div>
       </section>
 
-      <section>
+      <section id="nc-cache-section">
         <h2>
           Raw netCDF cache
           <button class="clear-btn" id="clear-goesnc-btn">Clear all</button>
@@ -511,7 +532,7 @@
     </div>
 
     <div class="col-add">
-      <section>
+      <section id="query-section">
         <h2>Submit a query</h2>
         <div class="row">
           <div class="field-group">
@@ -583,7 +604,7 @@
         <div id="query-result"></div>
       </section>
 
-      <section>
+      <section id="prefetch-section">
         <h2>Load a timeframe into cache</h2>
         <div class="row">
           <div class="field-group">
@@ -634,7 +655,7 @@
         </div>
       </section>
 
-    <section>
+    <section id="self-update-section">
         <h2>API update</h2>
         <div class="row">
           <span class="field-label">Branch</span>
@@ -677,14 +698,14 @@
 
       <section id="tokens-section" style="display:none;">
         <h2>
-          Tokens
+          Accounts &amp; API tokens
           <button class="clear-btn" id="tokens-refresh-btn">Refresh</button>
         </h2>
         <div class="table-scroll">
           <table>
             <thead><tr>
-              <th>Role</th><th>Owner</th><th>Username</th><th>Created</th>
-              <th>Last used</th><th>Revoked</th><th></th>
+              <th>Access</th><th>Owner</th><th>Username</th><th>Permissions</th>
+              <th>Created</th><th>Last used</th><th>Revoked</th><th></th>
             </tr></thead>
             <tbody id="tokens-body"></tbody>
           </table>
@@ -692,11 +713,10 @@
 
         <div class="row" style="margin-top:14px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="field-group">
-            <span class="field-label">Role</span>
-            <select id="tok-role">
-              <option value="regular">regular (API key only)</option>
-              <option value="moderator">moderator</option>
-              <option value="superuser">superuser</option>
+            <span class="field-label">Account type</span>
+            <select id="tok-kind">
+              <option value="console">Console account (username + password)</option>
+              <option value="apikey">API key only (no console login)</option>
             </select>
           </div>
           <div class="field-group">
@@ -708,7 +728,7 @@
             <input type="text" id="tok-owner-email" placeholder="jane@example.com" />
           </div>
         </div>
-        <div class="row" id="tok-login-fields" style="display:none;">
+        <div class="row" id="tok-login-fields">
           <div class="field-group">
             <span class="field-label">Console username</span>
             <input type="text" id="tok-username" />
@@ -718,14 +738,25 @@
             <input type="password" id="tok-password" />
           </div>
         </div>
-        <div class="row">
+        <div id="tok-permissions-block">
+          <div class="row" style="margin-bottom:0;">
+            <span class="field-label">Permissions</span>
+            <button class="clear-btn" id="tok-perm-none-btn" type="button">Clear all</button>
+          </div>
+          <div class="perm-grid" id="tok-permissions"></div>
+          <label id="tok-superuser-wrap" style="display:none; align-items:center; gap:8px; font-size:11px; margin-top:8px; cursor:pointer;">
+            <input type="checkbox" id="tok-superuser" />
+            Superuser — holds every permission, including ones added in future releases
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px;">
           <div class="field-group" style="flex:1 1 100%;">
             <span class="field-label">Notes (optional)</span>
             <input type="text" id="tok-notes" style="width:100%;" />
           </div>
         </div>
         <div class="row">
-          <button class="primary-btn" id="tok-create-btn">Create token</button>
+          <button class="primary-btn" id="tok-create-btn">Create account</button>
           <span class="status-text" id="tok-create-status"></span>
         </div>
         <div id="tok-new-secret" style="display:none; margin-top:8px;">
@@ -746,7 +777,7 @@
         </h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>When</th><th>Username</th><th>Role</th><th>Result</th><th>IP</th></tr></thead>
+            <thead><tr><th>When</th><th>Username</th><th>Result</th><th>IP</th></tr></thead>
             <tbody id="login-log-body"></tbody>
           </table>
         </div>
@@ -754,15 +785,23 @@
 
       <section id="usage-log-section" style="display:none;">
         <h2>
-          Usage log
+          Activity log
           <span>
+            <select id="usage-log-source" style="font-size:11px;">
+              <option value="admin">Console actions</option>
+              <option value="all">Everything</option>
+              <option value="api">API calls</option>
+            </select>
             <button class="clear-btn" id="usage-log-refresh-btn">Refresh</button>
             <button class="clear-btn" id="usage-log-clear-btn">Clear</button>
           </span>
         </h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>When</th><th>Owner</th><th>Role</th><th>Method</th><th>Endpoint</th><th>Status</th></tr></thead>
+            <thead><tr>
+              <th>When</th><th>Who</th><th>Action</th><th>Detail</th>
+              <th>Method</th><th>Endpoint</th><th>Status</th><th>IP</th>
+            </tr></thead>
             <tbody id="usage-log-body"></tbody>
           </table>
         </div>
@@ -836,32 +875,110 @@ function showApp() {
     document.getElementById('login-wrap').style.display = 'none';
     document.getElementById('app-header').style.display = 'flex';
     document.getElementById('app-main').classList.add('shown');
-    applyRoleVisibility();
+    applyPermissionVisibility();
+    loadPermissionCatalog();
     refreshAll();
-    pollLogs();
+    if (can('logs.view')) pollLogs();
     refreshUsageLog();
-    if (currentRole === 'superuser') refreshLoginLog();
-    refreshSelfUpdateBranches();
+    if (can('loginlog.view')) refreshLoginLog();
+    if (can('selfupdate.check')) refreshSelfUpdateBranches();
     startLiveRefresh();
 }
 
-// ── Role-based visibility — the backend enforces all of this for real
-// (a moderator hitting /v1/admin/tokens directly still gets a 403); this
-// just keeps a moderator's console from showing sections that would only
-// ever error out for them.
-let currentRole = null;
+// ── Permission-based visibility — the backend enforces all of this for real
+// (an account without users.manage hitting /v1/admin/tokens still gets a
+// 403); this just keeps the console from showing controls that would only
+// ever error out for whoever is signed in.
+//
+// currentPermissions is whatever /v1/admin/whoami last reported, and whoami
+// re-reads the account row rather than the session cookie — so a permission
+// someone grants you shows up on your next poll, without a re-login.
+let currentPermissions = [];
+let currentIsSuperuser = false;
 let currentUsername = null;
 let currentTokenId = null;
-function applyRoleVisibility() {
-    const superuserOnly = ['auth-toggle-section', 'tokens-section', 'login-log-section'];
-    const isSuperuser = currentRole === 'superuser';
-    superuserOnly.forEach((id) => {
-        document.getElementById(id).style.display = isSuperuser ? '' : 'none';
+/// Every permission the server knows about, `[{key, description}]`, fetched
+/// once per session so the account editor never carries its own copy.
+let permissionCatalog = [];
+
+function can(permission) {
+    return currentIsSuperuser || currentPermissions.includes(permission);
+}
+
+function setSessionFrom(data) {
+    currentUsername = data.username || null;
+    currentTokenId = data.token_id || null;
+    currentIsSuperuser = !!data.is_superuser;
+    currentPermissions = Array.isArray(data.permissions) ? data.permissions : [];
+}
+
+function applyPermissionVisibility() {
+    // section id -> the permission that makes it worth showing.
+    const gated = {
+        'status-section': 'status.view',
+        'app-log-section': 'logs.view',
+        'tile-cache-section': 'cache.view',
+        'nc-cache-section': 'cache.view',
+        'query-section': 'tiles.render',
+        'prefetch-section': 'tiles.render',
+        'self-update-section': 'selfupdate.check',
+        'auth-toggle-section': 'authconfig.manage',
+        'tokens-section': 'users.view',
+        'login-log-section': 'loginlog.view',
+        'archive-update-controls': 'archive.update',
+        'db-viewer-controls': 'db.view',
+    };
+    Object.entries(gated).forEach(([id, permission]) => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = can(permission) ? '' : 'none';
     });
+    // The Databases panel holds two independently gated halves plus the size
+    // cards; it's only pointless when none of the three apply.
+    const dbSection = document.getElementById('databases-section');
+    if (dbSection) {
+        const useful = can('archive.update') || can('db.view') || can('status.view');
+        dbSection.style.display = useful ? '' : 'none';
+    }
+    // Anyone who can reach the console sees the activity feed; clearing it is
+    // a separate permission.
     document.getElementById('usage-log-section').style.display = '';
+    ['usage-log-clear-btn', 'login-log-clear-btn'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = can('logs.clear') ? '' : 'none';
+    });
+    ['clear-satellite-btn', 'clear-goesnc-btn'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = can('cache.delete') ? '' : 'none';
+    });
+    const applyBtn = document.getElementById('self-update-apply-btn');
+    if (applyBtn && !can('selfupdate.apply')) {
+        applyBtn.style.display = 'none';
+    } else if (applyBtn) {
+        applyBtn.style.display = '';
+    }
+    // Only a superuser can hand out the superuser flag.
+    const suWrap = document.getElementById('tok-superuser-wrap');
+    if (suWrap) suWrap.style.display = currentIsSuperuser ? 'flex' : 'none';
+
+    const access = currentIsSuperuser
+        ? 'superuser'
+        : `${currentPermissions.length} permission${currentPermissions.length === 1 ? '' : 's'}`;
     document.getElementById('logged-in-as').textContent = currentUsername
-        ? `Logged in as ${currentUsername} (${currentRole})`
+        ? `Logged in as ${currentUsername} (${access})`
         : '';
+}
+
+async function loadPermissionCatalog() {
+    if (permissionCatalog.length) return;
+    try {
+        const res = await api('/v1/admin/permissions');
+        const data = await res.json();
+        permissionCatalog = data.permissions || [];
+        renderCreatePermissionGrid();
+        // The accounts table renders "n of <catalog size>" and the inline
+        // editors are built from the catalog, so re-draw it once we have one.
+        if (can('users.view')) refreshTokens();
+    } catch (e) {}
 }
 
 // ── Live refresh — polls status/cache tables so entries update as jobs
@@ -886,9 +1003,9 @@ function startLiveRefresh() {
     // are also "logs", not data tables, so they get the faster tick.
     logsPollTimer = setInterval(() => {
         if (document.visibilityState === 'visible') {
-            pollLogs();
+            if (can('logs.view')) pollLogs();
             refreshUsageLog();
-            if (currentRole === 'superuser') refreshLoginLog();
+            if (can('loginlog.view')) refreshLoginLog();
         }
     }, 3000);
 }
@@ -900,9 +1017,7 @@ function stopLiveRefresh() {
 async function checkAuth() {
     const res = await fetch(API_BASE + '/v1/admin/whoami', { credentials: 'same-origin' });
     const data = await res.json();
-    currentRole = data.role || null;
-    currentUsername = data.username || null;
-    currentTokenId = data.token_id || null;
+    setSessionFrom(data);
     if (data.authenticated) showApp(); else showLogin();
 }
 
@@ -947,9 +1062,7 @@ document.getElementById('login-btn').addEventListener('click', async () => {
         });
         if (!res.ok) { errEl.textContent = 'Invalid username or password.'; return; }
         const data = await res.json();
-        currentRole = data.role || null;
-        currentUsername = data.username || null;
-        currentTokenId = data.token_id || null;
+        setSessionFrom(data);
         showApp();
     } catch (e) {
         errEl.textContent = 'Network error: ' + e.message;
@@ -1050,7 +1163,8 @@ async function refreshSatelliteCache() {
     body.querySelectorAll('.del-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             await api(`/v1/admin/cache/satellite/${encodeURIComponent(btn.dataset.key)}`, { method: 'DELETE' });
-            refreshSatelliteCache(); refreshStatus();
+            refreshSatelliteCache();
+            if (can('status.view')) refreshStatus();
         });
     });
 }
@@ -1103,7 +1217,8 @@ async function refreshGoesNcCache() {
         body.querySelectorAll('.del-btn').forEach(btn => {
             btn.addEventListener('click', async () => {
                 await api(`/v1/admin/cache/goes_nc/${encodeURIComponent(btn.dataset.name)}`, { method: 'DELETE' });
-                refreshGoesNcCache(); refreshStatus();
+                refreshGoesNcCache();
+                if (can('status.view')) refreshStatus();
             });
         });
     }
@@ -1351,12 +1466,14 @@ async function previewReconMission(missionId) {
 document.getElementById('clear-satellite-btn').addEventListener('click', async () => {
     if (!confirm('Delete ALL rendered tile cache entries?')) return;
     await api('/v1/admin/cache/satellite', { method: 'DELETE' });
-    refreshSatelliteCache(); refreshStatus();
+    refreshSatelliteCache();
+    if (can('status.view')) refreshStatus();
 });
 document.getElementById('clear-goesnc-btn').addEventListener('click', async () => {
     if (!confirm('Delete ALL raw netCDF cache files? Future requests will re-download from NOAA S3.')) return;
     await api('/v1/admin/cache/goes_nc', { method: 'DELETE' });
-    refreshGoesNcCache(); refreshStatus();
+    refreshGoesNcCache();
+    if (can('status.view')) refreshStatus();
 });
 
 // ── Self-update ──────────────────────────────────────────────────────────
@@ -1627,27 +1744,84 @@ document.getElementById('auth-enabled-checkbox').addEventListener('change', asyn
     refreshAuthToggle();
 });
 
-function roleBadge(role) {
-    return `<span class="role-badge ${role}">${role}</span>`;
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function accessBadge(t) {
+    if (t.is_superuser) return '<span class="access-badge superuser">superuser</span>';
+    if (t.username) return '<span class="access-badge console">console</span>';
+    return '<span class="access-badge apikey">API key</span>';
+}
+
+/// A checkbox per permission in the catalog. Used both by the create form and
+/// by each account's inline editor, so the two can never drift apart.
+function permissionGridHtml(namePrefix, granted, disabled) {
+    return permissionCatalog.map((p) => `
+        <label>
+            <input type="checkbox" data-perm="${p.key}" data-perm-owner="${namePrefix}"
+                   ${granted.includes(p.key) ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
+            <span><span class="perm-key">${p.key}</span><br>
+                  <span class="perm-desc">${escapeHtml(p.description)}</span></span>
+        </label>`).join('');
+}
+
+function renderCreatePermissionGrid() {
+    const el = document.getElementById('tok-permissions');
+    if (el) el.innerHTML = permissionGridHtml('new', [], false);
+}
+
+// Which account rows have their permission editor open. Kept across refreshes
+// so the 5s live poll doesn't collapse an editor mid-edit.
+const openPermissionEditors = new Set();
+
+function permissionSummary(t) {
+    if (t.is_superuser) return '<span class="perm-summary">all (superuser)</span>';
+    if (!t.username) return '<span class="perm-summary">—</span>';
+    if (!t.permissions.length) return '<span class="perm-summary">none</span>';
+    return `<span class="perm-summary">${t.permissions.length} of ${permissionCatalog.length}</span>`;
 }
 
 async function refreshTokens() {
     try {
         const res = await api('/v1/admin/tokens');
         const data = await res.json();
+        const canManage = can('users.manage');
         document.getElementById('tokens-body').innerHTML = data.tokens.map((t) => {
             const isSelf = t.id === currentTokenId;
-            return `
+            // Editing your own permissions, or another superuser's without the
+            // flag yourself, is rejected by the API — don't offer it here.
+            const editable = canManage && !isSelf && (currentIsSuperuser || !t.is_superuser);
+            const open = openPermissionEditors.has(t.id);
+            const row = `
             <tr class="${t.revoked ? 'revoked-row' : ''}">
-                <td>${roleBadge(t.role)}${isSelf ? ' <span class="status-text">(you)</span>' : ''}</td>
-                <td>${t.owner_name}${t.owner_email ? `<br><span class="status-text">${t.owner_email}</span>` : ''}</td>
-                <td>${t.username || '—'}</td>
+                <td>${accessBadge(t)}${isSelf ? ' <span class="status-text">(you)</span>' : ''}</td>
+                <td>${escapeHtml(t.owner_name)}${t.owner_email ? `<br><span class="status-text">${escapeHtml(t.owner_email)}</span>` : ''}</td>
+                <td>${t.username ? escapeHtml(t.username) : '—'}</td>
+                <td>${permissionSummary(t)}${t.username && editable ? ` <button class="clear-btn" data-tok-perms="${t.id}">${open ? 'Close' : 'Edit'}</button>` : ''}</td>
                 <td>${fmtTs(t.created_at)}</td>
                 <td>${fmtTs(t.last_used_at)}</td>
-                <td><input type="checkbox" data-tok-revoke="${t.id}" ${t.revoked ? 'checked' : ''} /></td>
-                <td>
-                    <button class="clear-btn" data-tok-regen="${t.id}">Regenerate</button>
-                    <button class="clear-btn" data-tok-delete="${t.id}" ${isSelf ? 'disabled title="You can\'t delete the account you\'re logged in as"' : ''}>Delete</button>
+                <td><input type="checkbox" data-tok-revoke="${t.id}" ${t.revoked ? 'checked' : ''} ${editable ? '' : 'disabled'} /></td>
+                <td class="actions-cell">
+                    <button class="clear-btn" data-tok-regen="${t.id}" ${canManage ? '' : 'disabled'}>Regenerate</button>
+                    <button class="clear-btn" data-tok-delete="${t.id}" ${isSelf || !canManage ? 'disabled' : ''}>Delete</button>
+                </td>
+            </tr>`;
+            if (!open) return row;
+            const superuserToggle = currentIsSuperuser ? `
+                <label style="display:flex; align-items:center; gap:8px; font-size:11px; margin:8px 0 4px;">
+                    <input type="checkbox" data-tok-superuser="${t.id}" ${t.is_superuser ? 'checked' : ''} />
+                    Superuser — every permission, including ones added later
+                </label>` : '';
+            return row + `
+            <tr class="perm-editor-row">
+                <td colspan="8">
+                    ${superuserToggle}
+                    <div class="perm-grid">${permissionGridHtml(String(t.id), t.is_superuser ? permissionCatalog.map((p) => p.key) : t.permissions, t.is_superuser)}</div>
+                    <div class="row" style="margin-top:8px;">
+                        <button class="primary-btn" data-tok-perms-save="${t.id}">Save permissions</button>
+                        <span class="status-text" data-tok-perms-status="${t.id}"></span>
+                    </div>
                 </td>
             </tr>`;
         }).join('');
@@ -1657,34 +1831,83 @@ async function refreshTokens() {
 document.getElementById('tokens-refresh-btn').addEventListener('click', refreshTokens);
 
 document.getElementById('tokens-body').addEventListener('change', async (ev) => {
-    const id = ev.target.getAttribute('data-tok-revoke');
-    if (id == null) return;
-    await api(`/v1/admin/tokens/${id}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ revoked: ev.target.checked }),
-    });
-    refreshTokens();
+    const revokeId = ev.target.getAttribute('data-tok-revoke');
+    const superuserId = ev.target.getAttribute('data-tok-superuser');
+    if (revokeId != null) {
+        await patchAccount(revokeId, { revoked: ev.target.checked });
+    } else if (superuserId != null) {
+        // Promoting to superuser makes the per-permission checkboxes moot;
+        // demoting leaves whatever explicit grants the account already had.
+        await patchAccount(superuserId, { is_superuser: ev.target.checked });
+    }
 });
+
+/// PATCH an account and surface the API's own message on refusal — the guards
+/// (last superuser, editing yourself) all come back as a 400 with a reason.
+async function patchAccount(id, body) {
+    try {
+        const res = await api(`/v1/admin/tokens/${id}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || 'The change was rejected.');
+        }
+    } catch (e) {}
+    refreshTokens();
+}
 
 document.getElementById('tokens-body').addEventListener('click', async (ev) => {
     const regenId = ev.target.getAttribute('data-tok-regen');
     const delId = ev.target.getAttribute('data-tok-delete');
-    if (regenId != null) {
+    const permsId = ev.target.getAttribute('data-tok-perms');
+    const saveId = ev.target.getAttribute('data-tok-perms-save');
+    if (permsId != null) {
+        const id = Number(permsId);
+        if (openPermissionEditors.has(id)) openPermissionEditors.delete(id);
+        else openPermissionEditors.add(id);
+        refreshTokens();
+    } else if (saveId != null) {
+        const rowInputs = document.querySelectorAll(`#tokens-body input[data-perm-owner="${saveId}"]`);
+        const permissions = Array.from(rowInputs).filter((i) => i.checked).map((i) => i.getAttribute('data-perm'));
+        const statusEl = document.querySelector(`[data-tok-perms-status="${saveId}"]`);
+        if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'status-text working'; }
+        openPermissionEditors.delete(Number(saveId));
+        await patchAccount(saveId, { permissions });
+    } else if (regenId != null) {
         if (!confirm('Issue a new secret for this token? The old one stops working immediately.')) return;
         const res = await api(`/v1/admin/tokens/${regenId}/regenerate`, { method: 'POST' });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || 'The change was rejected.');
+            return;
+        }
         const data = await res.json();
         showNewTokenSecret(data.token);
         refreshTokens();
     } else if (delId != null) {
-        if (!confirm('Permanently delete this token? Usage/login history is kept, but the token stops working immediately.')) return;
-        await api(`/v1/admin/tokens/${delId}`, { method: 'DELETE' });
+        if (!confirm('Permanently delete this account? Its activity history is kept, but the account and its token stop working immediately.')) return;
+        const res = await api(`/v1/admin/tokens/${delId}`, { method: 'DELETE' });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || 'The change was rejected.');
+        }
         refreshTokens();
     }
 });
 
-document.getElementById('tok-role').addEventListener('change', (ev) => {
-    const needsLogin = ev.target.value !== 'regular';
-    document.getElementById('tok-login-fields').style.display = needsLogin ? '' : 'none';
+// An API-only key has no console login, so neither credentials nor console
+// permissions apply to it.
+document.getElementById('tok-kind').addEventListener('change', (ev) => {
+    const isConsole = ev.target.value === 'console';
+    document.getElementById('tok-login-fields').style.display = isConsole ? '' : 'none';
+    document.getElementById('tok-permissions-block').style.display = isConsole ? '' : 'none';
+});
+
+document.getElementById('tok-perm-none-btn').addEventListener('click', () => {
+    document.querySelectorAll('#tok-permissions input[data-perm]').forEach((i) => { i.checked = false; });
+    document.getElementById('tok-superuser').checked = false;
 });
 
 function showNewTokenSecret(rawToken) {
@@ -1694,20 +1917,29 @@ function showNewTokenSecret(rawToken) {
 
 document.getElementById('tok-create-btn').addEventListener('click', async () => {
     const statusEl = document.getElementById('tok-create-status');
-    const role = document.getElementById('tok-role').value;
+    const isConsole = document.getElementById('tok-kind').value === 'console';
     const owner_name = document.getElementById('tok-owner-name').value.trim();
     if (!owner_name) { statusEl.textContent = 'Owner name is required.'; statusEl.className = 'status-text err'; return; }
 
     const body = {
-        role, owner_name,
+        owner_name,
         owner_email: document.getElementById('tok-owner-email').value.trim() || null,
         notes: document.getElementById('tok-notes').value.trim() || null,
     };
-    if (role !== 'regular') {
+    if (isConsole) {
         body.username = document.getElementById('tok-username').value.trim();
         body.password = document.getElementById('tok-password').value;
         if (!body.username || !body.password) {
-            statusEl.textContent = `${role} tokens need a console username and password.`;
+            statusEl.textContent = 'A console account needs a username and password.';
+            statusEl.className = 'status-text err';
+            return;
+        }
+        body.is_superuser = currentIsSuperuser && document.getElementById('tok-superuser').checked;
+        body.permissions = Array.from(
+            document.querySelectorAll('#tok-permissions input[data-perm]')
+        ).filter((i) => i.checked).map((i) => i.getAttribute('data-perm'));
+        if (!body.is_superuser && !body.permissions.includes('console.access')) {
+            statusEl.textContent = "Without 'console.access' this account can't log in. Tick it or create an API-only key.";
             statusEl.className = 'status-text err';
             return;
         }
@@ -1734,6 +1966,8 @@ document.getElementById('tok-create-btn').addEventListener('click', async () => 
         document.getElementById('tok-notes').value = '';
         document.getElementById('tok-username').value = '';
         document.getElementById('tok-password').value = '';
+        document.getElementById('tok-superuser').checked = false;
+        renderCreatePermissionGrid();
         refreshTokens();
     } catch (e) {
         statusEl.textContent = 'Network error: ' + e.message;
@@ -1748,10 +1982,9 @@ async function refreshLoginLog() {
         document.getElementById('login-log-body').innerHTML = data.entries.map((e) => `
             <tr>
                 <td>${fmtTs(e.timestamp)}</td>
-                <td>${e.username}</td>
-                <td>${e.role ? roleBadge(e.role) : '—'}</td>
+                <td>${escapeHtml(e.username)}</td>
                 <td class="${e.success ? 'fg-success' : 'fg-error'}">${e.success ? 'success' : 'failed'}</td>
-                <td>${e.ip || '—'}</td>
+                <td>${e.ip ? escapeHtml(e.ip) : '—'}</td>
             </tr>`).join('');
     } catch (e) {}
 }
@@ -1764,26 +1997,37 @@ document.getElementById('login-log-clear-btn').addEventListener('click', async (
     refreshLoginLog();
 });
 
+// The activity feed carries two kinds of row: console actions somebody took
+// (source 'admin' — an action verb and a plain-English detail) and public-API
+// calls made with a bearer token (source 'api' — a status code). Console
+// actions are the default view, since API traffic can run to thousands of rows.
 async function refreshUsageLog() {
     try {
-        const res = await api('/v1/admin/usage-log');
+        const source = document.getElementById('usage-log-source').value;
+        const res = await api('/v1/admin/usage-log?source=' + encodeURIComponent(source));
         const data = await res.json();
-        document.getElementById('usage-log-body').innerHTML = data.entries.map((e) => `
-            <tr>
+        document.getElementById('usage-log-body').innerHTML = data.entries.map((e) => {
+            const who = e.username || e.owner_name;
+            return `
+            <tr class="${e.source === 'admin' ? 'usage-admin' : ''}">
                 <td>${fmtTs(e.timestamp)}</td>
-                <td>${e.owner_name}</td>
-                <td>${roleBadge(e.role)}</td>
+                <td>${escapeHtml(who)}</td>
+                <td class="usage-action">${e.action ? escapeHtml(e.action) : '—'}</td>
+                <td>${e.detail ? escapeHtml(e.detail) : '—'}</td>
                 <td>${e.method}</td>
-                <td>${e.endpoint}</td>
+                <td>${escapeHtml(e.endpoint)}</td>
                 <td class="${e.status_code >= 400 ? 'fg-error' : 'fg-success'}">${e.status_code ?? '—'}</td>
-            </tr>`).join('');
+                <td>${e.ip ? escapeHtml(e.ip) : '—'}</td>
+            </tr>`;
+        }).join('');
     } catch (e) {}
 }
 
 document.getElementById('usage-log-refresh-btn').addEventListener('click', refreshUsageLog);
+document.getElementById('usage-log-source').addEventListener('change', refreshUsageLog);
 
 document.getElementById('usage-log-clear-btn').addEventListener('click', async () => {
-    if (!confirm('Delete ALL usage log entries? This cannot be undone.')) return;
+    if (!confirm('Delete ALL activity log entries? This wipes the record of who did what, and cannot be undone.')) return;
     await api('/v1/admin/usage-log', { method: 'DELETE' });
     refreshUsageLog();
 });
@@ -1791,19 +2035,16 @@ document.getElementById('usage-log-clear-btn').addEventListener('click', async (
 // The subset that's safe to re-run on a recurring timer without disturbing
 // anything the operator is mid-interaction with (see startLiveRefresh above).
 function refreshLive() {
-    refreshStatus();
-    refreshSatelliteCache();
-    refreshGoesNcCache();
-    refreshSelfUpdateStatus();
-    if (currentRole === 'superuser') {
-        refreshAuthToggle();
-        refreshTokens();
-    }
+    if (can('status.view')) refreshStatus();
+    if (can('cache.view')) { refreshSatelliteCache(); refreshGoesNcCache(); }
+    if (can('selfupdate.check')) refreshSelfUpdateStatus();
+    if (can('authconfig.manage')) refreshAuthToggle();
+    if (can('users.view')) refreshTokens();
 }
 
 function refreshAll() {
     refreshLive();
-    refreshDbViewYears();
+    if (can('db.view')) refreshDbViewYears();
 }
 
 // ── Force-update the storms / recon MET archives ────────────────────────
@@ -1837,7 +2078,7 @@ function pollArchiveUpdate(archive, btn, statusEl) {
             statusEl.textContent = 'Done — ' + fmtArchiveSummary(archive, job.summary);
             statusEl.className = 'status-text ok';
         }
-        refreshStatus();
+        if (can('status.view')) refreshStatus();
     }, 3000);
 }
 
@@ -2105,7 +2346,8 @@ async function loadQuery() {
             const label = data.product ? `Product ${data.product}` : `Band ${data.band} (${data.cmap})`;
             setQStatus(`✓ ${data.satellite} ${label} — scan ${(data.scan_start || '').slice(0, 16)}Z`, 'ok');
             document.getElementById('query-result').innerHTML = `<img src="${API_BASE + data.png_url}" alt="rendered tile" />`;
-            refreshSatelliteCache(); refreshStatus();
+            if (can('cache.view')) refreshSatelliteCache();
+            if (can('status.view')) refreshStatus();
         }
     } catch (e) {
         setQStatus('Network error: ' + e.message, 'err');

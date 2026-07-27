@@ -135,7 +135,9 @@ curl localhost:8000/v1/recon/mission/<id>
 ### Console login
 On first run the server seeds a superuser from `admin_credentials.json`
 (default `admin` / `password`) into `data/auth.sqlite` — change it via the
-console's token management. Sessions are signed cookies keyed off that file's
+console's accounts pane. Every other console account gets explicit
+per-action permissions instead of the flag; an existing database is
+migrated off the old role groups at startup (`tokens::init_db`). Sessions are signed cookies keyed off that file's
 `secret_key` (the analog of Starlette's `SessionMiddleware`).
 
 ### 100% Rust — no Python

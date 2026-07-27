@@ -748,14 +748,42 @@ update" buttons still return `501` (the console UI shows them, but they
 don't work yet — see [RUST.md](RUST.md)). Run the ingest subcommands above
 by hand or via the nightly timer instead for now.
 
-Every console user has their own account with one of two roles (see
-"API tokens & accounts" below for how they're created):
+Every console user has their own account and their own set of **explicit
+permissions**, each independently switchable from the console's accounts
+pane (see "API tokens & accounts" below). There are no role groups: what
+someone can do is exactly the list of permissions granted to them.
 
-- **superuser** — everything, including account/token management and
-  triggering self-update.
-- **moderator** — everything except account/token management and
-  self-update — cache, logs, databases, archive-rebuild triggers, and the
-  usage log.
+`console.access` (log in at all), `status.view`, `logs.view`, `db.view`,
+`cache.view`, `cache.delete`, `archive.update`, `tiles.render`,
+`selfupdate.check`, `selfupdate.apply`, `users.view`, `users.manage`,
+`authconfig.manage`, `loginlog.view`, `logs.clear` — API.md's "Admin
+console" section describes what each one unlocks.
+
+One account carries a **superuser** flag instead: an implicit grant of
+every permission, including any added in future releases. On the canonical
+deployment that's `jjmurdock`. Only a superuser can grant the flag, create
+another superuser, or edit an account holding one — so handing someone
+`users.manage` delegates account admin without handing over the
+deployment. The last active superuser can't be deleted, revoked or
+demoted, and nobody can edit their own permissions.
+
+Permissions are read from `data/auth.sqlite` on **every** admin request
+rather than being baked into the session cookie, so granting or revoking
+one lands on that person's next click — no re-login, and revoking an
+account ends its live session immediately.
+
+**Every state-changing thing an operator does on the console is recorded**
+to the activity log against their username and IP: account and permission
+changes, cache deletions, database update triggers, self-update runs, the
+public-auth toggle, log clears, and login/logout. Read-only requests
+aren't — the console polls status, logs and cache listings every few
+seconds, and logging those would bury the trail. Browse it in the console's
+Activity log pane (filter: console actions / API calls / everything).
+
+Upgrading from the older three-role build migrates every account in place
+at startup: `jjmurdock` keeps the superuser flag, any other superuser gets
+all 15 permissions explicitly (so they can be pared back), each moderator
+gets the 8 they could actually use, and `regular` API keys get none.
 
 The very first account is bootstrapped automatically the first time the
 app starts: **`admin_credentials.json`** at the repo root (gitignored,
@@ -784,18 +812,23 @@ Off by default. A deployer can require an `Authorization: Bearer <token>`
 header on every public `/v1/*` data call (satellite/storms/recon/tdr/raw —
 `/v1/health` and the admin console always stay open) — useful for tracking
 or restricting who's calling your instance. Toggle it at install time (the
-installer asks) or later from the console's API management pane
-(superuser only) — takes effect immediately, no restart.
+installer asks) or later from the console's API management pane (needs
+`authconfig.manage`) — takes effect immediately, no restart.
 
-Three roles, one `tokens` table (`data/auth.sqlite`, same schema as the
-Python branch — see
+Two kinds of account, one `tokens` table (`data/auth.sqlite` — see
 [`crates/server/src/services/tokens.rs`](crates/server/src/services/tokens.rs)):
 
-- **regular** — a plain API key. No console login, tracked in the usage
-  log by owner name.
-- **moderator** / **superuser** — a console username+password *and* an API
-  key (the same token doubles as both — a superuser calling the public API
-  programmatically uses their own token same as anyone else).
+- **API-only key** — no username, no console login. Tracked in the
+  activity log by owner name.
+- **Console account** — a username+password *and* an API key (the same
+  token doubles as both, so someone calling the public API
+  programmatically uses their own token like anyone else), plus the
+  permission set described above.
+
+Permissions live in a `token_permissions` table, one row per grant, keyed
+`(token_id, permission)` and cascade-deleted with the account. Unknown
+permission keys are rejected at write time, so a typo can't create a grant
+no gate will ever check.
 
 Token secrets are high-entropy (32 random bytes, URL-safe base64) and
 stored as a fast hash (SHA-256) — safe to look up on every request without
@@ -807,11 +840,13 @@ branch, so `data/auth.sqlite` is portable between the two. A raw
 token/password is only ever shown once, at creation or regeneration time,
 exactly like a GitHub PAT.
 
-Every console login attempt (success or failure) lands in the login log;
-every authenticated public-API call lands in the usage log — both
-denormalize the owner name/role/username onto each row rather than only
-storing a foreign key, so history stays meaningful even after a token is
-deleted.
+Every console login attempt (success or failure) lands in the login log.
+The activity log (`usage_log`) carries two kinds of row: `source='api'`
+for authenticated public-API calls, and `source='admin'` for console
+actions — the latter with an `action` verb (`user.create`,
+`cache.clear_nc`) and a plain-English `detail`. Both denormalize the owner
+name and username onto each row rather than only storing a foreign key, so
+history stays meaningful after an account is deleted.
 
 ### netcdf-three demo client
 
@@ -899,7 +934,7 @@ crates/
                                    cookie signing key, cloned into every handler.
       logging.rs                    tracing subscriber: stdout + a daily-rotating file under logs/.
       auth.rs                       Console session (signed cookie via axum-extra's SignedCookieJar;
-                                   require_login/require_superuser) and the public-API token gate
+                                   require_login/require_permission) and the public-API token gate
                                    (require_api_token — a no-op unless auth_config.json's "enabled" is
                                    true). Still owns admin_credentials.json purely as the session
                                    cookie's secret-key source and the one-time legacy-migration input.
@@ -908,11 +943,14 @@ crates/
       routers/
         satellite.rs                 GET /v1/satellite/tile (all bands + both composite products),
                                    /status/{key}, /colortable, /colortables, /products.
-        admin.rs                      Login/logout/whoami, status, log tail, cache list/delete
-                                   (satellite + goes_nc, goes_nc also has netCDF structural-metadata
-                                   info), self-update. Bulk prefetch / archive-update are NOT ported
-                                   — routed to a 501 handler.
-        admin_tokens.rs                Token CRUD, login-log, usage-log, auth-config toggle.
+        admin.rs                      Login/logout/whoami, the permission catalog, status, log tail,
+                                   cache list/delete (satellite + goes_nc, goes_nc also has netCDF
+                                   structural-metadata info), self-update. Every handler gates on a
+                                   named permission and every mutation writes an audit entry. Bulk
+                                   prefetch is NOT ported — routed to a 501 handler.
+        admin_tokens.rs                Account/token CRUD incl. per-account permission grants, the
+                                   superuser flag and its guards, login-log, activity log,
+                                   auth-config toggle.
         storms.rs / recon.rs           Read-path routers (the ingest logic lives in services/, called
                                    from main.rs's subcommand dispatch, not from these routers).
         tdr.rs                         Mission/file discovery (years/:year/mission, same
@@ -928,8 +966,10 @@ crates/
         tokens.rs                       Token/account store backing both auth mechanisms — data/
                                    auth.sqlite, same schema and hash outputs as the Python branch
                                    (SHA-256 for token secrets, PBKDF2-HMAC-SHA256/310k iterations for
-                                   passwords — verified byte-identical, see its test module).
-                                   migrate_legacy_admin_credentials() bootstraps the first superuser.
+                                   passwords — verified byte-identical, see its test module). Owns
+                                   the PERMISSIONS catalog, token_permissions, and the audit writer
+                                   (record_admin_action). init_db() runs the one-time migration off
+                                   the old role groups onto explicit permissions.
         storms.rs                       storms.sqlite: the GET /v1/storms/* read path AND the
                                    HURDAT2 + ATCF ingest pipeline (run_ingest, called by main.rs's
                                    `ingest-storms` subcommand) in one file.

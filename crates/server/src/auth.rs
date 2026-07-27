@@ -1,10 +1,13 @@
 //! Auth for the admin console (signed-cookie session) and the optional public
-//! API token gate — port of `app/auth.py`.
+//! API token gate.
 //!
 //! Two mechanisms:
-//!   * **Console session** — a signed cookie (axum-extra `SignedCookieJar`, the
-//!     analog of Starlette's `SessionMiddleware`) holding `{authenticated, role,
-//!     username}`, signed with the secret in `admin_credentials.json`.
+//!   * **Console session** — a signed cookie (axum-extra `SignedCookieJar`)
+//!     holding `{authenticated, username, token_id}`, signed with the secret in
+//!     `admin_credentials.json`. The cookie carries *identity only*: what the
+//!     account may do is re-read from the database on every admin request
+//!     (`current_user`), so granting or revoking a permission takes effect on
+//!     that person's next click rather than at their next login.
 //!   * **Public API gate** — `require_api_token`, opt-in via `auth_config.json`
 //!     (off by default). When on, `/v1/*` data routes need a valid
 //!     `Authorization: Bearer <token>` OR a logged-in console session.
@@ -85,12 +88,12 @@ pub fn set_auth_enabled(repo_root: &Path, enabled: bool) -> std::io::Result<()> 
 
 // ── Console session ─────────────────────────────────────────────────────────
 
+/// What the signed cookie stores. Identity only — no permissions, no role. See
+/// the module docs for why.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
     pub authenticated: bool,
-    #[serde(default)]
-    pub role: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -100,9 +103,6 @@ pub struct Session {
 impl Session {
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
-    }
-    pub fn is_superuser(&self) -> bool {
-        self.role.as_deref() == Some("superuser")
     }
 }
 
@@ -114,31 +114,54 @@ pub fn read_session(jar: &SignedCookieJar) -> Session {
         .unwrap_or_default()
 }
 
-/// Console dependency: 401 unless the session is authenticated (`require_login`).
-pub fn require_login(jar: &SignedCookieJar) -> Result<Session, crate::error::ApiError> {
-    let s = read_session(jar);
-    if s.is_authenticated() {
-        Ok(s)
+/// Resolve the signed-in operator's live account row. Every admin handler goes
+/// through this (directly or via `require_permission`), which is what makes
+/// admin work run *as* a known person: the returned row is the identity the
+/// handler acts on and attributes its audit entry to.
+///
+/// 401 if there's no session, or if the account behind it was deleted, revoked,
+/// or lost `console.access` since the cookie was issued.
+pub fn require_login(state: &AppState, jar: &SignedCookieJar) -> Result<tokens::Token, ApiError> {
+    let unauthenticated =
+        || ApiError::new(axum::http::StatusCode::UNAUTHORIZED, "Not authenticated");
+
+    let session = read_session(jar);
+    if !session.is_authenticated() {
+        return Err(unauthenticated());
+    }
+    let token_id = session.token_id.ok_or_else(unauthenticated)?;
+    let conn = tokens::get_connection(&state.paths.auth_db)?;
+    tokens::load_session_account(&conn, token_id)?.ok_or_else(unauthenticated)
+}
+
+/// Console gate: 401 if not signed in, 403 without `permission`.
+pub fn require_permission(
+    state: &AppState,
+    jar: &SignedCookieJar,
+    permission: &str,
+) -> Result<tokens::Token, ApiError> {
+    let user = require_login(state, jar)?;
+    if user.has_permission(permission) {
+        Ok(user)
     } else {
-        Err(crate::error::ApiError::new(
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Not authenticated",
+        Err(ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            format!("This action requires the '{permission}' permission"),
         ))
     }
 }
 
-/// Console dependency: 401 if not logged in, 403 if not a superuser
-/// (`require_superuser`).
-pub fn require_superuser(jar: &SignedCookieJar) -> Result<Session, crate::error::ApiError> {
-    let s = require_login(jar)?;
-    if s.is_superuser() {
-        Ok(s)
-    } else {
-        Err(crate::error::ApiError::new(
-            axum::http::StatusCode::FORBIDDEN,
-            "Superuser access required",
-        ))
-    }
+/// Best-effort client IP for the audit trail. The API runs behind nginx in
+/// production, so the socket peer is always 127.0.0.1 — the forwarding headers
+/// are the only thing carrying the real caller.
+pub fn client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Return a jar with the session cookie set (signed).

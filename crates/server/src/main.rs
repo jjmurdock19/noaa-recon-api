@@ -83,8 +83,16 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("TDR DB init/migration failed: {e}");
     }
 
+    // Auth schema + the one-time migration off the old role groups onto
+    // explicit per-account permissions. Must run before any handler opens an
+    // auth connection: `tokens::get_connection` only applies the idempotent
+    // CREATE-IF-NOT-EXISTS schema, never the table rebuilds this does.
+    if let Err(e) = services::tokens::init_db(&state.paths.auth_db) {
+        tracing::error!("auth DB init/migration failed: {e}");
+    }
+
     // One-time: seed the first superuser from admin_credentials.json if the
-    // tokens table is empty (main.py's _migrate_legacy_admin startup hook).
+    // tokens table is empty.
     if let Ok(conn) = services::tokens::get_connection(&state.paths.auth_db) {
         if let Ok(true) = services::tokens::migrate_legacy_admin_credentials(
             &conn,
