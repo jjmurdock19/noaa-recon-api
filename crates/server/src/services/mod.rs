@@ -9,6 +9,7 @@ pub mod db;
 pub mod downloads;
 pub mod goes;
 pub mod hdf5_zstd;
+pub mod progress;
 pub mod recon_ingest;
 pub mod recon_met;
 pub mod self_update;

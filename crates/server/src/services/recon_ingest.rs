@@ -15,6 +15,7 @@ use chrono::{DateTime, Datelike, Utc};
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 
+use crate::services::progress::Progress;
 use crate::services::recon_met;
 use crate::services::storms;
 
@@ -820,11 +821,15 @@ fn reconcile_mismatched_storm_names(conn: &Connection, storms_conn: &Connection)
 // ── Orchestration ────────────────────────────────────────────────────────────
 
 /// Full recon ingest (`run_ingest`). `years` defaults to [current-1, current].
+///
+/// `progress` carries the live phase/counter the admin console polls; CLI and
+/// timer callers pass a `Progress::default()` and ignore it.
 pub async fn run_ingest(
     recon_db: &Path,
     storms_db: &Path,
     years: Option<Vec<i64>>,
     force: bool,
+    progress: &Progress,
 ) -> anyhow::Result<Value> {
     let years = years.unwrap_or_else(|| {
         let y = Utc::now().year() as i64;
@@ -840,9 +845,15 @@ pub async fn run_ingest(
     let (mut ingested, mut skipped, mut errors) = (0i64, 0i64, 0i64);
 
     for year in &years {
+        progress.phase(format!("{year} recon missions"), None);
         let mission_ids = get_mission_list(&http, *year).await;
+        progress.set_total(mission_ids.len() as i64);
         let mut year_ingested = 0;
         for mission_id in &mission_ids {
+            // Set before the harvest, not after: a mission's netCDF download
+            // is the slowest single step in the pass, so this is the line an
+            // operator sees while waiting.
+            progress.detail(mission_id);
             match harvest_mission(&http, &nc_http, &conn, *year, mission_id, force).await {
                 Ok(true) => {
                     year_ingested += 1;
@@ -854,11 +865,13 @@ pub async fn run_ingest(
                     errors += 1;
                 }
             }
+            progress.step();
         }
         years_map.insert(year.to_string(), json!(year_ingested));
     }
 
     // Reconciliation passes (need the storms DB for track matching).
+    progress.phase("Reconciling storm identities", None);
     let storms_conn = storms::get_connection(storms_db)?;
     let mut counts = Map::new();
     let cleaned = clean_null_island_observations(&conn)?;

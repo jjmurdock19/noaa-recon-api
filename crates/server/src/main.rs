@@ -185,7 +185,11 @@ async fn main() -> anyhow::Result<()> {
 /// `ingest-storms` subcommand — port of scripts/ingest_storms.py (HURDAT2 + ATCF).
 async fn cmd_ingest_storms(paths: &Paths) -> anyhow::Result<()> {
     println!("Ingesting storm-track archive (HURDAT2 + ATCF) — this usually takes ~10s...");
-    let summary = services::storms::run_ingest(&paths.storms_db).await?;
+    // Progress reporting exists for the admin console's polling; a CLI run
+    // has nothing reading it, so the reports go into a cell nobody snapshots.
+    let summary =
+        services::storms::run_ingest(&paths.storms_db, &services::progress::Progress::default())
+            .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -227,8 +231,14 @@ async fn cmd_ingest_recon(paths: &Paths, args: &[String]) -> anyhow::Result<()> 
         }
     }
     println!("Ingesting recon MET archive (crawl + netCDF + reconcile)...");
-    let summary =
-        services::recon_ingest::run_ingest(&paths.recon_met_db, &paths.storms_db, years, force).await?;
+    let summary = services::recon_ingest::run_ingest(
+        &paths.recon_met_db,
+        &paths.storms_db,
+        years,
+        force,
+        &services::progress::Progress::default(),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -263,7 +273,13 @@ async fn cmd_ingest_tdr(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         }
     }
     println!("Ingesting TDR archive (crawl Level 1b + Level 2, build local index)...");
-    let summary = services::tdr_ingest::run_ingest(&paths.tdr_db, years, force).await?;
+    let summary = services::tdr_ingest::run_ingest(
+        &paths.tdr_db,
+        years,
+        force,
+        &services::progress::Progress::default(),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }

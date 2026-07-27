@@ -46,6 +46,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
+use crate::services::progress::Progress;
 use crate::services::tdr;
 
 const LEVEL1B_BASE: &str = "https://seb.omao.noaa.gov/pub/flight/radar";
@@ -448,7 +449,15 @@ async fn harvest_mission_dir(
 /// same as the recon MET archive. Crawls Level 1b (flat mission dirs, all
 /// years live under one listing so the `years` filter is applied after the
 /// fact) and Level 2 (year -> storm -> mission) for each requested year.
-pub async fn run_ingest(tdr_db: &Path, years: Option<Vec<i64>>, force: bool) -> anyhow::Result<Value> {
+///
+/// `progress` carries the live phase/counter the admin console polls; CLI and
+/// timer callers pass a `Progress::default()` and ignore it.
+pub async fn run_ingest(
+    tdr_db: &Path,
+    years: Option<Vec<i64>>,
+    force: bool,
+    progress: &Progress,
+) -> anyhow::Result<Value> {
     let years = years.unwrap_or_else(|| {
         let y = Utc::now().year() as i64;
         vec![y - 1, y]
@@ -461,12 +470,22 @@ pub async fn run_ingest(tdr_db: &Path, years: Option<Vec<i64>>, force: bool) -> 
 
     let (mut ingested_1b, mut ingested_2, mut skipped, mut errors) = (0i64, 0i64, 0i64, 0i64);
 
-    for mission_id in get_level1b_mission_list(&http).await {
-        let Some(year) = mission_year(&mission_id) else { continue };
+    progress.phase("Level 1b missions", None);
+    // All years share one flat listing, so the year filter runs after the
+    // crawl — the total counts every mission listed, not just this year's.
+    let level1b = get_level1b_mission_list(&http).await;
+    progress.set_total(level1b.len() as i64);
+    for mission_id in level1b {
+        let Some(year) = mission_year(&mission_id) else {
+            progress.step();
+            continue;
+        };
         if !years.contains(&year) {
+            progress.step();
             continue;
         }
         let mission_url = format!("{LEVEL1B_BASE}/{mission_id}/");
+        progress.detail(&mission_id);
         match harvest_mission_dir(&http, &conn, &mission_id, year, Level::L1b, &mission_url, None, force)
             .await
         {
@@ -477,10 +496,15 @@ pub async fn run_ingest(tdr_db: &Path, years: Option<Vec<i64>>, force: bool) -> 
                 errors += 1;
             }
         }
+        progress.step();
     }
 
     for year in &years {
-        for slug in get_level2_storm_slugs(&http, *year).await {
+        progress.phase(format!("Level 2 storms {year}"), None);
+        let slugs = get_level2_storm_slugs(&http, *year).await;
+        progress.set_total(slugs.len() as i64);
+        for slug in slugs {
+            progress.detail(&slug);
             for mission_id in get_level2_mission_list(&http, *year, &slug).await {
                 let mission_url = format!("{LEVEL2_BASE}/{year}/{slug}/{mission_id}/");
                 match harvest_mission_dir(
@@ -503,9 +527,11 @@ pub async fn run_ingest(tdr_db: &Path, years: Option<Vec<i64>>, force: bool) -> 
                     }
                 }
             }
+            progress.step();
         }
     }
 
+    progress.phase("Counting", None);
     let total_missions: i64 = conn.query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))?;
     let total_files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
 

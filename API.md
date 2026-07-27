@@ -1023,7 +1023,7 @@ https://joshmurdock.net/api/
 | `/v1/admin/prefetch/{job_id}` | GET | Poll a prefetch job's progress. |
 | `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
 | `/v1/admin/archive-update/{archive}` | POST | Force-run the storms or recon MET nightly ingest immediately — `archive` is `storms` or `recon_met`. Same code path as the systemd timer (`storms.run_ingest()` / `recon_met.run_ingest()`), just triggered on demand for data that hasn't been picked up yet. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). |
-| `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done, started_at, finished_at, summary, error}`. |
+| `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done\|error, started_at, finished_at, summary, error}`. While `running` it also carries `progress: {phase, detail, done, total, updated_at}` — the phase the ingest is in, the item it's on, and how far through the phase it is. `total` is null for a phase whose size isn't known yet, and `updated_at` is the liveness clock: a timestamp that stops advancing means the job is wedged, which the counter alone can't distinguish from a slow single item. |
 | `/v1/admin/self-update/status` | GET | Cached "is an update available" check plus any in-progress apply job. |
 | `/v1/admin/self-update/check` | POST | Needs `selfupdate.check`. Force an immediate GitHub check, bypassing the periodic timer. |
 | `/v1/admin/self-update/apply` | POST | Needs `selfupdate.apply`. Pull the latest code and restart the process. |

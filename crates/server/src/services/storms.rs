@@ -180,6 +180,8 @@ use std::io::Read;
 use chrono::Datelike;
 use serde_json::{json, Value};
 
+use crate::services::progress::Progress;
+
 const HURDAT_URLS: [(&str, &str); 2] = [
     ("AL", "https://www.nhc.noaa.gov/data/hurdat/hurdat2-1851-2024-040425.txt"),
     ("EP", "https://www.nhc.noaa.gov/data/hurdat/hurdat2-nepac-1949-2023-042624.txt"),
@@ -483,7 +485,8 @@ pub async fn check_hurdat_updates(db_path: &Path) -> anyhow::Result<Value> {
             continue;
         }
         let text = client.get(&file.url).send().await?.error_for_status()?.text().await?;
-        let n = ingest_basin(&conn, &text)?;
+        // Timer-driven, with nothing polling it — reports go nowhere.
+        let n = ingest_basin(&conn, &text, &Progress::default())?;
         record_hurdat_source(&conn, &file)?;
         result.insert(
             file.basin.to_string(),
@@ -514,6 +517,30 @@ fn list_atcf_filenames(dir_html: &str, basin_prefix: &str, year: i64, gz: bool) 
     names.into_iter().collect()
 }
 
+/// Runs `f` inside one explicit transaction.
+///
+/// `upsert_storm` issues one statement per storm plus one per track point, so
+/// without an enclosing transaction every one of those is its own implicit
+/// commit — and in WAL mode each commit means an fsync and a fresh batch of
+/// WAL frames. A HURDAT2 pass is ~3k storms / ~80k track points, which is
+/// what made a console "Force update: Storm Tracks" appear to run forever
+/// while the `-wal` file grew without ever being folded back (auto-checkpoint
+/// can't reset the WAL while readers keep arriving, and the console polls
+/// this same DB every 3s for the duration of the job).
+fn in_transaction<T>(conn: &Connection, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    conn.execute_batch("BEGIN")?;
+    match f() {
+        Ok(v) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 fn upsert_storm(conn: &Connection, s: &ParsedStorm) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO storms (basin, atcf_id, year, name) VALUES (?1,?2,?3,?4) \
@@ -536,16 +563,25 @@ fn upsert_storm(conn: &Connection, s: &ParsedStorm) -> rusqlite::Result<()> {
 }
 
 /// Ingest one HURDAT2 file's named storms; returns the count ingested.
-fn ingest_basin(conn: &Connection, text: &str) -> anyhow::Result<i64> {
-    let mut count = 0;
-    for s in parse_hurdat2(text)? {
-        if !is_real_storm_name(&s.name) {
-            continue;
+///
+/// The whole basin goes in one transaction: parsing is already done by then
+/// and there's no network in the loop, so the write lock is held only for the
+/// inserts themselves.
+fn ingest_basin(conn: &Connection, text: &str, progress: &Progress) -> anyhow::Result<i64> {
+    let parsed = parse_hurdat2(text)?;
+    progress.set_total(parsed.len() as i64);
+    in_transaction(conn, || {
+        let mut count = 0;
+        for s in &parsed {
+            if is_real_storm_name(&s.name) {
+                progress.detail(&s.name);
+                upsert_storm(conn, s)?;
+                count += 1;
+            }
+            progress.step();
         }
-        upsert_storm(conn, &s)?;
-        count += 1;
-    }
-    Ok(count)
+        Ok(count)
+    })
 }
 
 fn max_year_for_basin(conn: &Connection, basin: &str) -> rusqlite::Result<Option<i64>> {
@@ -570,6 +606,7 @@ async fn ingest_atcf_season(
     prefix: &str,
     year: i64,
     live: bool,
+    progress: &Progress,
 ) -> anyhow::Result<i64> {
     let (dir_url, file_tmpl) = if live {
         (
@@ -583,20 +620,25 @@ async fn ingest_atcf_season(
         )
     };
 
+    progress.phase(format!("ATCF {basin} {year}"), None);
     let resp = client.get(&dir_url).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(0);
     }
     let dir_html = resp.error_for_status()?.text().await?;
     let filenames = list_atcf_filenames(&dir_html, prefix, year, !live);
+    // The listing is the first thing that knows this season's b-deck count.
+    progress.set_total(filenames.len() as i64);
 
     let mut ingested = 0;
     for filename in filenames {
         let num_start = format!("b{prefix}").len();
         let num = &filename[num_start..num_start + 2];
         let file_url = format!("{file_tmpl}{filename}");
+        progress.detail(&filename);
         let r = client.get(&file_url).send().await?;
         if r.status() == reqwest::StatusCode::NOT_FOUND {
+            progress.step();
             continue;
         }
         let r = r.error_for_status()?;
@@ -606,15 +648,23 @@ async fn ingest_atcf_season(
             gunzip(&r.bytes().await?)?
         };
         if let Some(parsed) = parse_atcf_bdeck(&text, basin, num, year) {
-            upsert_storm(conn, &parsed)?;
+            // One transaction per storm rather than per season: each b-deck
+            // arrives over the network, and the write lock must not be held
+            // across an HTTP fetch.
+            in_transaction(conn, || Ok(upsert_storm(conn, &parsed)?))?;
             ingested += 1;
         }
+        progress.step();
     }
     Ok(ingested)
 }
 
 /// Full HURDAT2 + ATCF ingest pass (`run_ingest`). Returns a JSON summary.
-pub async fn run_ingest(db_path: &Path) -> anyhow::Result<Value> {
+///
+/// `progress` is written as the pass moves through its phases so the admin
+/// console can show live motion instead of a bare "running"; CLI callers pass
+/// a `Progress::default()` and ignore it.
+pub async fn run_ingest(db_path: &Path, progress: &Progress) -> anyhow::Result<Value> {
     let conn = get_connection(db_path)?;
     let current_year = chrono::Utc::now().year() as i64;
     let client = reqwest::Client::builder()
@@ -623,8 +673,11 @@ pub async fn run_ingest(db_path: &Path) -> anyhow::Result<Value> {
 
     let mut hurdat = serde_json::Map::new();
     for (basin, url) in HURDAT_URLS {
+        // Declared before the fetch: the HURDAT2 files are several MB, so the
+        // download itself is long enough to look like a stall.
+        progress.phase(format!("HURDAT2 {basin}"), None);
         let text = client.get(url).send().await?.error_for_status()?.text().await?;
-        let n = ingest_basin(&conn, &text)?;
+        let n = ingest_basin(&conn, &text, progress)?;
         hurdat.insert(basin.to_string(), json!(n));
     }
 
@@ -633,15 +686,24 @@ pub async fn run_ingest(db_path: &Path) -> anyhow::Result<Value> {
         let start_year = max_year_for_basin(&conn, basin)?.unwrap_or(current_year - 1) + 1;
         let mut basin_summary = serde_json::Map::new();
         for gap_year in start_year..current_year {
-            let n = ingest_atcf_season(&client, &conn, basin, prefix, gap_year, false).await?;
+            let n = ingest_atcf_season(&client, &conn, basin, prefix, gap_year, false, progress).await?;
             basin_summary.insert(gap_year.to_string(), json!(n));
         }
-        let n = ingest_atcf_season(&client, &conn, basin, prefix, current_year, true).await?;
+        let n = ingest_atcf_season(&client, &conn, basin, prefix, current_year, true, progress).await?;
         basin_summary.insert(current_year.to_string(), json!(n));
         atcf.insert(basin.to_string(), Value::Object(basin_summary));
     }
 
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM storms", [], |r| r.get(0))?;
+
+    progress.phase("Checkpointing database", None);
+    // Fold the WAL back into the main DB and truncate it. Auto-checkpoint only
+    // fires opportunistically and gives up whenever a reader is mid-snapshot —
+    // with the console polling throughout an ingest, it can lose that race for
+    // the entire run and leave a multi-hundred-MB `-wal` behind. A busy
+    // checkpoint here is not an ingest failure, so its result is discarded.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+
     Ok(json!({ "hurdat2": hurdat, "atcf": atcf, "total_storms": total }))
 }
 

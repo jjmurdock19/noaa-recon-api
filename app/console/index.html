@@ -882,6 +882,7 @@ function showApp() {
     refreshUsageLog();
     if (can('loginlog.view')) refreshLoginLog();
     if (can('selfupdate.check')) refreshSelfUpdateBranches();
+    if (can('archive.update')) resumeArchiveUpdates();
     startLiveRefresh();
 }
 
@@ -2060,13 +2061,61 @@ function fmtArchiveSummary(archive, summary) {
     return `${summary.ingested} ingested, ${summary.skipped} unchanged, ${summary.errors} errors, ${summary.total_missions} missions total`;
 }
 
+function fmtDuration(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// How long a job may go without publishing progress before the console calls
+// it stalled. Comfortably longer than the slowest single step (a recon netCDF
+// download runs on a 120s timeout), so a slow mission never reads as a hang.
+const PROGRESS_STALL_SECONDS = 180;
+
+// The running job's `progress` block (services/progress.rs), as one line:
+// "ATCF AL 2026 · 12/47 · bal012026.dat · 1m 24s elapsed". Every part is
+// optional — a phase that doesn't know its size just omits the counter.
+function fmtArchiveProgress(job) {
+    const p = job.progress || {};
+    const bits = [];
+    if (p.phase) bits.push(p.phase);
+    if (p.total) bits.push(`${p.done}/${p.total}`);
+    else if (p.done) bits.push(`${p.done} done`);
+    if (p.detail) bits.push(p.detail);
+    if (job.started_at) bits.push(fmtDuration((Date.now() - Date.parse(job.started_at)) / 1000) + ' elapsed');
+    return bits.join(' · ') || 'running…';
+}
+
+// Seconds since the job last reported anything. This is what separates "slow"
+// from "wedged" — the counter alone can't, since a single stuck step looks
+// identical to one that's merely taking a while.
+function progressStalledFor(job) {
+    const t = job.progress && job.progress.updated_at;
+    return t ? (Date.now() - Date.parse(t)) / 1000 : 0;
+}
+
 function pollArchiveUpdate(archive, btn, statusEl) {
     const timer = setInterval(async () => {
-        const res = await api(`/v1/admin/archive-update/${archive}`);
-        const job = await res.json();
+        let job;
+        try {
+            const res = await api(`/v1/admin/archive-update/${archive}`);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            job = await res.json();
+        } catch (e) {
+            // A dropped poll is not a dropped job — the server is still
+            // running it, so keep the timer and say what happened.
+            statusEl.textContent = 'Lost contact with the API — still polling…';
+            statusEl.className = 'status-text err';
+            return;
+        }
         if (job.status === 'running' || job.status === 'queued') {
-            statusEl.textContent = `${job.status}…`;
-            statusEl.className = 'status-text working';
+            const stalled = progressStalledFor(job);
+            const stuck = stalled > PROGRESS_STALL_SECONDS;
+            statusEl.textContent = fmtArchiveProgress(job) +
+                (stuck ? ` · no progress for ${fmtDuration(stalled)}` : '');
+            statusEl.className = stuck ? 'status-text err' : 'status-text working';
             return;
         }
         clearInterval(timer);
@@ -2080,6 +2129,34 @@ function pollArchiveUpdate(archive, btn, statusEl) {
         }
         if (can('status.view')) refreshStatus();
     }, 3000);
+}
+
+// Reattach to any update still running server-side. The job outlives the page
+// that started it, so without this a reload (or a second operator opening the
+// console) shows an idle button next to a live ingest, and the only way to
+// learn it finished is to click again and get a 409.
+async function resumeArchiveUpdates() {
+    const attach = [
+        ['storms', 'storms-update-btn', 'storms-update-status'],
+        ['recon_met', 'reconmet-update-btn', 'reconmet-update-status'],
+        ['tdr', 'tdr-update-btn', 'tdr-update-status'],
+    ];
+    for (const [archive, btnId, statusId] of attach) {
+        try {
+            const res = await api(`/v1/admin/archive-update/${archive}`);
+            if (!res.ok) continue;
+            const job = await res.json();
+            if (job.status !== 'running' && job.status !== 'queued') continue;
+            const btn = document.getElementById(btnId);
+            const statusEl = document.getElementById(statusId);
+            btn.disabled = true;
+            statusEl.textContent = fmtArchiveProgress(job);
+            statusEl.className = 'status-text working';
+            pollArchiveUpdate(archive, btn, statusEl);
+        } catch (e) {
+            // Console still loads without it; the button just starts idle.
+        }
+    }
 }
 
 function startArchiveUpdate(archive, btnId, statusId, years) {
