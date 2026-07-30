@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod colormap;
 pub mod models;
 pub mod project; // Web-Mercator + geostationary geometry (abi_to_latlon)
+pub mod qc; // TDR "Custom QC" — a second, post-synthesis QC pass on the finished grid
 pub mod render; // array -> RGBA (gap-fill, smooth, colorize)
 pub mod sweep; // TDR sweep slicing (CAPPI / vertical-profile plane extraction)
 

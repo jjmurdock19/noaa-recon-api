@@ -256,6 +256,15 @@ async fn fetch_jobfile_storm(
     parse_jobfile_storm(&text)
 }
 
+/// The flight-number token used for a weather-reconnaissance training
+/// flight — e.g. `mission="WXWXA ET02"` — as opposed to a real storm
+/// mission's numeric flight number (`mission="0106E FAUSTO"`). Unlike a
+/// storm mission, the token *after* `WXWXA` is an exercise id, not a name,
+/// so it must be special-cased before the normal "second token is the name"
+/// parse below ever sees it.
+const TRAINING_FLIGHT_TOKEN: &str = "WXWXA";
+const TRAINING_STORM_NAME: &str = "Training";
+
 /// Pulls `(storm_name, atcf_id)` from a gunzipped jobfile tar's text (the
 /// `<flight mission="…" storm="…">` line). Split out for unit testing.
 fn parse_jobfile_storm(text: &str) -> Option<(String, Option<String>)> {
@@ -266,9 +275,16 @@ fn parse_jobfile_storm(text: &str) -> Option<(String, Option<String>)> {
 
     let mission_val = mission_re.captures(text)?.get(1)?.as_str().trim().to_string();
     // "3113A MELISSA" → the name is everything after the leading flight-number
-    // token; a training/ferry jobfile is just the number with no name → skip.
+    // token. A training flight's leading token is WXWXA (not a flight
+    // number) followed by an exercise id, not a storm name — e.g.
+    // "WXWXA ET02" — so it's labeled outright rather than misread as a
+    // storm called "Et02". A plain ferry/training jobfile with no second
+    // token at all still has no name → skip.
     let mut parts = mission_val.split_whitespace();
-    let _flight_num = parts.next()?;
+    let flight_num = parts.next()?;
+    if flight_num.eq_ignore_ascii_case(TRAINING_FLIGHT_TOKEN) {
+        return Some((TRAINING_STORM_NAME.to_string(), None));
+    }
     let name_raw = parts.collect::<Vec<_>>().join(" ");
     if name_raw.is_empty() {
         return None;
@@ -616,6 +632,27 @@ mod tests {
         let (name, atcf) = parse_jobfile_storm(text).unwrap();
         assert_eq!(name, "Melissa");
         assert_eq!(atcf.as_deref(), Some("AL132025"));
+    }
+
+    #[test]
+    fn parses_storm_name_from_second_token() {
+        let text = r#"<flight id="20260616H1" mission="0106E FAUSTO" storm="EP062026">"#;
+        let (name, atcf) = parse_jobfile_storm(text).unwrap();
+        assert_eq!(name, "Fausto");
+        assert_eq!(atcf.as_deref(), Some("EP062026"));
+    }
+
+    #[test]
+    fn wxwxa_leading_token_is_labeled_training() {
+        // The exercise id after WXWXA (here "ET02") is not a storm name —
+        // must not be mistaken for one, regardless of what it looks like.
+        let text = r#"<flight id="20260101H1" mission="WXWXA ET02" storm="">"#;
+        let (name, atcf) = parse_jobfile_storm(text).unwrap();
+        assert_eq!(name, "Training");
+        assert_eq!(atcf, None);
+
+        let lower = r#"<flight mission="wxwxa RANDOMTOKEN">"#;
+        assert_eq!(parse_jobfile_storm(lower).unwrap().0, "Training");
     }
 
     #[test]

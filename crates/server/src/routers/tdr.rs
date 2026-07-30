@@ -9,11 +9,92 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use noaa_recon_core::qc;
 use noaa_recon_core::sweep::colorscale_for_field;
 
 use crate::error::{ApiError, ApiResult};
 use crate::services::{tdr, tdr_nc};
 use crate::state::AppState;
+
+/// `qc=true` always means the real, indexed `product=xy` file at
+/// `level=1b` — never a synthetic product string (see `noaa_recon_core::qc`'s
+/// module doc and the dashboard's `resolveProductLevel`). No product-string
+/// mangling anywhere: the DB lookup (`tdr::find_file`) still keys on the
+/// literal `"xy"`/`"1b"` this validates.
+fn check_qc_product(qc: bool, product: &str) -> ApiResult<()> {
+    if qc && product != "xy" {
+        return Err(ApiError::bad_request("Custom QC (qc=true) currently only supports product=xy"));
+    }
+    Ok(())
+}
+
+/// Shown to a client alongside `qc_applied`/`qc_summary` so every response
+/// carries the caveat, not just the dashboard's own banner (see
+/// `clients/tdr-dashboard/index.html`'s disclaimer copy, which this mirrors).
+const QC_DISCLAIMER: &str = "Custom QC (Experimental): a locally-implemented, automated QC pass on top of \
+NOAA/HRD's real-time Level 1b grid. Not an official NOAA/NHC/HRD product, and not reviewed or endorsed by \
+them. Flags and masks statistical outliers in the finished grid but cannot correct upstream radar or \
+synthesis errors, and hasn't been validated against Level 2. Treat as a supplementary diagnostic.";
+
+/// Inserts the QC fields into an already-built sweep/volume/composite
+/// response object when a QC pass actually ran.
+fn insert_qc_fields(response: &mut Value, report: Option<qc::QcReport>) {
+    if let Some(report) = report {
+        let obj = response.as_object_mut().expect("response is always a JSON object");
+        obj.insert("qc_applied".into(), json!(true));
+        obj.insert("qc_summary".into(), serde_json::to_value(report).unwrap());
+        obj.insert("qc_disclaimer".into(), json!(QC_DISCLAIMER));
+    }
+}
+
+/// Fetches + decodes the paired `xy_rel` file for the D (cross-consistency)
+/// check, once the caller has already looked it up (`tdr::find_file`,
+/// synchronously, before any `.await` — a `&rusqlite::Connection` can never
+/// be passed into an async fn that itself awaits, since `Connection: !Sync`
+/// would make the whole handler's future non-`Send`; see `archive_update.rs`'s
+/// module doc for the same constraint). `requested_z` is passed through
+/// unchanged so the counterpart resolves to the *same* CAPPI level as
+/// whatever the primary file resolved to.
+async fn fetch_qc_counterpart_slice(
+    cache_dir: &std::path::Path,
+    counterpart_file: &tdr::FileRecord,
+    mission_id: &str,
+    level: &str,
+    analysis_time: &str,
+    field: &str,
+    requested_z: Option<f32>,
+) -> ApiResult<tdr_nc::FieldSlice> {
+    let cache_key = format!("{mission_id}_{level}_xy_rel_{analysis_time}");
+    let nc_path = tdr_nc::fetch_and_cache(cache_dir, &counterpart_file.source_url, &cache_key)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
+    let field = field.to_string();
+    tokio::task::spawn_blocking(move || tdr_nc::read_xy_slice(&nc_path, &field, requested_z))
+        .await
+        .map_err(|e| ApiError::internal(format!("qc counterpart slice task panicked: {e}")))?
+        .map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+/// Same as [`fetch_qc_counterpart_slice`] but for a whole `xy_rel` volume
+/// (the D check against a [`tdr_nc::FieldVolume`]).
+async fn fetch_qc_counterpart_volume(
+    cache_dir: &std::path::Path,
+    counterpart_file: &tdr::FileRecord,
+    mission_id: &str,
+    level: &str,
+    analysis_time: &str,
+    field: &str,
+) -> ApiResult<tdr_nc::FieldVolume> {
+    let cache_key = format!("{mission_id}_{level}_xy_rel_{analysis_time}");
+    let nc_path = tdr_nc::fetch_and_cache(cache_dir, &counterpart_file.source_url, &cache_key)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
+    let field = field.to_string();
+    tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+        .await
+        .map_err(|e| ApiError::internal(format!("qc counterpart volume task panicked: {e}")))?
+        .map_err(|e| ApiError::bad_request(e.to_string()))
+}
 
 pub fn router() -> Router<AppState> {
     // Static segments ("years", "mission") resolve ahead of the `:year`
@@ -161,6 +242,12 @@ struct SweepQuery {
     /// actual analysis level (returned as `z_km`). Ignored for `vert_*`
     /// products, which have no level axis. Defaults to 2.0km.
     z: Option<f32>,
+    /// Runs the experimental "Custom QC" pass (`noaa_recon_core::qc`) on the
+    /// decoded grid before returning it — see the module doc comment there.
+    /// Forces `level` to `"1b"` regardless of what was requested, and only
+    /// `product=xy` is accepted. Adds `qc_applied`/`qc_summary`/
+    /// `qc_disclaimer` to the response; omitted entirely when unset/false.
+    qc: Option<bool>,
 }
 
 async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -> ApiResult<Json<Value>> {
@@ -171,11 +258,17 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
             q.product
         )));
     }
+    let want_qc = q.qc.unwrap_or(false);
+    check_qc_product(want_qc, &q.product)?;
 
     let conn = conn(&state)?;
     let mission = tdr::get_mission(&conn, &q.mission_id)?
         .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {}", q.mission_id)))?;
-    let level = q.level.unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
+    let level = if want_qc {
+        "1b".to_string()
+    } else {
+        q.level.unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() })
+    };
 
     let file = tdr::find_file(&conn, &q.mission_id, &level, &q.product, &q.analysis_time, "nc")?.ok_or_else(|| {
         ApiError::not_found(format!(
@@ -184,6 +277,10 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
             q.product, q.mission_id, q.analysis_time, q.mission_id
         ))
     })?;
+    // Looked up synchronously alongside the primary file, before any
+    // `.await` — see `fetch_qc_counterpart_slice`'s doc comment.
+    let counterpart_file =
+        if want_qc { tdr::find_file(&conn, &q.mission_id, &level, "xy_rel", &q.analysis_time, "nc")? } else { None };
 
     let cache_dir = state.paths.cache_root.join("tdr_nc");
     let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, q.analysis_time);
@@ -191,9 +288,16 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
         .await
         .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
 
+    let counterpart = match &counterpart_file {
+        Some(cf) => {
+            Some(fetch_qc_counterpart_slice(&cache_dir, cf, &q.mission_id, &level, &q.analysis_time, &q.field, q.z).await?)
+        }
+        None => None,
+    };
+
     let field = q.field.clone();
     let requested_z = q.z;
-    let slice = tokio::task::spawn_blocking(move || {
+    let mut slice = tokio::task::spawn_blocking(move || {
         if is_vert {
             tdr_nc::read_vert_slice(&nc_path, &field)
         } else {
@@ -204,11 +308,17 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
     .map_err(|e| ApiError::internal(format!("slice task panicked: {e}")))?
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
+    let qc_report = if want_qc {
+        Some(tdr_nc::apply_qc_to_slice(&mut slice, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+    } else {
+        None
+    };
+
     let cs = colorscale_for_field(&q.field);
     let data: Vec<Vec<Option<f64>>> =
         slice.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "mission_id": mission.mission_id,
         "storm_name": slice.storm_name_attr.unwrap_or(mission.storm_name),
         "level": level,
@@ -225,7 +335,9 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
         "units": cs.units,
         "origin_lat": slice.origin_lat,
         "origin_lon": slice.origin_lon,
-    })))
+    });
+    insert_qc_fields(&mut response, qc_report);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -238,23 +350,33 @@ struct VolumeQuery {
     product: String,
     analysis_time: String,
     field: String,
+    /// Same meaning as `SweepQuery::qc` — forces `level` to `"1b"` and
+    /// requires `product=xy`.
+    qc: Option<bool>,
 }
 
+/// `qc`: same forcing behavior as `SweepQuery::qc` — see `check_qc_product`.
 fn resolve_mission_and_file(
     conn: &rusqlite::Connection,
     mission_id: &str,
     level: &Option<String>,
     product: &str,
     analysis_time: &str,
+    qc: bool,
 ) -> ApiResult<(tdr::Mission, tdr::FileRecord, String)> {
     if !product.starts_with("xy") {
         return Err(ApiError::bad_request(format!(
             "Unknown product '{product}' — expected xy or xy_rel (a vertical profile has no level axis)."
         )));
     }
+    check_qc_product(qc, product)?;
     let mission = tdr::get_mission(conn, mission_id)?
         .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {mission_id}")))?;
-    let level = level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
+    let level = if qc {
+        "1b".to_string()
+    } else {
+        level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() })
+    };
     let file = tdr::find_file(conn, mission_id, &level, product, analysis_time, "nc")?.ok_or_else(|| {
         ApiError::not_found(format!(
             "No '{product}' netCDF file on record for mission {mission_id} at level {level}, \
@@ -265,9 +387,12 @@ fn resolve_mission_and_file(
 }
 
 async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>) -> ApiResult<Json<Value>> {
+    let want_qc = q.qc.unwrap_or(false);
     let conn = conn(&state)?;
     let (mission, file, level) =
-        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time)?;
+        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time, want_qc)?;
+    let counterpart_file =
+        if want_qc { tdr::find_file(&conn, &q.mission_id, &level, "xy_rel", &q.analysis_time, "nc")? } else { None };
 
     let cache_dir = state.paths.cache_root.join("tdr_nc");
     let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, q.analysis_time);
@@ -275,11 +400,22 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
 
+    let counterpart = match &counterpart_file {
+        Some(cf) => Some(fetch_qc_counterpart_volume(&cache_dir, cf, &q.mission_id, &level, &q.analysis_time, &q.field).await?),
+        None => None,
+    };
+
     let field = q.field.clone();
-    let volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+    let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
         .await
         .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let qc_report = if want_qc {
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+    } else {
+        None
+    };
 
     let cs = colorscale_for_field(&q.field);
     let data: Vec<Vec<Vec<Option<f64>>>> = volume
@@ -288,7 +424,7 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
         .map(|plane| plane.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect())
         .collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "mission_id": mission.mission_id,
         "storm_name": volume.storm_name_attr.unwrap_or(mission.storm_name),
         "level": level,
@@ -305,7 +441,9 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
         "units": cs.units,
         "origin_lat": volume.origin_lat,
         "origin_lon": volume.origin_lon,
-    })))
+    });
+    insert_qc_fields(&mut response, qc_report);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -331,6 +469,13 @@ struct CompositeQuery {
     /// `mode=time` only — which CAPPI level to mosaic. Defaults to 2.0km.
     /// Ignored for `mode=time_volume`, which mosaics every level.
     z: Option<f32>,
+    /// Same meaning as `SweepQuery::qc`, run per analysis-time file *before*
+    /// mosaicking (never on the combined mosaic — a synthesis-stage artifact
+    /// shouldn't get smeared across the composite). Scoped to checks A/B/C/E
+    /// here — the D (cross-consistency) check is skipped for composites, to
+    /// avoid multiplying the counterpart-file fetch by every analysis time
+    /// in the mosaic.
+    qc: Option<bool>,
 }
 
 /// `GET /v1/tdr/composite` — two ways to flatten a mission's TDR data into
@@ -357,6 +502,7 @@ struct CompositeQuery {
 ///   from one analysis time shouldn't dominate the composite) — never a
 ///   last-write-wins overlay.
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
+    let want_qc = q.qc.unwrap_or(false);
     let conn = conn(&state)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
 
@@ -367,9 +513,11 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 q.product
             )));
         }
+        check_qc_product(want_qc, &q.product)?;
         let mission = tdr::get_mission(&conn, &q.mission_id)?
             .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {}", q.mission_id)))?;
-        let level = q.level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
+        let level =
+            if want_qc { "1b".to_string() } else { q.level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() }) };
         let files = tdr::find_files_for_product(&conn, &q.mission_id, &level, &q.product)?;
         if files.is_empty() {
             return Err(ApiError::not_found(format!(
@@ -377,25 +525,31 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 q.product, q.mission_id
             )));
         }
-        return get_composite_time_volume(mission, level, files, &cache_dir, &q).await;
+        return get_composite_time_volume(mission, level, files, &cache_dir, &q, want_qc).await;
     }
 
+    let mut qc_report = qc::QcReport::default();
     let (mission, level, x, y, data, detail, origin) = match q.mode.as_str() {
         "altitude" => {
             let analysis_time = q.analysis_time.clone().ok_or_else(|| {
                 ApiError::bad_request("mode=altitude requires analysis_time".to_string())
             })?;
             let (mission, file, level) =
-                resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &analysis_time)?;
+                resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &analysis_time, want_qc)?;
             let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, analysis_time);
             let nc_path = tdr_nc::fetch_and_cache(&cache_dir, &file.source_url, &cache_key)
                 .await
                 .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
             let field = q.field.clone();
-            let slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_altitude_composite(&nc_path, &field))
+            let mut slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_altitude_composite(&nc_path, &field))
                 .await
                 .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
                 .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            if want_qc {
+                // No D (cross-consistency) check for composites — see
+                // `CompositeQuery::qc`'s doc comment.
+                qc_report = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, &qc::QcParams::default());
+            }
             let origin = slice.origin_lat.zip(slice.origin_lon);
             (mission, level, slice.x, slice.y, slice.data, json!({"analysis_time": analysis_time}), origin)
         }
@@ -406,9 +560,14 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     q.product
                 )));
             }
+            check_qc_product(want_qc, &q.product)?;
             let mission = tdr::get_mission(&conn, &q.mission_id)?
                 .ok_or_else(|| ApiError::not_found(format!("Unknown TDR mission_id: {}", q.mission_id)))?;
-            let level = q.level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() });
+            let level = if want_qc {
+                "1b".to_string()
+            } else {
+                q.level.clone().unwrap_or_else(|| if mission.has_level2 { "2".into() } else { "1b".into() })
+            };
             let files = tdr::find_files_for_product(&conn, &q.mission_id, &level, &q.product)?;
             if files.is_empty() {
                 return Err(ApiError::not_found(format!(
@@ -420,6 +579,9 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
 
             // Read every analysis time's slice first (need them all in hand
             // before we know the reference origin to offset the rest from).
+            // Custom QC runs per slice, here, before mosaicking — never on
+            // the combined mosaic, so a synthesis-stage artifact in one
+            // analysis time can't get smeared across the composite.
             let mut slices = Vec::with_capacity(files.len());
             for file in &files {
                 let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
@@ -427,10 +589,14 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     .await
                     .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
                 let field = q.field.clone();
-                let slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_slice(&nc_path, &field, Some(requested_z)))
+                let mut slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_slice(&nc_path, &field, Some(requested_z)))
                     .await
                     .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
                     .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                if want_qc {
+                    let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, &qc::QcParams::default());
+                    qc_report.merge(r);
+                }
                 slices.push((file.analysis_time.clone(), slice));
             }
 
@@ -485,7 +651,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
     let cs = colorscale_for_field(&q.field);
     let data_out: Vec<Vec<Option<f64>>> = data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "mission_id": mission.mission_id,
         "storm_name": mission.storm_name,
         "level": level,
@@ -502,7 +668,9 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
         "zmin": cs.zmin,
         "zmax": cs.zmax,
         "units": cs.units,
-    })))
+    });
+    insert_qc_fields(&mut response, want_qc.then_some(qc_report));
+    Ok(Json(response))
 }
 
 /// `mode=time_volume` — the 3D counterpart to `mode=time`: instead of
@@ -522,9 +690,13 @@ async fn get_composite_time_volume(
     files: Vec<tdr::FileRecord>,
     cache_dir: &std::path::Path,
     q: &CompositeQuery,
+    want_qc: bool,
 ) -> ApiResult<Json<Value>> {
     // Read every analysis time's whole volume first — need them all in hand
-    // before we know the reference origin and canonical level grid.
+    // before we know the reference origin and canonical level grid. Custom
+    // QC (no D/cross-consistency check — see `CompositeQuery::qc`) runs on
+    // each volume here, before mosaicking.
+    let mut qc_report = qc::QcReport::default();
     let mut volumes = Vec::with_capacity(files.len());
     for file in &files {
         let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
@@ -532,10 +704,14 @@ async fn get_composite_time_volume(
             .await
             .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
         let field = q.field.clone();
-        let volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+        let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
             .await
             .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if want_qc {
+            let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, &qc::QcParams::default());
+            qc_report.merge(r);
+        }
         volumes.push((file.analysis_time.clone(), volume));
     }
 
@@ -592,7 +768,7 @@ async fn get_composite_time_volume(
     }
 
     let cs = colorscale_for_field(&q.field);
-    Ok(Json(json!({
+    let mut response = json!({
         "mission_id": mission.mission_id,
         "storm_name": mission.storm_name,
         "level": level,
@@ -614,7 +790,9 @@ async fn get_composite_time_volume(
         "zmin": cs.zmin,
         "zmax": cs.zmax,
         "units": cs.units,
-    })))
+    });
+    insert_qc_fields(&mut response, want_qc.then_some(qc_report));
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -638,6 +816,10 @@ struct PlaneSliceQuery {
     /// How many evenly-spaced points to sample along the line. Defaults to
     /// 100; clamped to at least 2.
     n: Option<usize>,
+    /// Same meaning as `SweepQuery::qc` — runs on the whole volume before
+    /// the cut is taken, so the cross-section reflects cleaned data rather
+    /// than being interpolated from a still-raw volume.
+    qc: Option<bool>,
 }
 
 /// `GET /v1/tdr/plane_slice` — the "plane slice" tool: an arbitrary
@@ -651,9 +833,12 @@ struct PlaneSliceQuery {
 /// smooth regardless of the line's angle through the grid — not just
 /// snapped to the nearest existing column.
 async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSliceQuery>) -> ApiResult<Json<Value>> {
+    let want_qc = q.qc.unwrap_or(false);
     let conn = conn(&state)?;
     let (mission, file, level) =
-        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time)?;
+        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time, want_qc)?;
+    let counterpart_file =
+        if want_qc { tdr::find_file(&conn, &q.mission_id, &level, "xy_rel", &q.analysis_time, "nc")? } else { None };
 
     let cache_dir = state.paths.cache_root.join("tdr_nc");
     let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, q.analysis_time);
@@ -661,11 +846,22 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
         .await
         .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
 
+    let counterpart = match &counterpart_file {
+        Some(cf) => Some(fetch_qc_counterpart_volume(&cache_dir, cf, &q.mission_id, &level, &q.analysis_time, &q.field).await?),
+        None => None,
+    };
+
     let field = q.field.clone();
-    let volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
+    let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
         .await
         .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let qc_report = if want_qc {
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+    } else {
+        None
+    };
 
     let n = q.n.unwrap_or(100).max(2);
     let cut = noaa_recon_core::sweep::plane_slice(
@@ -684,7 +880,7 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
     let data: Vec<Vec<Option<f64>>> =
         cut.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "mission_id": mission.mission_id,
         "storm_name": volume.storm_name_attr.unwrap_or(mission.storm_name),
         "level": level,
@@ -701,7 +897,9 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
         "units": cs.units,
         "origin_lat": volume.origin_lat,
         "origin_lon": volume.origin_lon,
-    })))
+    });
+    insert_qc_fields(&mut response, qc_report);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -739,8 +937,12 @@ struct CentersQuery {
 async fn get_centers(State(state): State<AppState>, Query(q): Query<CentersQuery>) -> ApiResult<Json<Value>> {
     let product = q.product.clone().unwrap_or_else(|| "xy".into());
     let conn = tdr::get_connection(&state.paths.tdr_db)?;
+    // Custom QC isn't wired up for center-finding — not exposed in the
+    // dashboard, and this endpoint's raw U/V fit is arguably a different
+    // concern from the gridded-field QC checks here — so `qc` is always
+    // `false` for this call.
     let (mission, file, level) =
-        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &product, &q.analysis_time)?;
+        resolve_mission_and_file(&conn, &q.mission_id, &q.level, &product, &q.analysis_time, false)?;
     drop(conn);
 
     let cache_dir = state.paths.cache_root.join("tdr_nc");

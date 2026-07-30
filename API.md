@@ -600,14 +600,16 @@ different hosts and QC lineage:
 
 A mission can appear at either level, both, or (rarely) neither yet.
 `mission_id` (`YYYYMMDDAI`) uses the exact same scheme as the recon MET
-archive's mission IDs — see "Recon MET archive" above — so storm-name
-resolution is done **live at read time** by looking the mission ID up in the
-recon MET index, not stored as an association. Recon's storm name wins; if the
-mission isn't in the recon index yet, the ingest-time label (the Level 2
-directory name, or the Level 1b jobfile's storm name) is the fallback, then
-"Unknown". Because it's recomputed per request, a TDR flight that lands before
-its recon data self-resolves the moment recon ingest catches up — no backfill
-step.
+archive's mission IDs — see "Recon MET archive" above — but storm identity is
+entirely TDR's own: `storm_name`/`storm_id` are stored columns captured at
+ingest time from a same-host source (the Level 1b mission's own jobfile, or
+the Level 2 storm-slug path), never resolved against the recon MET index or
+any other database. This used to be resolved live via a join against recon
+MET, but that made a TDR mission's displayed name hostage to recon's own
+storm-name reconciliation — see `services/tdr.rs`'s module doc for why that
+was dropped. An admin can correct a wrong/missing name via the console
+(`PATCH /v1/admin/tdr/missions/{mission_id}`, below), which locks it against
+being overwritten by a future crawl.
 
 This phase only indexes file **metadata** (mission → product → source URL)
 — it never downloads a netCDF file. Actual decode/slice rendering
@@ -654,8 +656,9 @@ schema's layout — nobody has inspected a real one yet.
 | `product` | string | *required* | `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall` — see `GET /v1/tdr/mission/{id}` for what a given mission actually has. |
 | `analysis_time` | string | *required* | `HHMM`, matching one of the mission's indexed analysis times. |
 | `field` | string | *required* | `xy`/`xy_rel`: `reflectivity`, `radial_wind`, `tangential_wind`, `u`, `v`, `w`, `vort`, `wind_speed`. `vert_*`: `reflectivity`, `radial_wind`, `tangential_wind`, `wind_speed`. |
-| `level` | string | resolved | `1b` or `2` (which source level's file to read). Defaults to `2` if that mission has a Level 2 file, else `1b`. |
+| `level` | string | resolved | `1b` or `2` (which source level's file to read). Defaults to `2` if that mission has a Level 2 file, else `1b`. Ignored (forced to `1b`) when `qc=true`. |
 | `z` | float | `2.0` | `xy`/`xy_rel` only — CAPPI altitude in km, snapped to the nearest actual analysis level (echoed back as `z_km`). Ignored for `vert_*` (no level axis). |
+| `qc` | bool | `false` | Runs the experimental "Custom QC" pass on the decoded grid — see "Custom QC" below. Only `product=xy` is accepted when set; `level` is forced to `1b`. Adds `qc_applied`/`qc_summary`/`qc_disclaimer` to the response. |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&z=2.0"
@@ -726,7 +729,8 @@ to pick.
 | `product` | string | *required* | `xy` or `xy_rel` only — a vertical profile (`vert_*`) has no level axis to volume-render. |
 | `analysis_time` | string | *required* | `HHMM`, matching one of the mission's indexed analysis times. |
 | `field` | string | *required* | `reflectivity`, `radial_wind`, `tangential_wind`, `u`, `v`, `w`, `vort`, `wind_speed`. |
-| `level` | string | resolved | `1b` or `2`. Defaults to `2` if that mission has a Level 2 file, else `1b`. |
+| `level` | string | resolved | `1b` or `2`. Defaults to `2` if that mission has a Level 2 file, else `1b`. Ignored (forced to `1b`) when `qc=true`. |
+| `qc` | bool | `false` | Same meaning as `/tdr/sweep`'s — see "Custom QC" below. |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/volume?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity"
@@ -789,8 +793,9 @@ wind/vorticity composite). The resolved mode is echoed back in
 | `field` | string | *required* | Same field list as `/tdr/sweep`/`/tdr/volume`. |
 | `mode` | string | *required* | `altitude`, `time`, or `time_volume`. |
 | `analysis_time` | string | required for `mode=altitude` | Ignored for `time`/`time_volume` (they use every indexed time). |
-| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. |
+| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. Ignored (forced to `1b`) when `qc=true`. |
 | `z` | float | `2.0` | `mode=time` only — which CAPPI level to mosaic. Ignored for `mode=time_volume` (mosaics every level) and `mode=altitude` (collapses every level). |
+| `qc` | bool | `false` | Same meaning as `/tdr/sweep`'s, run per analysis-time file *before* mosaicking — see "Custom QC" below. Scoped to checks A/B/C/E there (no cross-consistency check against `xy_rel`, to avoid multiplying that fetch by every analysis time in the mosaic). |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product=xy&field=reflectivity&mode=altitude&analysis_time=1201"
@@ -867,9 +872,10 @@ through the grid.
 | `product` | string | *required* | `xy` or `xy_rel` only. |
 | `analysis_time` | string | *required* | |
 | `field` | string | *required* | Same field list as `/tdr/volume`. |
-| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. |
+| `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. Ignored (forced to `1b`) when `qc=true`. |
 | `x0`, `y0`, `x1`, `y1` | float | *required* | The cut line's two endpoints, in the same km-from-origin coordinate system a prior `/tdr/sweep` or `/tdr/volume` response's `x`/`y` use — pass through coordinates a user clicked on that plot directly. |
 | `n` | int | `100` | How many evenly-spaced points to sample along the line. Clamped to at least 2. |
+| `qc` | bool | `false` | Same meaning as `/tdr/sweep`'s, run on the whole volume before the cut is taken — see "Custom QC" below. |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/plane_slice?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&x0=-50&y0=0&x1=50&y1=0&n=150"
@@ -897,6 +903,83 @@ curl "https://joshmurdock.net/api/v1/tdr/plane_slice?mission_id=20240630I1&produ
   altitude in km (same as `/tdr/volume`'s `levels_km`). `data[row][col]`
   — row indexes `y`/altitude, col indexes `x`/along-line distance.
 - Error responses are the same shape as `/tdr/volume`'s.
+
+---
+
+## Custom QC (`qc=true`) 🟢 — experimental
+
+An optional, locally-implemented second QC pass on top of NOAA/HRD's
+real-time Level 1b `xy` grid, available on `/tdr/sweep`, `/tdr/volume`,
+`/tdr/composite`, and `/tdr/plane_slice` via `qc=true`. **Not an official
+NOAA/NHC/HRD product** — implemented in this codebase, not reviewed or
+endorsed by NOAA, and not validated against Level 2.
+
+Why it's a genuinely different thing from NOAA's own automated Level 1b QC
+(not a duplicate of it): every documented HRD QC step — dealiasing,
+sea-clutter/sidelobe removal, spectral-width gating, dual-PRF
+range-ambiguity correction — runs on **raw Doppler radials and individual
+sweeps**, upstream of or during the 3D-variational synthesis that produces
+the `xy`/`vert_*` grids this API serves. This API never downloads raw
+radials (see `services/tdr_ingest.rs`) — only the finished gridded
+product — so Custom QC is a **second pass on the already-synthesized grid**
+(`crates/core/src/qc.rs`), catching synthesis-stage artifacts (grid-cell
+spikes, vertical discontinuities, azimuthal stitching seams, low-coverage
+edges, storm-relative-transform errors) that no raw-radial QC could ever
+see, since they only exist after the variational solve. It cannot correct
+anything upstream of that.
+
+Five checks, each a robust (median/MAD-based, not a fixed physical
+threshold) statistical-outlier test against a cell's own local context, so
+it self-calibrates per mission/field:
+
+| Check | What it flags |
+|---|---|
+| Spatial despiking | A cell whose value is a statistical outlier against its immediate (5x5 by default) neighborhood. |
+| Vertical continuity | A cell whose value is a statistical outlier against nearby CAPPI levels at the same (x,y). |
+| Azimuthal-ring consistency | A cell whose value departs from its own radius-annulus's typical value (binned around the grid origin, which is already storm-centered by construction). |
+| Cross-consistency | *Opportunistic* — only runs when the paired `xy_rel` (or `xy`) file exists for the same mission/level/analysis_time. Flags cells that disagree with their counterpart beyond what the field's own expected relationship allows (near-zero for `reflectivity`/`w`/`vort`; a constant storm-motion offset for `u`/`v`; skipped for `radial_wind`/`tangential_wind`, different projections by definition). |
+| Low-coverage edge trim | A cell with too few valid neighbors to be trustworthy, regardless of its value — targets the exact weakness Gamache's automated-QC report calls out: it over-trims relative to manual QC, worst near the inner eyewall edge. |
+
+A flagged cell is set to `null` — never interpolated or fabricated, same
+convention as an ordinary `missing_value`-masked cell.
+
+Behavior when `qc=true`:
+- `level` is forced to `1b` regardless of what was requested (Custom QC is
+  a Level 1b concept by definition) and only `product=xy` is accepted
+  (`400` otherwise) — the one dropdown/API option, not a family of
+  QC'd product variants.
+- The response gets three extra fields: `"qc_applied": true`,
+  `"qc_summary": {cells_examined, cells_flagged_despike,
+  cells_flagged_vertical, cells_flagged_azimuthal,
+  cells_flagged_cross_consistency, cells_flagged_edge}`, and a
+  `"qc_disclaimer"` string carrying the same caveat as this section — so
+  any API consumer sees it, not just the dashboard's own banner. All three
+  are omitted entirely when `qc` isn't set.
+- `/tdr/composite` runs QC per analysis-time file *before* mosaicking,
+  never on the combined mosaic (so one bad file's artifacts can't smear
+  across the composite), and skips the cross-consistency check specifically
+  (to avoid multiplying the counterpart-file fetch by every analysis time
+  in the mosaic) — `qc_summary` there is the sum across every file.
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&qc=true"
+```
+
+```json
+{
+  "...": "same shape as a plain /tdr/sweep response, plus:",
+  "qc_applied": true,
+  "qc_summary": {
+    "cells_examined": 41230,
+    "cells_flagged_despike": 12,
+    "cells_flagged_vertical": 0,
+    "cells_flagged_azimuthal": 5,
+    "cells_flagged_cross_consistency": 3,
+    "cells_flagged_edge": 214
+  },
+  "qc_disclaimer": "Custom QC (Experimental): ..."
+}
+```
 
 ---
 
@@ -1026,7 +1109,7 @@ https://joshmurdock.net/api/
 | `/v1/admin/prefetch` | POST | Bulk-load a timeframe into cache — see below. Returns a job immediately; poll for progress. |
 | `/v1/admin/prefetch/{job_id}` | GET | Poll a prefetch job's progress. |
 | `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
-| `/v1/admin/archive-update/{archive}` | POST | Force-run the storms or recon MET nightly ingest immediately — `archive` is `storms` or `recon_met`. Same code path as the systemd timer (`storms.run_ingest()` / `recon_met.run_ingest()`), just triggered on demand for data that hasn't been picked up yet. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). |
+| `/v1/admin/archive-update/{archive}` | POST | Needs `archive.update`. Run the named ingest immediately — `archive` is `storms`, `recon_met`, or `tdr`. Same code path as the corresponding systemd timer, just triggered on demand. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). `?years=2015,2016` (`tdr` only) reaches further back than the default shallow (current-1, current) window. `?force=true` (`tdr` only) re-crawls missions already indexed in scope instead of skipping them — e.g. to re-derive `storm_name` after a parsing fix — rather than only picking up new ones; a `storm_locked` mission (see "TDR mission management") is still never touched. `force` is meaningfully heavier (re-fetches every in-scope mission's listing/jobfile) so it's opt-in. |
 | `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done\|error, started_at, finished_at, summary, error}`. While `running` it also carries `progress: {phase, detail, done, total, updated_at}` — the phase the ingest is in, the item it's on, and how far through the phase it is. `total` is null for a phase whose size isn't known yet, and `updated_at` is the liveness clock: a timestamp that stops advancing means the job is wedged, which the counter alone can't distinguish from a slow single item. |
 | `/v1/admin/self-update/status` | GET | Cached "is an update available" check plus any in-progress apply job. |
 | `/v1/admin/self-update/check` | POST | Needs `selfupdate.check`. Force an immediate GitHub check, bypassing the periodic timer. |

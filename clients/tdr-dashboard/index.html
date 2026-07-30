@@ -250,6 +250,7 @@
   <div id="plot-area">
     <div id="status"></div>
     <div id="data-disclaimer" style="display:none"></div>
+    <div id="qc-disclaimer" style="display:none"></div>
     <div id="info-bar" style="display:none"></div>
     <div id="plot"><div class="empty-state">Pick a year, storm, and mission on the left to get started.</div></div>
     <div id="plot3d" style="display:none; flex:1; min-height:480px; border:1px solid var(--border); border-radius:4px; background:var(--bg-panel); position:relative;">
@@ -530,6 +531,28 @@ const VIEW_HINTS = {
 // level across every time) instead of one specific instant.
 const TIME_COMPOSITE_VALUE = '__composite__';
 function isTimeComposite() { return $('sel-time').value === TIME_COMPOSITE_VALUE; }
+
+// Pseudo product value: "Custom QC" isn't a file NOAA ships — it's a
+// locally-implemented QC pass this API runs on top of the real, indexed
+// `xy` product at Level 1b, on request (`qc=true`). Same synthetic-option
+// idea as TIME_COMPOSITE_VALUE above, just injected into the product
+// dropdown instead of the time one — see `populateProducts`.
+const CUSTOM_QC_VALUE = '__custom_qc_xy__';
+function isCustomQc() { return $('sel-product').value === CUSTOM_QC_VALUE; }
+// The real product/level Custom QC always resolves to — see
+// `services/tdr.rs`'s `check_qc_product` on the server, which enforces the
+// same pairing.
+const CUSTOM_QC_REAL_PRODUCT = 'xy';
+const CUSTOM_QC_REAL_LEVEL = '1b';
+
+// Resolves whatever's actually selected in the product/level dropdowns into
+// the {product, level, qc} an API request should use — the one place that
+// understands the Custom QC pseudo-option, so plotSweep/plotVolume/
+// plotComposite never have to special-case it themselves.
+function resolveProductLevel() {
+  if (isCustomQc()) return { product: CUSTOM_QC_REAL_PRODUCT, level: CUSTOM_QC_REAL_LEVEL, qc: true };
+  return { product: $('sel-product').value, level: $('sel-level').value, qc: false };
+}
 function canAltitudeComposite() {
   const product = $('sel-product').value || '';
   return currentView() === 'sweep' && !product.startsWith('vert_') && !isTimeComposite();
@@ -562,6 +585,15 @@ the radar's raw Doppler vertical velocity, which otherwise conflates the two.</p
 <p><b>Level 1b vs. Level 2</b> — Level 1b is real-time data as processed during the
 flight, available immediately. Level 2 is the post-season, quality-controlled reanalysis
 — prefer it when a mission has both.</p>
+<p><b>Custom QC (Experimental)</b> — a second, locally-implemented QC pass on top of the
+real-time Level 1b <b>xy</b> grid, offered regardless of whether Level 2 is also
+available for this mission (Level 2 is already NOAA/HRD's own QC'd reanalysis — Custom
+QC exists to help before that's ready). It flags and masks statistical outliers in the
+already-synthesized grid — spatial spikes, vertical discontinuities, azimuthal
+inconsistencies, low-coverage edges, and (when a storm-relative counterpart file exists)
+cross-grid mismatches — using the same fixed <b>xy</b> product under the hood. It is
+<b>not</b> an official NOAA/NHC/HRD product and has not been validated against Level 2 —
+see the banner shown when it's selected before relying on it.</p>
 <p><b>CAPPI altitude</b> — picks one horizontal slice at a specific altitude out of the
 xy volume, for the 2D sweep view.</p>
 <p><b>Composite — altitude max-projection</b> — collapses one analysis time's whole
@@ -583,7 +615,9 @@ function closeHelpModal() {
 
 function currentView() { return $('sel-view').value; }
 
-function isVolumeCapableProduct(product) { return product === 'xy' || product.startsWith('xy_'); }
+function isVolumeCapableProduct(product) {
+  return product === 'xy' || product.startsWith('xy_') || product === CUSTOM_QC_VALUE;
+}
 
 // ── Data-level disclaimer banner ──────────────────────────────────────────
 // Copy is grounded in the AOML TDR dataset README: Level 1b is generated
@@ -624,6 +658,27 @@ function updateDataDisclaimer() {
     + `<a href="${TDR_POLICY_URL}" target="_blank" rel="noopener">data-use policy</a></div></div>`;
 }
 
+// Shown alongside (not instead of) the level banner above whenever "Custom
+// QC" is the selected product — updated from `populateTimes`, which both the
+// level/view-change path (via `populateProducts`) and the product-change
+// listener funnel through, so one call site covers both triggers.
+function updateQcDisclaimer() {
+  const el = $('qc-disclaimer');
+  if (!isCustomQc()) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  const accent = '#8e24aa';
+  el.innerHTML = `<div style="border:1px solid ${accent}; border-left:4px solid ${accent}; background:rgba(142,36,170,0.10); border-radius:4px; padding:8px 12px; margin-bottom:8px; font-size:12px; line-height:1.5; color:var(--text);">`
+    + `<div style="font-weight:600; color:${accent}; margin-bottom:2px;">Custom QC (Experimental)</div>`
+    + `<div style="color:var(--text-muted);">A locally-implemented, automated QC pass applied on top of `
+    + `NOAA/HRD's real-time Level 1b grid. Not an official NOAA/NHC/HRD product, and not reviewed or `
+    + `endorsed by them. Flags and masks statistical outliers in the finished grid (spatial spikes, `
+    + `vertical discontinuities, azimuthal inconsistencies, low-coverage edges, and — when a `
+    + `storm-relative counterpart file exists — cross-grid mismatches) but cannot correct upstream radar `
+    + `or synthesis errors, and hasn't been validated against Level 2. Treat as a supplementary `
+    + `diagnostic, not an authoritative wind analysis — prefer Level 2 once available, and consult NHC `
+    + `guidance for operational use.</div></div>`;
+}
+
 function populateLevels() {
   const levels = distinct(missionFiles.map(f => f.level)).sort(); // "1b" < "2"
   const selLevel = $('sel-level');
@@ -639,7 +694,14 @@ function populateProducts() {
   let products = distinct(missionFiles.filter(f => f.level === level).map(f => f.product)).sort();
   if (view !== 'sweep') products = products.filter(isVolumeCapableProduct);
   const selProduct = $('sel-product');
-  fillSelect(selProduct, products);
+  const options = products.map((p) => [p, p]);
+  // Custom QC always targets the real, indexed `xy` file at Level 1b — offer
+  // it whenever that file exists for this mission, regardless of which level
+  // is currently selected (it's not itself gated by the level dropdown).
+  if (missionFiles.some((f) => f.level === CUSTOM_QC_REAL_LEVEL && f.product === CUSTOM_QC_REAL_PRODUCT)) {
+    options.push([CUSTOM_QC_VALUE, 'Custom QC (Level 1b, experimental)']);
+  }
+  fillSelect(selProduct, options);
   // `xy` is by far the most commonly used product — default to it instead
   // of whatever sorts first alphabetically (vert_inbound, otherwise).
   if (products.includes('xy')) selProduct.value = 'xy';
@@ -648,8 +710,10 @@ function populateProducts() {
 }
 
 function populateTimes() {
-  const level = $('sel-level').value;
-  const product = $('sel-product').value;
+  // Custom QC's times come from the real xy/Level-1b files, independent of
+  // whatever the level/product dropdowns currently show.
+  const level = isCustomQc() ? CUSTOM_QC_REAL_LEVEL : $('sel-level').value;
+  const product = isCustomQc() ? CUSTOM_QC_REAL_PRODUCT : $('sel-product').value;
   const times = distinct(missionFiles.filter(f => f.level === level && f.product === product).map(f => f.analysis_time)).sort();
   const options = [...times];
   // Only xy-family products have a storm-center grid to mosaic by (see
@@ -659,6 +723,7 @@ function populateTimes() {
     options.push([TIME_COMPOSITE_VALUE, 'Composite (mosaic all times)']);
   }
   fillSelect($('sel-time'), options);
+  updateQcDisclaimer();
   populateFields();
 }
 
@@ -1735,13 +1800,13 @@ async function loadSatelliteImage() {
 
 async function plotVolume() {
   const missionId = $('sel-mission').value;
-  const level = $('sel-level').value;
-  const product = $('sel-product').value;
+  const { product, level, qc } = resolveProductLevel();
   const analysisTime = $('sel-time').value;
   const field = $('sel-field').value;
   const btn = $('btn-load');
 
   const params = new URLSearchParams({ mission_id: missionId, level, product, analysis_time: analysisTime, field });
+  if (qc) params.set('qc', 'true');
   btn.disabled = true;
   setStatus('loading', 'Fetching + slicing the whole level axis (first request for a file downloads and caches it server-side, may take a few seconds)…');
   try {
@@ -1782,8 +1847,7 @@ async function plotVolume() {
 // every instant mosaicked — the volume-shaped counterpart of 'time').
 async function plotComposite() {
   const missionId = $('sel-mission').value;
-  const level = $('sel-level').value;
-  const product = $('sel-product').value;
+  const { product, level, qc } = resolveProductLevel();
   const field = $('sel-field').value;
   const mode = isTimeComposite() ? (currentView() === 'volume' ? 'time_volume' : 'time') : 'altitude';
   const btn = $('btn-load');
@@ -1792,6 +1856,7 @@ async function plotComposite() {
   if (mode === 'altitude') params.set('analysis_time', $('sel-time').value);
   else if (mode === 'time') params.set('z', $('inp-z').value || '2.0');
   // time_volume mosaics every level — no z, no single analysis_time.
+  if (qc) params.set('qc', 'true');
 
   btn.disabled = true;
   setStatus('loading', mode === 'time_volume'
@@ -1844,7 +1909,7 @@ async function plotComposite() {
       // times into one image with no single volume behind it — not
       // meaningful (the endpoint needs one analysis_time to read).
       planeSliceContext = mode === 'altitude'
-        ? { mission_id: comp.mission_id, level: comp.level, product: comp.product, analysis_time: comp.detail.analysis_time, field: comp.field }
+        ? { mission_id: comp.mission_id, level: comp.level, product: comp.product, analysis_time: comp.detail.analysis_time, field: comp.field, qc: comp.qc_applied === true }
         : null;
       // Streamlines only need an x/y grid, not a single volume, so 'time'
       // works here too (mean-of-u/v across the mosaicked times) — see
@@ -1865,8 +1930,7 @@ async function plotComposite() {
 
 async function plotSweep() {
   const missionId = $('sel-mission').value;
-  const level = $('sel-level').value;
-  const product = $('sel-product').value;
+  const { product, level, qc } = resolveProductLevel();
   const analysisTime = $('sel-time').value;
   const field = $('sel-field').value;
   const isVert = product.startsWith('vert_');
@@ -1874,6 +1938,7 @@ async function plotSweep() {
 
   const params = new URLSearchParams({ mission_id: missionId, level, product, analysis_time: analysisTime, field });
   if (!isVert) params.set('z', $('inp-z').value || '2.0');
+  if (qc) params.set('qc', 'true');
 
   btn.disabled = true;
   setStatus('loading', 'Fetching + slicing (first request for a file downloads and caches it server-side, may take a few seconds)…');
@@ -1888,7 +1953,7 @@ async function plotSweep() {
     // A plane slice needs a single analysis time's whole volume to cut
     // through, so it's only meaningful for a plain (non-composite) xy/xy_rel
     // sweep, never a vert_inbound/vert_outbound profile.
-    planeSliceContext = isVert ? null : { mission_id: sweep.mission_id, level: sweep.level, product: sweep.product, analysis_time: sweep.analysis_time, field: sweep.field };
+    planeSliceContext = isVert ? null : { mission_id: sweep.mission_id, level: sweep.level, product: sweep.product, analysis_time: sweep.analysis_time, field: sweep.field, qc: sweep.qc_applied === true };
     updatePlaneSliceAvailability();
     currentGridQuery = isVert ? null : { endpoint: '/v1/tdr/sweep', params };
     const streamlinesOk = await refreshStreamlines();
@@ -1911,7 +1976,7 @@ let lastIsVert = false;
 // rendered #plot is a single analysis time's plain xy/xy_rel sweep (a
 // composite mosaics multiple times/levels together, so "a plane through
 // this volume" wouldn't mean anything for it — see updatePlaneSliceAvailability).
-let planeSliceContext = null; // {mission_id, level, product, analysis_time, field} or null
+let planeSliceContext = null; // {mission_id, level, product, analysis_time, field, qc} or null
 let planeSliceToolActive = false;
 let planeSlicePoints = []; // [{x,y}, ...] up to 2, in the plot's km-from-center frame
 let lastPlaneSliceCut = null; // raw (native m/s) last-rendered cross-section, or null
@@ -2376,6 +2441,7 @@ async function fetchPlaneSlice() {
     field: planeSliceContext.field,
     x0: a.x, y0: a.y, x1: b.x, y1: b.y, n: 150,
   });
+  if (planeSliceContext.qc) params.set('qc', 'true');
   updatePlaneSliceStatus('loading');
   try {
     const cut = await getJSON(`/v1/tdr/plane_slice?${params.toString()}`);

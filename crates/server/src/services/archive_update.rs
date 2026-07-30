@@ -9,16 +9,23 @@
 //! phase the ingest is in and when it last moved rather than a bare "running"
 //! that looks identical to a hang.
 //!
-//! "Force" refers only to bypassing the *console's own* re-click guard
-//! (`is_running`) — it does not mean "reprocess everything". All three ingest
-//! functions are already incremental: `recon_ingest::harvest_mission` skips a
-//! mission whose `nc_version` hasn't changed, `storms::ingest_atcf_season`
-//! only fetches seasons after `max_year_for_basin`, and `tdr_ingest` skips a
-//! mission already indexed at the requested level unless forced. This module
-//! always calls them with `force: false` and (for recon/tdr) `years: None`,
-//! matching each CLI's default (`ingest-recon`/`ingest-tdr` with no
-//! `--force`/`--full`); a full reprocess or deep historical backfill is only
-//! ever a deliberate CLI run, never a console click.
+//! "Force" on the storm-tracks/recon-MET buttons refers only to bypassing the
+//! *console's own* re-click guard (`is_running`) — it does not mean
+//! "reprocess everything". Those two ingest functions are already
+//! incremental (`recon_ingest::harvest_mission` skips a mission whose
+//! `nc_version` hasn't changed; `storms::ingest_atcf_season` only fetches
+//! seasons after `max_year_for_basin`) and this module always calls them with
+//! `force: false`, matching `ingest-recon`'s CLI default.
+//!
+//! TDR is the one archive where a real, deliberate `--force` (re-crawl a
+//! mission already indexed, e.g. to re-derive `storm_name` after a parsing
+//! fix) is exposed all the way through to the console's "Force update: TDR" /
+//! "Backfill TDR years" buttons via an explicit checkbox — see `run_tdr` and
+//! `routers/admin.rs::start_archive_update`'s `force` query param. It's
+//! opt-in and off by default (`false` unless the checkbox was ticked) because
+//! it's a materially heavier operation: it re-fetches every already-indexed
+//! mission's file listing (and, for Level 1b, its jobfile) instead of only
+//! new ones.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -151,6 +158,10 @@ impl ArchiveUpdateState {
 /// (which has no year concept) and `recon_met` (not exposed in the console
 /// UI yet, though `recon_ingest::run_ingest` does support it).
 ///
+/// `force` is a genuine "reprocess already-indexed missions" flag, but only
+/// `tdr` acts on it — see the module doc comment. Ignored for `storms`/
+/// `recon_met`, which stay incremental-only from the console.
+///
 /// Runs via `spawn_blocking` + `Handle::block_on` rather than a plain
 /// `tokio::spawn`: both `storms::run_ingest` and `recon_ingest::run_ingest`
 /// hold a `&rusqlite::Connection` (not `Sync`) across internal `.await`
@@ -164,6 +175,7 @@ pub fn start(
     paths: &Arc<Paths>,
     archive: &str,
     years: Option<Vec<i64>>,
+    force: bool,
 ) -> Option<Value> {
     if !ArchiveUpdateState::is_known_archive(archive) {
         return None;
@@ -195,7 +207,8 @@ pub fn start(
             let job_state = state.clone();
             let tdr_db = paths.tdr_db.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current().block_on(run_tdr(job_state, tdr_db, years, progress));
+                tokio::runtime::Handle::current()
+                    .block_on(run_tdr(job_state, tdr_db, years, force, progress));
             });
             supervise(state.clone(), "tdr", handle);
         }
@@ -239,15 +252,20 @@ async fn run_recon(
 /// `years: None` defaults to [current-1, current] — same shallow-ingest
 /// convention as the CLI's `ingest-tdr` with no `--years`/`--full`. Passing
 /// an explicit `years` (from the console's backfill control) reaches further
-/// back, same as `ingest-tdr --years`. `force` is always `false` here —
-/// still just "run it now", not "reprocess everything already indexed".
+/// back, same as `ingest-tdr --years`. `force`, when the console's "Force
+/// re-crawl" checkbox was ticked, re-fetches every already-indexed mission
+/// in scope instead of only new ones — same as `ingest-tdr --force` — so a
+/// storm-name parsing fix (or a manual correction that's since been
+/// un-locked) can actually be re-applied without a CLI session. A locked
+/// mission (`tdr::edit_mission`) is still never touched, force or not.
 async fn run_tdr(
     state: Arc<ArchiveUpdateState>,
     tdr_db: PathBuf,
     years: Option<Vec<i64>>,
+    force: bool,
     progress: Progress,
 ) {
-    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, years, false, &progress)
+    let result = crate::services::tdr_ingest::run_ingest(&tdr_db, years, force, &progress)
         .await
         .map_err(|e| e.to_string());
     state.finish("tdr", result);

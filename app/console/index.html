@@ -468,6 +468,12 @@
           <button class="primary-btn" id="tdr-backfill-btn" title="Crawl only the given years — same incremental, non-destructive ingest as Force update, just reaching further back than the default last-2-years window">Backfill TDR years</button>
           <span class="status-text" id="tdr-backfill-status"></span>
         </div>
+        <div class="row" style="margin-top:2px;">
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;">
+            <input type="checkbox" id="tdr-force-recrawl">
+            Force re-crawl (ignore existing index — re-fetches every mission in scope, not just new ones; applies to both TDR buttons above; slower, and never touches a mission you've locked via the editor below)
+          </label>
+        </div>
         </div>
 
         <div id="db-viewer-controls">
@@ -2187,13 +2193,16 @@ async function resumeArchiveUpdates() {
     }
 }
 
-function startArchiveUpdate(archive, btnId, statusId, years) {
+function startArchiveUpdate(archive, btnId, statusId, years, force) {
     const btn = document.getElementById(btnId);
     const statusEl = document.getElementById(statusId);
     btn.disabled = true;
     statusEl.textContent = 'Starting…';
     statusEl.className = 'status-text working';
-    const qs = years ? `?years=${encodeURIComponent(years)}` : '';
+    const params = new URLSearchParams();
+    if (years) params.set('years', years);
+    if (force) params.set('force', 'true');
+    const qs = params.toString() ? `?${params.toString()}` : '';
     api(`/v1/admin/archive-update/${archive}${qs}`, { method: 'POST' })
         .then(async (res) => {
             if (!res.ok) {
@@ -2234,8 +2243,15 @@ document.getElementById('storms-update-btn').addEventListener('click', () => {
 document.getElementById('reconmet-update-btn').addEventListener('click', () => {
     startArchiveUpdate('recon_met', 'reconmet-update-btn', 'reconmet-update-status');
 });
+
+function tdrForceChecked() {
+    return document.getElementById('tdr-force-recrawl').checked;
+}
+
 document.getElementById('tdr-update-btn').addEventListener('click', () => {
-    startArchiveUpdate('tdr', 'tdr-update-btn', 'tdr-update-status');
+    const force = tdrForceChecked();
+    if (force && !confirm('Force re-crawl the last 2 seasons? This re-fetches every already-indexed mission in that window (not just new ones) and can take a while.')) return;
+    startArchiveUpdate('tdr', 'tdr-update-btn', 'tdr-update-status', null, force);
 });
 document.getElementById('tdr-backfill-btn').addEventListener('click', () => {
     const statusEl = document.getElementById('tdr-backfill-status');
@@ -2245,7 +2261,9 @@ document.getElementById('tdr-backfill-btn').addEventListener('click', () => {
         statusEl.className = 'status-text err';
         return;
     }
-    startArchiveUpdate('tdr', 'tdr-backfill-btn', 'tdr-backfill-status', years);
+    const force = tdrForceChecked();
+    if (force && !confirm(`Force re-crawl ${years}? This re-fetches every already-indexed mission in those years (not just new ones) and can take a while.`)) return;
+    startArchiveUpdate('tdr', 'tdr-backfill-btn', 'tdr-backfill-status', years, force);
 });
 
 // ── Database viewer — browse storms/recon MET by year -> storm ─────────

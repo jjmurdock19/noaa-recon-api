@@ -600,7 +600,8 @@ async fn self_update_job(State(state): State<AppState>, jar: SignedCookieJar) ->
 // ── Archive update (storm-track / recon-MET ingest) ──────────────────────────
 // See services/archive_update.rs — both ingests are incremental by construction
 // (skip missions/seasons already up to date), so "force update" only means
-// "run it now" rather than "rebuild the archive from scratch".
+// "run it now" rather than "rebuild the archive from scratch". TDR's `force`
+// query param is the one genuine exception — see archive_update.rs::run_tdr.
 
 #[derive(Deserialize)]
 struct ArchiveUpdateQuery {
@@ -609,6 +610,12 @@ struct ArchiveUpdateQuery {
     /// back than the default shallow (current-1, current) ingest window.
     /// Ignored for other archives.
     years: Option<String>,
+    /// `tdr` only: re-crawl missions already indexed instead of skipping
+    /// them, so a storm-name parsing fix (or unlocking a manual correction)
+    /// can actually be re-applied. Heavier than a plain update — re-fetches
+    /// every in-scope mission's listing (and, for Level 1b, its jobfile) —
+    /// so it's opt-in, off by default. Ignored for other archives.
+    force: Option<bool>,
 }
 
 async fn start_archive_update(
@@ -635,11 +642,13 @@ async fn start_archive_update(
         .as_ref()
         .map(|y| format!(" for year(s) {}", y.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",")))
         .unwrap_or_default();
-    let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive, years)
+    let force = q.force.unwrap_or(false);
+    let force_note = if force { " (forced re-crawl of already-indexed missions)" } else { "" };
+    let job = crate::services::archive_update::start(&state.archive_update, &state.paths, &archive, years, force)
         .ok_or_else(|| ApiError::not_found(format!("Unknown archive: {archive}")))?;
     audit(
         &state, &user, "archive.update",
-        Some(&format!("started the '{archive}' database update{year_note}")),
+        Some(&format!("started the '{archive}' database update{year_note}{force_note}")),
         "/v1/admin/archive-update/{archive}", "POST", &headers,
     );
     Ok(Json(job))

@@ -15,6 +15,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use noaa_recon_core::qc;
 use noaa_recon_core::sweep;
 
 use crate::services::goes::nc_lock;
@@ -250,6 +251,50 @@ fn global_attr_str(ds: &netcdf::File, name: &str) -> Option<String> {
 
 fn storm_name_attr(ds: &netcdf::File) -> Option<String> {
     global_attr_str(ds, "STORM NAME").or_else(|| global_attr_str(ds, "STMNAME"))
+}
+
+/// Runs the Level 1b "Custom QC" pass (`noaa_recon_core::qc`) on an
+/// already-decoded `xy`/`xy_rel` slice in place, returning a summary of what
+/// got flagged — the server-side half of the `qc=true` request param (see
+/// `routers/tdr.rs`). `counterpart` is the paired `xy_rel`/`xy` file's
+/// already-decoded data for the same field, if the router found and fetched
+/// one; the D (cross-consistency) check only runs when it's `Some`.
+///
+/// xy-specific (needs `x`/`y` grid coords for the azimuthal-ring check) — a
+/// `vert_*` profile goes through `noaa_recon_core::qc::qc_plane_vert`
+/// directly instead, since it never has azimuthal geometry to check.
+pub fn apply_qc_to_slice(
+    slice: &mut FieldSlice,
+    field: &str,
+    counterpart: Option<&FieldSlice>,
+    params: &qc::QcParams,
+) -> qc::QcReport {
+    let mut report = qc::qc_plane_xy(&mut slice.data, &slice.x, &slice.y, params);
+    if let Some(counterpart) = counterpart {
+        report.cells_flagged_cross_consistency = qc::qc_cross_consistency(&mut slice.data, &counterpart.data, field, params);
+    }
+    report
+}
+
+/// Same as [`apply_qc_to_slice`] for a full `xy`/`xy_rel` volume — despike +
+/// azimuthal-ring + edge trim per level, then vertical continuity across
+/// levels, then (if a counterpart volume was fetched) cross-consistency per
+/// level against the matching level in `counterpart`.
+pub fn apply_qc_to_volume(
+    volume: &mut FieldVolume,
+    field: &str,
+    counterpart: Option<&FieldVolume>,
+    params: &qc::QcParams,
+) -> qc::QcReport {
+    let mut report = qc::qc_volume(&mut volume.data, &volume.x, &volume.y, params);
+    if let Some(counterpart) = counterpart {
+        let mut cross_flagged = 0;
+        for (level, counterpart_level) in volume.data.iter_mut().zip(counterpart.data.iter()) {
+            cross_flagged += qc::qc_cross_consistency(level, counterpart_level, field, params);
+        }
+        report.cells_flagged_cross_consistency = cross_flagged;
+    }
+    report
 }
 
 /// Reads one field from an `xy`/`xy_rel` volume file and slices out the
