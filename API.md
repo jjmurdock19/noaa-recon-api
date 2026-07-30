@@ -616,10 +616,10 @@ This phase only indexes file **metadata** (mission → product → source URL)
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/tdr/years` | Every year with at least one indexed TDR mission. |
-| `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. `storm_name` is resolved live from the recon index by mission ID; missions not found there fall back to their ingest-time label, or are grouped under `storm_name: "Unknown"` if there's none. |
-| `GET /v1/tdr/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, has_level1b, has_level2}[]`. |
+| `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. `storm_name` is TDR's own stored value — captured at ingest time from a same-host source (the Level 1b mission's own jobfile, or the Level 2 storm-slug path), not resolved against any other database — or `"Unknown"` if ingest found none and no admin has corrected it. |
+| `GET /v1/tdr/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, storm_name, storm_id, storm_locked, has_level1b, has_level2}[]`. `storm_locked` is `true` once an admin has corrected the mission's storm identity via the console — a locked mission is never touched by ingest again (see `POST /v1/admin/tdr/missions` below). |
 | `GET /v1/tdr/centers` | The **TDR-derived storm center at each CAPPI altitude** for one analysis time (`mission_id` + `analysis_time`; optional `level`, `product`, and the `rmin_km`/`rmax_km`/`max_offset_km`/`min_tangential_wind_ms`/`continuity_km` tuning knobs). Per level the center maximizes the azimuthal-mean tangential wind from the `U`/`V` field (HRD symmetric-circulation criterion); an anchor level plus level-to-level continuity make the track follow the vortex's tilt, and edge-pinned fits are dropped. Returns `{..., centers: [{level_km, lat, lon, x_km, y_km, tangential_wind_ms, rmw_km}]}` — center fields `null` where no coherent center exists (weak/disorganized storms come back all-`null` by design). The gridded synthesis only stores one `ORIGIN_LATITUDE/LONGITUDE` for the whole volume; this recovers the height-varying center. See "TDR-derived storm centers" in README.md for the algorithm. |
-| `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., file_count, files: [{level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}]}`. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). |
+| `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., storm_name, storm_id, storm_locked, file_count, files: [{id, level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}], legs: [{id, level, start_time, stop_time, source_url}]}`. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). Each file/leg's `id` is only useful for `DELETE /v1/admin/tdr/files/{id}` / `.../legs/{id}` below. |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/2024/Beryl"
@@ -930,10 +930,13 @@ https://joshmurdock.net/api/demo/netcdf-three/
 A login-gated web UI for operating this deployment: cache status/storage
 stats, browsing and deleting cached rendered tiles and raw netCDF
 downloads, submitting one-off queries, and bulk-prefetching a timeframe
-into the cache. Also a "Databases" panel showing storm-track and recon MET
-archive size/record counts, a browsable viewer (year -> storm -> track
-points/missions) over both, and a "force update" button per archive to
-run the nightly ingest on demand instead of waiting for the timer. Static
+into the cache. Also a "Databases" panel showing storm-track, recon MET,
+and TDR archive size/record counts, a browsable viewer (year -> storm ->
+track points/missions) over all three, and a "force update" button per
+archive to run the nightly ingest on demand instead of waiting for the
+timer. The TDR view doubles as an editor (`tdr.manage`) — correcting a
+mission's storm name/ID, or adding/deleting a mission or one of its
+indexed files/legs by hand; see "TDR mission management" below. Static
 page at `app/console/index.html`, calling the `/v1/admin/*` JSON endpoints
 below.
 
@@ -951,6 +954,7 @@ created and permissions granted.
 | `cache.view` | Listing cached rendered tiles and raw netCDF downloads. |
 | `cache.delete` | Deleting cache entries, individually or all at once. |
 | `archive.update` | Triggering the storms / recon MET / TDR ingest jobs. |
+| `tdr.manage` | Creating, editing and deleting TDR mission records (see "TDR mission management" below). |
 | `tiles.render` | Submitting one-off render queries and bulk prefetch jobs. |
 | `selfupdate.check` | Seeing update status and checking GitHub for new commits. |
 | `selfupdate.apply` | Pulling new code and restarting the process. |
@@ -1044,6 +1048,21 @@ https://joshmurdock.net/api/
 | `/v1/admin/usage-log` | DELETE | `logs.clear` | Wipe it. Recorded to the activity log afterwards, so the trail always names whoever emptied it. |
 | `/v1/admin/auth-config` | GET | `authconfig.manage` | `{enabled: bool}` — whether the public API currently requires a token. |
 | `/v1/admin/auth-config` | POST | `authconfig.manage` | `{enabled: bool}` — flip it. Takes effect immediately, no restart. |
+
+### TDR mission management
+
+Correcting entries in the TDR archive by hand — e.g. a storm ingest never
+found a name for, or one it got wrong. Viewing stays on the public
+`GET /v1/tdr/*` endpoints described above; these are the mutations, all
+gated by `tdr.manage`. Every mutation is recorded to the activity log.
+
+| Endpoint | Method | Permission | Purpose |
+|---|---|---|---|
+| `/v1/admin/tdr/missions` | POST | `tdr.manage` | Hand-create a mission ingest never saw. `{mission_id, storm_name?, storm_id?, aircraft?, tail_num?}` — `mission_id` must match the `YYYYMMDDAI` convention (year derived from it automatically); `409` if it already exists. Starts `storm_locked: true` since there's nothing to auto-manage. |
+| `/v1/admin/tdr/missions/{mission_id}` | PATCH | `tdr.manage` | Edit any of `storm_name`, `storm_id` (empty string clears it to null), `aircraft`, `tail_num`, `has_level1b`, `has_level2`, `storm_locked` — only the keys present in the body are touched. Setting `storm_name` or `storm_id` without an explicit `storm_locked` auto-sets `storm_locked: true`, so a correction survives the next ingest crawl without an extra step; pass `storm_locked: false` to hand the row back to ingest. |
+| `/v1/admin/tdr/missions/{mission_id}` | DELETE | `tdr.manage` | Delete a mission; its indexed files and legs cascade with it. A future crawl can re-add the mission from scratch, but not any manual correction that was on it. |
+| `/v1/admin/tdr/files/{file_id}` | DELETE | `tdr.manage` | Delete one indexed file record (the `id` from `GET /v1/tdr/mission/{id}`'s `files[]`). Only removes it from the index — the source file on NOAA's host is untouched, so a re-crawl can re-index it. |
+| `/v1/admin/tdr/legs/{leg_id}` | DELETE | `tdr.manage` | Same, for one leg record. |
 
 ### Bulk prefetch
 

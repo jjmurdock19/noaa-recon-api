@@ -134,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
     let v1 = Router::new()
         .merge(routers::health::router())
         .merge(routers::admin::router())
+        .merge(routers::admin_tdr::router())
         .merge(routers::admin_tokens::router())
         .merge(gated);
 

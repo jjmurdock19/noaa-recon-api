@@ -45,6 +45,7 @@ pub const PERMISSIONS: &[(&str, &str)] = &[
     ("cache.view", "View cached tiles and raw netCDF files"),
     ("cache.delete", "Delete cached tiles and raw netCDF files"),
     ("archive.update", "Trigger storm / recon MET / TDR ingest jobs"),
+    ("tdr.manage", "Create, edit and delete TDR mission records"),
     ("tiles.render", "Submit render queries and prefetch jobs"),
     ("selfupdate.check", "Check whether an API update is available"),
     ("selfupdate.apply", "Apply an update and restart the API"),

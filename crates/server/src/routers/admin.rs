@@ -250,10 +250,8 @@ async fn status(State(state): State<AppState>, jar: SignedCookieJar) -> ApiResul
         recon_bytes,
         "mission_count",
     );
-    // TDR read connection attaches the recon DB; a plain COUNT doesn't touch it,
-    // but we go through the same read path so a broken attach surfaces here too.
     let tdr = count_section(
-        tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db),
+        tdr::get_connection(&state.paths.tdr_db),
         "SELECT COUNT(*) FROM missions",
         tdr_bytes,
         "mission_count",

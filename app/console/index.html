@@ -477,6 +477,7 @@
             <select id="db-view-type">
               <option value="storms">Storm Tracks</option>
               <option value="recon_met">Recon MET</option>
+              <option value="tdr">TDR</option>
             </select>
           </div>
           <div class="field-group">
@@ -496,6 +497,32 @@
             <thead id="db-view-thead"></thead>
             <tbody id="db-view-body"></tbody>
           </table>
+        </div>
+        <div id="tdr-add-mission" style="display:none; margin-top:10px; border-top:1px solid var(--border); padding-top:10px;">
+          <div class="row" style="margin-bottom:0;">
+            <div class="field-group">
+              <span class="field-label">Mission ID (YYYYMMDDAI)</span>
+              <input type="text" id="tdr-add-mission-id" placeholder="20260616H1" style="width:140px">
+            </div>
+            <div class="field-group">
+              <span class="field-label">Storm name</span>
+              <input type="text" id="tdr-add-storm-name" placeholder="Fausto" style="width:140px">
+            </div>
+            <div class="field-group">
+              <span class="field-label">Storm ID (optional)</span>
+              <input type="text" id="tdr-add-storm-id" placeholder="EP062026" style="width:120px">
+            </div>
+            <div class="field-group">
+              <span class="field-label">Aircraft (optional)</span>
+              <input type="text" id="tdr-add-aircraft" placeholder="NOAA 42 (Kermit)" style="width:160px">
+            </div>
+            <div class="field-group">
+              <span class="field-label">Tail # (optional)</span>
+              <input type="text" id="tdr-add-tail-num" placeholder="N42" style="width:80px">
+            </div>
+            <button class="primary-btn" id="tdr-add-mission-btn">Add mission</button>
+            <span class="status-text" id="tdr-add-mission-status"></span>
+          </div>
         </div>
         </div>
       </section>
@@ -940,6 +967,7 @@ function applyPermissionVisibility() {
         const useful = can('archive.update') || can('db.view') || can('status.view');
         dbSection.style.display = useful ? '' : 'none';
     }
+    updateTdrAddVisibility();
     // Anyone who can reach the console sees the activity feed; clearing it is
     // a separate permission.
     document.getElementById('usage-log-section').style.display = '';
@@ -2227,6 +2255,21 @@ function setDbViewStatus(msg, cls) {
     el.className = 'status-text ' + (cls || '');
 }
 
+function dbViewYearsPath(type) {
+    if (type === 'storms') return '/v1/storms/years';
+    if (type === 'tdr') return '/v1/tdr/years';
+    return '/v1/recon/years';
+}
+
+/// TDR's "Add mission" mini-form only makes sense when TDR is the selected
+/// database and the operator can actually write (`tdr.manage`) — the panel
+/// itself stays visible under the weaker `db.view` gate for everyone else.
+function updateTdrAddVisibility() {
+    const type = document.getElementById('db-view-type').value;
+    const el = document.getElementById('tdr-add-mission');
+    if (el) el.style.display = (type === 'tdr' && can('tdr.manage')) ? '' : 'none';
+}
+
 async function refreshDbViewYears() {
     const type = document.getElementById('db-view-type').value;
     const yearSel = document.getElementById('db-view-year');
@@ -2239,8 +2282,9 @@ async function refreshDbViewYears() {
     _lastStormTrack = null;
     document.getElementById('db-view-thead').innerHTML = '';
     document.getElementById('db-view-body').innerHTML = '';
+    updateTdrAddVisibility();
 
-    const path = type === 'storms' ? '/v1/storms/years' : '/v1/recon/years';
+    const path = dbViewYearsPath(type);
     try {
         const res = await api(path);
         const data = await res.json();
@@ -2262,7 +2306,8 @@ document.getElementById('db-view-year').addEventListener('change', async functio
     document.getElementById('db-view-load-btn').disabled = true;
     if (!this.value) return;
 
-    const path = type === 'storms' ? `/v1/storms/${this.value}` : `/v1/recon/${this.value}`;
+    const path = type === 'storms' ? `/v1/storms/${this.value}`
+        : type === 'tdr' ? `/v1/tdr/${this.value}` : `/v1/recon/${this.value}`;
     const res = await api(path);
     if (!res.ok) { setDbViewStatus('No data for that year', 'err'); return; }
     const data = await res.json();
@@ -2284,6 +2329,41 @@ document.getElementById('db-view-storm').addEventListener('change', function () 
     document.getElementById('db-view-load-btn').disabled = !this.value;
 });
 
+// Mission rows for whatever TDR storm/year is currently loaded — kept so the
+// inline editor (toggle/save/delete) can diff against original values and
+// re-render without an extra round trip, same idea as `_lastStormTrack`.
+let _lastTdrData = null;
+const openTdrEditors = new Set();
+
+function tdrMissionEditorRowHtml(m) {
+    const field = (name, value) => `data-tdr-field="${name}" data-tdr-owner="${m.mission_id}" value="${escapeHtml(value ?? '')}"`;
+    const check = (name, checked) => `data-tdr-field="${name}" data-tdr-owner="${m.mission_id}" ${checked ? 'checked' : ''}`;
+    return `
+        <tr class="perm-editor-row">
+            <td colspan="8">
+                <div class="row" style="margin-bottom:6px;">
+                    <div class="field-group"><span class="field-label">Storm name</span><input type="text" ${field('storm_name', m.storm_name)}></div>
+                    <div class="field-group"><span class="field-label">Storm ID</span><input type="text" ${field('storm_id', m.storm_id)}></div>
+                    <div class="field-group"><span class="field-label">Aircraft</span><input type="text" ${field('aircraft', m.aircraft)}></div>
+                    <div class="field-group"><span class="field-label">Tail #</span><input type="text" ${field('tail_num', m.tail_num)}></div>
+                </div>
+                <label style="display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:11px;">
+                    <input type="checkbox" ${check('has_level1b', m.has_level1b)}> Level 1b
+                </label>
+                <label style="display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:11px;">
+                    <input type="checkbox" ${check('has_level2', m.has_level2)}> Level 2
+                </label>
+                <label style="display:inline-flex;align-items:center;gap:6px;font-size:11px;" title="Prevents the nightly crawler from ever overwriting this mission's storm name/ID again">
+                    <input type="checkbox" ${check('storm_locked', m.storm_locked)}> Lock storm identity
+                </label>
+                <div class="row" style="margin-top:8px;">
+                    <button class="primary-btn tdr-save-btn" data-mission-id="${m.mission_id}">Save</button>
+                    <span class="status-text" data-tdr-save-status="${m.mission_id}"></span>
+                </div>
+            </td>
+        </tr>`;
+}
+
 function renderDbViewTable(type, data) {
     const thead = document.getElementById('db-view-thead');
     const tbody = document.getElementById('db-view-body');
@@ -2297,6 +2377,40 @@ function renderDbViewTable(type, data) {
                 <td>${p.wind_kt ?? ''}</td><td>${p.pressure_mb ?? ''}</td>
             </tr>`).join('') : '<tr class="empty-row"><td colspan="7">No track points.</td></tr>';
         setDbViewStatus(`${points.length} track points — ${data.name} (${data.basin}) ${data.year}`, 'ok');
+    } else if (type === 'tdr') {
+        _lastTdrData = data;
+        const canManage = can('tdr.manage');
+        thead.innerHTML = '<tr><th>Mission ID</th><th>Aircraft</th><th>Tail #</th><th>Storm ID</th><th>Locked</th><th>L1b</th><th>L2</th><th></th></tr>';
+        const missions = data.missions || [];
+        tbody.innerHTML = missions.length ? missions.map((m) => {
+            const open = openTdrEditors.has(m.mission_id);
+            const row = `
+            <tr>
+                <td class="code">${m.mission_id}</td><td>${escapeHtml(m.aircraft ?? '')}</td><td class="code">${escapeHtml(m.tail_num ?? '')}</td>
+                <td class="code">${escapeHtml(m.storm_id ?? '')}</td>
+                <td>${m.storm_locked ? 'locked' : ''}</td>
+                <td>${m.has_level1b ? 'yes' : ''}</td><td>${m.has_level2 ? 'yes' : ''}</td>
+                <td class="actions-cell">
+                    <button class="view-btn tdr-files-btn" data-mission-id="${m.mission_id}">Files/legs</button>
+                    ${canManage ? `<button class="clear-btn tdr-edit-btn" data-mission-id="${m.mission_id}">${open ? 'Close' : 'Edit'}</button>` : ''}
+                    ${canManage ? `<button class="del-btn tdr-delete-btn" data-mission-id="${m.mission_id}">Delete</button>` : ''}
+                </td>
+            </tr>`;
+            return open ? row + tdrMissionEditorRowHtml(m) : row;
+        }).join('') : '<tr class="empty-row"><td colspan="8">No missions.</td></tr>';
+        setDbViewStatus(`${missions.length} missions — ${data.storm_name} ${data.year}`, 'ok');
+        tbody.querySelectorAll('.tdr-files-btn').forEach((btn) => {
+            btn.addEventListener('click', () => previewTdrMission(btn.dataset.missionId));
+        });
+        tbody.querySelectorAll('.tdr-edit-btn').forEach((btn) => {
+            btn.addEventListener('click', () => toggleTdrEditor(btn.dataset.missionId));
+        });
+        tbody.querySelectorAll('.tdr-delete-btn').forEach((btn) => {
+            btn.addEventListener('click', () => deleteTdrMission(btn.dataset.missionId));
+        });
+        tbody.querySelectorAll('.tdr-save-btn').forEach((btn) => {
+            btn.addEventListener('click', () => saveTdrMissionEdit(btn.dataset.missionId));
+        });
     } else {
         thead.innerHTML = '<tr><th>Mission ID</th><th>Aircraft</th><th>Tail #</th><th>Flight date</th><th>Start (UTC)</th><th>End (UTC)</th><th>Obs</th><th></th></tr>';
         const missions = data.missions || [];
@@ -2334,6 +2448,8 @@ document.getElementById('db-view-load-btn').addEventListener('click', async () =
     if (type === 'storms') {
         const [name, basin] = stormVal.split('|');
         path = `/v1/storms/${year}/${encodeURIComponent(name)}?basin=${basin}`;
+    } else if (type === 'tdr') {
+        path = `/v1/tdr/${year}/${encodeURIComponent(stormVal)}`;
     } else {
         path = `/v1/recon/${year}/${encodeURIComponent(stormVal)}`;
     }
@@ -2352,6 +2468,181 @@ document.getElementById('db-view-load-btn').addEventListener('click', async () =
         }
     } catch (e) {
         setDbViewStatus('Network error: ' + e.message, 'err');
+    }
+});
+
+// ── TDR mission editor — inline edit/delete on the viewer above, same
+// expandable-row idea as the accounts permission editor (`openTdrEditors`
+// mirrors `openPermissionEditors`) ──────────────────────────────────────
+function toggleTdrEditor(missionId) {
+    if (openTdrEditors.has(missionId)) openTdrEditors.delete(missionId);
+    else openTdrEditors.add(missionId);
+    if (_lastTdrData) renderDbViewTable('tdr', _lastTdrData);
+}
+
+/// Re-fetches the currently-loaded TDR storm/year after a save/delete. A
+/// storm with zero missions left just 404s — that's not an error here, it
+/// means the table should go empty rather than show a stale error message.
+async function reloadTdrMissions() {
+    if (!_lastTdrData) return;
+    const { year, storm_name } = _lastTdrData;
+    try {
+        const res = await api(`/v1/tdr/${year}/${encodeURIComponent(storm_name)}`);
+        if (!res.ok) {
+            renderDbViewTable('tdr', { year, storm_name, missions: [] });
+            return;
+        }
+        renderDbViewTable('tdr', await res.json());
+    } catch (e) {
+        setDbViewStatus('Network error: ' + e.message, 'err');
+    }
+}
+
+async function saveTdrMissionEdit(missionId) {
+    const statusEl = document.querySelector(`[data-tdr-save-status="${missionId}"]`);
+    const before = (_lastTdrData?.missions || []).find((m) => m.mission_id === missionId);
+    if (!before) return;
+    const field = (name) => document.querySelector(`[data-tdr-field="${name}"][data-tdr-owner="${missionId}"]`);
+
+    // Only send what actually changed — the audit log names the changed
+    // fields, so an unchanged value shouldn't show up as an edit.
+    const body = {};
+    const text = { storm_name: 'storm_name', storm_id: 'storm_id', aircraft: 'aircraft', tail_num: 'tail_num' };
+    for (const [inputName, bodyKey] of Object.entries(text)) {
+        const next = field(inputName).value.trim();
+        if (next !== (before[inputName] ?? '')) body[bodyKey] = next;
+    }
+    for (const name of ['has_level1b', 'has_level2', 'storm_locked']) {
+        const next = field(name).checked;
+        if (next !== !!before[name]) body[name] = next;
+    }
+
+    if (Object.keys(body).length === 0) {
+        if (statusEl) { statusEl.textContent = 'No changes.'; statusEl.className = 'status-text'; }
+        return;
+    }
+    if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'status-text working'; }
+    try {
+        const res = await api(`/v1/admin/tdr/missions/${encodeURIComponent(missionId)}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            if (statusEl) { statusEl.textContent = err.detail || 'The change was rejected.'; statusEl.className = 'status-text err'; }
+            return;
+        }
+        openTdrEditors.delete(missionId);
+        await reloadTdrMissions();
+        if (can('status.view')) refreshStatus();
+    } catch (e) {
+        if (statusEl) { statusEl.textContent = 'Network error: ' + e.message; statusEl.className = 'status-text err'; }
+    }
+}
+
+async function deleteTdrMission(missionId) {
+    if (!confirm(`Permanently delete TDR mission '${missionId}'? Its indexed files and legs go with it — a future re-crawl can re-add the mission, but not any manual corrections you made to it.`)) return;
+    const res = await api(`/v1/admin/tdr/missions/${encodeURIComponent(missionId)}`, { method: 'DELETE' });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(err.detail || 'The change was rejected.');
+        return;
+    }
+    openTdrEditors.delete(missionId);
+    await reloadTdrMissions();
+    if (can('status.view')) refreshStatus();
+}
+
+async function previewTdrMission(missionId) {
+    showPreview('<div class="status-text">Loading…</div>');
+    try {
+        const res = await api(`/v1/tdr/mission/${encodeURIComponent(missionId)}`);
+        if (!res.ok) {
+            const err = await res.json();
+            showPreview(`<div class="status-text err">Error: ${err.detail || 'failed to load mission'}</div>`);
+            return;
+        }
+        renderTdrMissionPreview(await res.json());
+    } catch (e) {
+        showPreview(`<div class="status-text err">Network error: ${e.message}</div>`);
+    }
+}
+
+function renderTdrMissionPreview(m) {
+    const canManage = can('tdr.manage');
+    const fileRows = (m.files || []).map((f) => `
+        <tr>
+            <td class="code">${f.level}</td><td>${f.product}</td><td>${f.format}</td><td>${f.analysis_time}</td>
+            <td class="actions-cell">${canManage ? `<button class="del-btn tdr-delfile-btn" data-file-id="${f.id}" data-mission-id="${m.mission_id}">Delete</button>` : ''}</td>
+        </tr>`).join('');
+    const legRows = (m.legs || []).map((l) => `
+        <tr>
+            <td class="code">${l.level}</td><td>${l.start_time}</td><td>${l.stop_time}</td>
+            <td class="actions-cell">${canManage ? `<button class="del-btn tdr-delleg-btn" data-leg-id="${l.id}" data-mission-id="${m.mission_id}">Delete</button>` : ''}</td>
+        </tr>`).join('');
+    showPreview(`
+        <div class="status-text">${m.mission_id} — ${escapeHtml(m.storm_name)}${m.storm_locked ? ' (locked)' : ''}, ${m.year}</div>
+        <div class="nc-section-title">Files (${(m.files || []).length})</div>
+        <table class="meta-table">
+            <thead><tr><th>Level</th><th>Product</th><th>Format</th><th>Time</th><th></th></tr></thead>
+            <tbody>${fileRows || '<tr class="empty-row"><td colspan="5">No files.</td></tr>'}</tbody>
+        </table>
+        <div class="nc-section-title" style="margin-top:10px;">Legs (${(m.legs || []).length})</div>
+        <table class="meta-table">
+            <thead><tr><th>Level</th><th>Start</th><th>Stop</th><th></th></tr></thead>
+            <tbody>${legRows || '<tr class="empty-row"><td colspan="4">No legs.</td></tr>'}</tbody>
+        </table>
+    `);
+    document.querySelectorAll('.tdr-delfile-btn').forEach((btn) => btn.addEventListener('click', async () => {
+        if (!confirm('Delete this file record? This only removes it from the index — it can be re-added by a re-crawl.')) return;
+        await api(`/v1/admin/tdr/files/${btn.dataset.fileId}`, { method: 'DELETE' });
+        previewTdrMission(btn.dataset.missionId);
+    }));
+    document.querySelectorAll('.tdr-delleg-btn').forEach((btn) => btn.addEventListener('click', async () => {
+        if (!confirm('Delete this leg record? This only removes it from the index — it can be re-added by a re-crawl.')) return;
+        await api(`/v1/admin/tdr/legs/${btn.dataset.legId}`, { method: 'DELETE' });
+        previewTdrMission(btn.dataset.missionId);
+    }));
+}
+
+document.getElementById('tdr-add-mission-btn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('tdr-add-mission-status');
+    const missionId = document.getElementById('tdr-add-mission-id').value.trim();
+    if (!missionId) {
+        statusEl.textContent = 'Mission ID is required.';
+        statusEl.className = 'status-text err';
+        return;
+    }
+    const body = {
+        mission_id: missionId,
+        storm_name: document.getElementById('tdr-add-storm-name').value.trim() || null,
+        storm_id: document.getElementById('tdr-add-storm-id').value.trim() || null,
+        aircraft: document.getElementById('tdr-add-aircraft').value.trim() || null,
+        tail_num: document.getElementById('tdr-add-tail-num').value.trim() || null,
+    };
+    statusEl.textContent = 'Adding…';
+    statusEl.className = 'status-text working';
+    try {
+        const res = await api('/v1/admin/tdr/missions', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            statusEl.textContent = 'Error: ' + (err.detail || 'request failed');
+            statusEl.className = 'status-text err';
+            return;
+        }
+        statusEl.textContent = 'Added.';
+        statusEl.className = 'status-text ok';
+        ['tdr-add-mission-id', 'tdr-add-storm-name', 'tdr-add-storm-id', 'tdr-add-aircraft', 'tdr-add-tail-num'].forEach((id) => {
+            document.getElementById(id).value = '';
+        });
+        // A hand-added mission's year might be new to the dropdown, so
+        // refresh from the top rather than trying to patch the view in place.
+        refreshDbViewYears();
+        if (can('status.view')) refreshStatus();
+    } catch (e) {
+        statusEl.textContent = 'Network error: ' + e.message;
+        statusEl.className = 'status-text err';
     }
 });
 

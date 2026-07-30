@@ -33,9 +33,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn conn(state: &AppState) -> ApiResult<rusqlite::Connection> {
-    // Read connection: opens tdr.sqlite and ATTACHes the recon index so storm
-    // identity resolves live in the mission queries — see tdr::get_connection.
-    Ok(tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db)?)
+    Ok(tdr::get_connection(&state.paths.tdr_db)?)
 }
 
 async fn list_years(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -75,6 +73,9 @@ async fn list_missions_for_storm(
                 "mission_id": m.mission_id,
                 "aircraft": m.aircraft,
                 "tail_num": m.tail_num,
+                "storm_name": m.storm_name,
+                "storm_id": m.storm_id,
+                "storm_locked": m.storm_locked,
                 "has_level1b": m.has_level1b,
                 "has_level2": m.has_level2,
             })
@@ -95,6 +96,7 @@ async fn get_mission(
         .iter()
         .map(|f| {
             json!({
+                "id": f.id,
                 "level": f.level,
                 "product": f.product,
                 "format": f.format,
@@ -114,6 +116,7 @@ async fn get_mission(
         .iter()
         .map(|l| {
             json!({
+                "id": l.id,
                 "level": l.level,
                 "start_time": l.start_time,
                 "stop_time": l.stop_time,
@@ -128,6 +131,7 @@ async fn get_mission(
         "tail_num": mission.tail_num,
         "storm_name": mission.storm_name,
         "storm_id": mission.storm_id,
+        "storm_locked": mission.storm_locked,
         "has_level1b": mission.has_level1b,
         "has_level2": mission.has_level2,
         "file_count": files.len(),
@@ -734,7 +738,7 @@ struct CentersQuery {
 /// center fields `null` at levels with no coherent circulation.
 async fn get_centers(State(state): State<AppState>, Query(q): Query<CentersQuery>) -> ApiResult<Json<Value>> {
     let product = q.product.clone().unwrap_or_else(|| "xy".into());
-    let conn = tdr::get_connection(&state.paths.tdr_db, &state.paths.recon_met_db)?;
+    let conn = tdr::get_connection(&state.paths.tdr_db)?;
     let (mission, file, level) =
         resolve_mission_and_file(&conn, &q.mission_id, &q.level, &product, &q.analysis_time)?;
     drop(conn);

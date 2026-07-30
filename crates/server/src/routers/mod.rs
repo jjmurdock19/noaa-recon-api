@@ -5,6 +5,7 @@
 //! Ported incrementally; only `health` exists so far.
 
 pub mod admin;
+pub mod admin_tdr;
 pub mod admin_tokens;
 pub mod health;
 pub mod raw;

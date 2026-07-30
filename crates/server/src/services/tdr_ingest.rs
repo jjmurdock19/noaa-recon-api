@@ -29,12 +29,13 @@
 //! bundle per leg, which is the only place that boundary actually lives —
 //! see `parse_leg_filename` and the `legs` table.
 //!
-//! Ingest records only a storm-name *fallback* (`storm_label`): the jobfile
-//! name for a Level 1b mission, the path slug for a Level 2 one. Authoritative
-//! storm identity is resolved live at read time by joining the recon MET index
-//! on the shared `mission_id` (`YYYYMMDDAI`, the exact same scheme on both
-//! hosts) — see `tdr::get_connection`. There is no stored association to
-//! reconcile and no pending/re-resolve machine here anymore.
+//! Ingest captures TDR's own authoritative storm name: the jobfile name for a
+//! Level 1b mission, the path slug for a Level 2 one — see
+//! `fetch_jobfile_storm`. It's stored directly in `missions.storm_name`, not
+//! resolved against any other database. If an admin has corrected a mission's
+//! storm identity via the console (`tdr::edit_mission` sets
+//! `missions.storm_locked`), a re-crawl must leave `storm_name`/`storm_id`
+//! alone — see the `ON CONFLICT` clause in `harvest_mission_dir`.
 
 use std::io::Read;
 use std::path::Path;
@@ -99,7 +100,7 @@ async fn list_hrefs(client: &reqwest::Client, url: &str) -> Vec<String> {
         .collect()
 }
 
-fn mission_id_re() -> &'static Regex {
+pub(crate) fn mission_id_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)^\d{8}[hin]\d+[a-z]?$").unwrap())
 }
@@ -200,7 +201,7 @@ fn parse_leg_filename(name: &str) -> Option<(String, String)> {
     Some((c[1].to_string(), c[2].to_string()))
 }
 
-fn mission_year(mission_id: &str) -> Option<i64> {
+pub(crate) fn mission_year(mission_id: &str) -> Option<i64> {
     mission_id.get(0..4)?.parse().ok()
 }
 
@@ -294,6 +295,49 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Upserts one mission's own columns. Split out from `harvest_mission_dir` for
+/// unit testing (no HTTP involved) — same reasoning as `parse_jobfile_storm`.
+/// A fresh insert always starts unlocked (`storm_locked = 0`). On a re-crawl:
+/// if an admin has locked the row (a manual correction via the console),
+/// `storm_name`/`storm_id` are left alone entirely; otherwise COALESCE
+/// prefers the incoming value but falls back to what's already stored, so a
+/// later label-less pass (e.g. a training-dir jobfile) can't wipe out a good
+/// name.
+#[allow(clippy::too_many_arguments)]
+fn upsert_mission(
+    conn: &Connection,
+    mission_id: &str,
+    year: i64,
+    aircraft: Option<&str>,
+    tail_num: Option<&str>,
+    storm_name: Option<&str>,
+    storm_id: Option<&str>,
+    level1b_flag: i64,
+    level2_flag: i64,
+    fetched_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO missions \
+         (mission_id, year, aircraft, tail_num, storm_name, storm_id, storm_locked, has_level1b, has_level2, \
+          fetched_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,0,?7,?8,?9) \
+         ON CONFLICT(mission_id) DO UPDATE SET \
+           aircraft=excluded.aircraft, tail_num=excluded.tail_num, \
+           storm_name=CASE WHEN missions.storm_locked=1 THEN missions.storm_name \
+                            ELSE COALESCE(excluded.storm_name, missions.storm_name) END, \
+           storm_id=CASE WHEN missions.storm_locked=1 THEN missions.storm_id \
+                          ELSE COALESCE(excluded.storm_id, missions.storm_id) END, \
+           has_level1b=MAX(missions.has_level1b, excluded.has_level1b), \
+           has_level2=MAX(missions.has_level2, excluded.has_level2), \
+           fetched_at=excluded.fetched_at",
+        rusqlite::params![
+            mission_id, year, aircraft, tail_num, storm_name, storm_id,
+            level1b_flag, level2_flag, fetched_at,
+        ],
+    )?;
+    Ok(())
+}
+
 // ── Per-mission harvest ──────────────────────────────────────────────────────
 
 /// Crawls one mission directory's file listing and upserts its parsed
@@ -321,11 +365,7 @@ async fn harvest_mission_dir(
             |r| r.get(0),
         )
         .unwrap_or(0);
-    // Skip the crawl when this level is already indexed, unless `force`. Storm
-    // identity is now resolved live at read time against the recon index, so
-    // there's no provisional/pending state left to re-crawl for — a mission
-    // that "landed as Unknown" simply resolves the moment recon data uploads,
-    // no re-ingest required.
+    // Skip the crawl when this level is already indexed, unless `force`.
     if already != 0 && !force {
         return Ok(false);
     }
@@ -349,12 +389,12 @@ async fn harvest_mission_dir(
         })
         .collect();
 
-    // The ingest-time storm-name fallback (`storm_label`) + any ATCF id, kept
-    // only for when the recon index has no live match at read time:
+    // TDR's own authoritative storm name + any ATCF id, straight from a
+    // same-host source:
     //   - Level 2: the storm is named right in the path slug; no jobfile.
     //   - Level 1b: lift the name (+ ATCF) from the mission dir's own jobfile;
-    //     a training/ferry dir with no name leaves `storm_label` NULL.
-    let (storm_label, storm_id): (Option<String>, Option<String>) = match level {
+    //     a training/ferry dir with no name leaves `storm_name` NULL.
+    let (storm_name, storm_id): (Option<String>, Option<String>) = match level {
         Level::L2 => (level2_storm_slug.map(title_case), None),
         Level::L1b => match fetch_jobfile_storm(http, mission_url, &hrefs).await {
             Some((name, atcf)) => (Some(name), atcf),
@@ -370,26 +410,9 @@ async fn harvest_mission_dir(
             Level::L1b => (1, 0),
             Level::L2 => (0, 1),
         };
-        // `storm_label`/`storm_id` are only the read-time fallback, so on a
-        // re-crawl keep an existing better label rather than let a later
-        // label-less pass (e.g. a training-dir jobfile) wipe it — COALESCE
-        // prefers the incoming value but falls back to what's already stored.
-        conn.execute(
-            "INSERT INTO missions \
-             (mission_id, year, aircraft, tail_num, storm_label, storm_id, has_level1b, has_level2, \
-              fetched_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-             ON CONFLICT(mission_id) DO UPDATE SET \
-               aircraft=excluded.aircraft, tail_num=excluded.tail_num, \
-               storm_label=COALESCE(excluded.storm_label, missions.storm_label), \
-               storm_id=COALESCE(excluded.storm_id, missions.storm_id), \
-               has_level1b=MAX(missions.has_level1b, excluded.has_level1b), \
-               has_level2=MAX(missions.has_level2, excluded.has_level2), \
-               fetched_at=excluded.fetched_at",
-            rusqlite::params![
-                mission_id, year, aircraft, tail_num, storm_label, storm_id,
-                level1b_flag, level2_flag, fetched_at,
-            ],
+        upsert_mission(
+            conn, mission_id, year, aircraft.as_deref(), tail_num.as_deref(),
+            storm_name.as_deref(), storm_id.as_deref(), level1b_flag, level2_flag, fetched_at,
         )?;
 
         let mut stmt = conn.prepare(
@@ -463,8 +486,8 @@ pub async fn run_ingest(
         vec![y - 1, y]
     });
 
-    // WRITE connection: applies/migrates the schema. Storm identity is resolved
-    // at read time, so ingest never opens the recon index.
+    // WRITE connection: applies/migrates the schema. Storm identity is TDR's
+    // own now, so ingest never opens any other database.
     let conn = tdr::init_db(tdr_db)?;
     let http = client()?;
 
@@ -549,6 +572,43 @@ pub async fn run_ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(tdr::SCHEMA).unwrap();
+        conn
+    }
+
+    #[test]
+    fn re_crawl_updates_an_unlocked_mission() {
+        let conn = mem_conn();
+        upsert_mission(&conn, "20260616H1", 2026, Some("N42"), Some("N42"), Some("Fausto"), Some("EP062026"), 1, 0, 100).unwrap();
+        // Simulated re-crawl with a different (e.g. re-parsed) name.
+        upsert_mission(&conn, "20260616H1", 2026, Some("N42"), Some("N42"), Some("Fausto2"), Some("EP062026"), 1, 0, 200).unwrap();
+
+        let name: String = conn.query_row("SELECT storm_name FROM missions", [], |r| r.get(0)).unwrap();
+        assert_eq!(name, "Fausto2");
+    }
+
+    #[test]
+    fn re_crawl_never_touches_a_locked_mission() {
+        let conn = mem_conn();
+        upsert_mission(&conn, "20260616H1", 2026, Some("N42"), Some("N42"), Some("Training / Research"), None, 1, 0, 100).unwrap();
+        // An admin correction, mirroring what tdr::edit_mission does.
+        conn.execute(
+            "UPDATE missions SET storm_name = 'Fausto', storm_id = 'EP062026', storm_locked = 1 WHERE mission_id = '20260616H1'",
+            [],
+        )
+        .unwrap();
+
+        // A re-crawl that would otherwise demote it right back.
+        upsert_mission(&conn, "20260616H1", 2026, Some("N42"), Some("N42"), Some("Training / Research"), None, 1, 0, 200).unwrap();
+
+        let (name, id): (String, Option<String>) =
+            conn.query_row("SELECT storm_name, storm_id FROM missions", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(name, "Fausto", "locked mission must survive a re-crawl unchanged");
+        assert_eq!(id.as_deref(), Some("EP062026"));
+    }
 
     #[test]
     fn parses_storm_from_jobfile_xml() {
