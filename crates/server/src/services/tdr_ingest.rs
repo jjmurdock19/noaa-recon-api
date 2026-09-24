@@ -31,12 +31,24 @@
 //!
 //! Ingest captures TDR's own authoritative storm name: the jobfile name for a
 //! Level 1b mission, the path slug for a Level 2 one — see
-//! `fetch_jobfile_storm`. It's stored directly in `missions.storm_name`, not
+//! `parse_jobfile_storm`. It's stored directly in `missions.storm_name`, not
 //! resolved against any other database. If an admin has corrected a mission's
 //! storm identity via the console (`tdr::edit_mission` sets
 //! `missions.storm_locked`), a re-crawl must leave `storm_name`/`storm_id`
 //! alone — see the `ON CONFLICT` clause in `harvest_mission_dir`.
+//!
+//! Each analysis also has its own tiny `*_{HHMMSS}_jobfile.tar.gz` (both
+//! hosts) — not indexed as a *file*, but every one is fetched once and parsed
+//! into the `analyses` table: HRD's "acceptable for composite" verdict and the
+//! storm center that analysis's grid was built around (`parse_jobfile_analysis`),
+//! which `GET /v1/tdr/composite` uses to filter and align analyses.
+//!
+//! A mission isn't written off once indexed: its dir keeps being re-listed
+//! and diffed against what's on record until it has gone `STABLE_AFTER_SECS`
+//! without a new file (the `crawl_state` table), so files published after a
+//! partial first crawl still get picked up — see `should_skip_crawl`.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -44,7 +56,7 @@ use std::sync::OnceLock;
 use chrono::{Datelike, Utc};
 use flate2::read::GzDecoder;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::services::progress::Progress;
@@ -229,31 +241,127 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
-/// The storm name + ATCF id lifted from a Level 1b mission dir's own
-/// `*_jobfile.tar.gz`. The gzip wraps a tiny (~1.6 KB) tar whose `jobfile.xml`
-/// member is a single line like
-/// `<flight id="20251030H1" mission="3113A MELISSA" storm="AL132025" …>`.
-/// Because tar stores member *contents* uncompressed, the gunzipped bytes carry
-/// those attributes verbatim — so we gunzip and regex them straight out rather
-/// than pull in a tar reader for one 1.6 KB blob. This is the ONLY in-directory
-/// source of the storm name for a Level 1b mission (no plaintext index exists),
-/// which is exactly what lets a radar-only mission that landed before its recon
-/// MET data get a real (if still provisional) name instead of "Unknown".
-async fn fetch_jobfile_storm(
-    http: &reqwest::Client,
-    mission_url: &str,
-    hrefs: &[String],
-) -> Option<(String, Option<String>)> {
-    let job_href = hrefs.iter().find(|h| h.to_lowercase().ends_with("_jobfile.tar.gz"))?;
-    let name = job_href.rsplit('/').next().unwrap_or(job_href);
-    let gz = fetch_bytes(http, &format!("{mission_url}{name}")).await?;
-    let mut text = String::new();
+/// Every per-analysis `*_jobfile.tar.gz` in a mission dir listing, sorted by
+/// filename. Level 1b names them `{processedYYYYMMDDHHMMSS}_{mission}_
+/// {centerHHMMSS}_jobfile.tar.gz`, so sorting puts a re-run of the same
+/// analysis *after* the original and its upsert wins; Level 2 names them
+/// `{mission}_{centerHHMMSS}_jobfile.tar.gz` (one per analysis).
+fn jobfile_names(hrefs: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = hrefs
+        .iter()
+        .map(|h| h.rsplit('/').next().unwrap_or(h).to_string())
+        .filter(|n| n.to_lowercase().ends_with("_jobfile.tar.gz"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The `{centerHHMMSS}` suffix of a jobfile's name — the same on both hosts.
+fn jobfile_center_time(name: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)_(\d{6})_jobfile\.tar\.gz$").unwrap());
+    Some(re.captures(name)?[1].to_string())
+}
+
+/// Fetches one `*_jobfile.tar.gz` and returns its gunzipped text. The gzip
+/// wraps a tiny (~1.6 KB) tar whose `jobfile.xml` member is a single line like
+/// `<flight id="20251030H1" mission="3113A MELISSA" storm="AL132025" …>` and
+/// whose `summary` member is a short plaintext recap. Because tar stores member
+/// *contents* uncompressed, the gunzipped bytes carry both verbatim — so we
+/// gunzip and regex them straight out rather than pull in a tar reader for one
+/// 1.6 KB blob. The jobfile is the ONLY in-directory source of the storm name
+/// for a Level 1b mission (no plaintext index exists), which is exactly what
+/// lets a radar-only mission that landed before its recon MET data get a real
+/// (if still provisional) name instead of "Unknown" — and the only source of
+/// each analysis's composite-acceptability verdict and center.
+async fn fetch_jobfile_text(http: &reqwest::Client, url: &str) -> Option<String> {
+    let gz = fetch_bytes(http, url).await?;
     // The tar's binary headers aren't valid UTF-8, so read as bytes then
-    // lossy-decode — the `<flight …>` line we want is plain ASCII regardless.
+    // lossy-decode — the `<flight …>` line and summary are plain ASCII regardless.
     let mut buf = Vec::new();
     GzDecoder::new(&gz[..]).read_to_end(&mut buf).ok()?;
-    text.push_str(&String::from_utf8_lossy(&buf));
-    parse_jobfile_storm(&text)
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// One analysis's metadata from its jobfile — see the `analyses` table in
+/// `tdr::SCHEMA`.
+#[derive(Debug, PartialEq)]
+struct JobfileAnalysis {
+    /// HHMM — the `files.analysis_time` key of the products this jobfile built.
+    analysis_time: String,
+    /// Full HHMMSS `centerTime`.
+    center_time: String,
+    center_lat: Option<f64>,
+    center_lon: Option<f64>,
+    storm_dir_deg: Option<f64>,
+    storm_speed_kt: Option<f64>,
+    acceptable_for_composite: Option<bool>,
+}
+
+/// Pulls one analysis's metadata out of a gunzipped jobfile tar's text.
+/// Split out for unit testing, same as `parse_jobfile_storm`.
+///
+/// - `analysis_time`: the XML `<centerTime>` (HHMMSS), truncated to HHMM —
+///   confirmed against live dirs (centerTime `134908` built `…_1349_xy.nc`).
+///   Falls back to the `_{HHMMSS}_jobfile` filename suffix if the XML has none.
+/// - `acceptable_for_composite`: XML `<acceptable>` (0/1), else the summary's
+///   `Acceptable for composite: N` line.
+/// - center: the summary's signed `Center lat, lon:` line first (no
+///   hemisphere guessing), else XML `latDeg`/`lonDeg` (+ minutes), with
+///   `lonHemisphere` 0 meaning west — the only encoding seen on either host,
+///   cross-checked against the signed summary line in both.
+fn parse_jobfile_analysis(text: &str, filename: &str) -> Option<JobfileAnalysis> {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    static SUMMARY_CENTER_RE: OnceLock<Regex> = OnceLock::new();
+    static SUMMARY_ACCEPT_RE: OnceLock<Regex> = OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"<([A-Za-z0-9]+)>\s*([^<]*?)\s*</[A-Za-z0-9]+>").unwrap());
+    let tag = |name: &str| -> Option<&str> {
+        tag_re.captures_iter(text).find(|c| &c[1] == name).map(|c| c.get(2).unwrap().as_str())
+    };
+    let tag_f64 = |name: &str| tag(name).and_then(|v| v.parse::<f64>().ok());
+
+    let center_time = match tag("centerTime").filter(|t| t.len() == 6 && t.bytes().all(|b| b.is_ascii_digit())) {
+        Some(t) => t.to_string(),
+        None => jobfile_center_time(filename)?,
+    };
+    let analysis_time = center_time[..4].to_string();
+
+    let accept_re =
+        SUMMARY_ACCEPT_RE.get_or_init(|| Regex::new(r"(?i)Acceptable for composite:\s*(\d)").unwrap());
+    let acceptable_for_composite = tag("acceptable")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| accept_re.captures(text).and_then(|c| c[1].parse().ok()))
+        .map(|v| v != 0);
+
+    let center_re = SUMMARY_CENTER_RE
+        .get_or_init(|| Regex::new(r"(?i)Center lat, lon:\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)").unwrap());
+    let (center_lat, center_lon) = match center_re.captures(text) {
+        Some(c) => (c[1].parse().ok(), c[2].parse().ok()),
+        None => {
+            let deg_min = |d: &str, m: &str| Some(tag_f64(d)? + tag_f64(m).unwrap_or(0.0) / 60.0);
+            let lat = deg_min("latDeg", "latMin");
+            let lon = deg_min("lonDeg", "lonMin").map(|lon| {
+                if tag("lonHemisphere") == Some("0") { -lon.abs() } else { lon }
+            });
+            (lat, lon)
+        }
+    };
+    // A 0/0 center is the jobfile's "unset", not a real fix.
+    let (center_lat, center_lon) = match (center_lat, center_lon) {
+        (Some(la), Some(lo)) if !(la == 0.0 && lo == 0.0) => (Some(la), Some(lo)),
+        _ => (None, None),
+    };
+
+    Some(JobfileAnalysis {
+        analysis_time,
+        center_time,
+        center_lat,
+        center_lon,
+        storm_dir_deg: tag_f64("stmDir"),
+        storm_speed_kt: tag_f64("stmMotion"),
+        acceptable_for_composite,
+    })
 }
 
 /// The flight-number token used for a weather-reconnaissance training
@@ -354,12 +462,92 @@ fn upsert_mission(
     Ok(())
 }
 
+/// How long a mission dir keeps being re-listed after the last time a crawl
+/// found something new in it. A Level 1b mission is published file-by-file
+/// while (and shortly after) the aircraft flies, and Level 2 is uploaded in
+/// batches post-season, so "this level is already indexed" can't mean "this
+/// mission is done" — only a quiet stretch with no new files can.
+const STABLE_AFTER_SECS: i64 = 14 * 24 * 3600;
+
+/// Ingest's skip rule, split out for unit testing: skip re-listing a mission
+/// dir only when this level is already indexed *and* has a `crawl_state`
+/// row whose last change is older than [`STABLE_AFTER_SECS`]. No
+/// `crawl_state` row means the mission predates that table (or was never
+/// fully crawled), so it gets one re-list — which is also what backfills
+/// the `analyses` table for missions indexed before it existed.
+fn should_skip_crawl(conn: &Connection, mission_id: &str, level: Level, force: bool, now: i64) -> bool {
+    if force {
+        return false;
+    }
+    let already: i64 = conn
+        .query_row(
+            match level {
+                Level::L1b => "SELECT has_level1b FROM missions WHERE mission_id = ?1",
+                Level::L2 => "SELECT has_level2 FROM missions WHERE mission_id = ?1",
+            },
+            [mission_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if already == 0 {
+        return false;
+    }
+    let last_changed: Option<i64> = conn
+        .query_row(
+            "SELECT last_changed_at FROM crawl_state WHERE mission_id = ?1 AND level = ?2",
+            rusqlite::params![mission_id, level.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    last_changed.is_some_and(|t| now - t > STABLE_AFTER_SECS)
+}
+
+/// Every source URL already on record for one (mission, level) — files,
+/// legs, and jobfiles — so a re-list can tell what's genuinely new.
+fn known_source_urls(conn: &Connection, mission_id: &str, level: Level) -> rusqlite::Result<HashSet<String>> {
+    let mut known = HashSet::new();
+    for table in ["files", "legs", "analyses"] {
+        let mut stmt = conn.prepare(&format!("SELECT source_url FROM {table} WHERE mission_id = ?1 AND level = ?2"))?;
+        let rows = stmt.query_map(rusqlite::params![mission_id, level.as_str()], |r| r.get::<_, String>(0))?;
+        for url in rows {
+            known.insert(url?);
+        }
+    }
+    Ok(known)
+}
+
+/// `analysis_time -> jobfile source_url` currently on record for one
+/// (mission, level).
+fn stored_jobfile_urls(
+    conn: &Connection,
+    mission_id: &str,
+    level: Level,
+) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT analysis_time, source_url FROM analyses WHERE mission_id = ?1 AND level = ?2")?;
+    let rows = stmt.query_map(rusqlite::params![mission_id, level.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn record_crawl(conn: &Connection, mission_id: &str, level: Level, now: i64, changed: bool) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO crawl_state (mission_id, level, last_crawled_at, last_changed_at) VALUES (?1, ?2, ?3, ?3) \
+         ON CONFLICT(mission_id, level) DO UPDATE SET \
+           last_crawled_at = excluded.last_crawled_at, \
+           last_changed_at = CASE WHEN ?4 THEN excluded.last_changed_at ELSE crawl_state.last_changed_at END",
+        rusqlite::params![mission_id, level.as_str(), now, changed],
+    )?;
+    Ok(())
+}
+
 // ── Per-mission harvest ──────────────────────────────────────────────────────
 
-/// Crawls one mission directory's file listing and upserts its parsed
-/// products. Returns whether anything new was indexed. Skips the crawl
-/// entirely (no HTTP request against the mission dir) if this level is
-/// already on record for the mission, unless `force`.
+/// Crawls one mission directory's file listing and upserts whatever's new in
+/// it — products, legs, and per-analysis jobfiles. Returns whether anything
+/// new was indexed. See [`should_skip_crawl`] for when the listing isn't
+/// even fetched; otherwise the listing is always diffed against what's on
+/// record, so a mission first indexed mid-flight still picks up files that
+/// land later instead of being written off as "already ingested".
 #[allow(clippy::too_many_arguments)]
 async fn harvest_mission_dir(
     http: &reqwest::Client,
@@ -371,18 +559,8 @@ async fn harvest_mission_dir(
     level2_storm_slug: Option<&str>,
     force: bool,
 ) -> anyhow::Result<bool> {
-    let already: i64 = conn
-        .query_row(
-            match level {
-                Level::L1b => "SELECT has_level1b FROM missions WHERE mission_id = ?1",
-                Level::L2 => "SELECT has_level2 FROM missions WHERE mission_id = ?1",
-            },
-            [mission_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    // Skip the crawl when this level is already indexed, unless `force`.
-    if already != 0 && !force {
+    let now = now_unix();
+    if should_skip_crawl(conn, mission_id, level, force, now) {
         return Ok(false);
     }
 
@@ -404,21 +582,64 @@ async fn harvest_mission_dir(
             parse_leg_filename(name).map(|(start, stop)| (start, stop, format!("{mission_url}{name}")))
         })
         .collect();
+    let jobfile_urls: Vec<(String, String)> =
+        jobfile_names(&hrefs).into_iter().map(|n| (format!("{mission_url}{n}"), n)).collect();
 
-    // TDR's own authoritative storm name + any ATCF id, straight from a
-    // same-host source:
-    //   - Level 2: the storm is named right in the path slug; no jobfile.
-    //   - Level 1b: lift the name (+ ATCF) from the mission dir's own jobfile;
-    //     a training/ferry dir with no name leaves `storm_name` NULL.
+    // Diff the listing against what's on record. With nothing new (and no
+    // `force`), there's nothing to write beyond noting the crawl happened.
+    let known = known_source_urls(conn, mission_id, level)?;
+    let is_new = |url: &String| force || !known.contains(url);
+    // An analysis re-run leaves both jobfiles in the dir but only the later
+    // one's URL on record (it overwrote the row), so a jobfile also counts
+    // as seen when the stored row for its analysis time came from a jobfile
+    // that sorts at or after it — see `jobfile_names`.
+    let stored_jobfiles = stored_jobfile_urls(conn, mission_id, level)?;
+    let is_new_jobfile = |url: &String, name: &str| {
+        is_new(url)
+            && !jobfile_center_time(name)
+                .and_then(|t| stored_jobfiles.get(&t[..4]))
+                .is_some_and(|stored| !force && stored.as_str() >= url.as_str())
+    };
+    let any_new = files.iter().any(|(_, u)| is_new(u))
+        || legs.iter().any(|(_, _, u)| is_new(u))
+        || jobfile_urls.iter().any(|(u, n)| is_new_jobfile(u, n));
+    let mission_exists = conn
+        .query_row("SELECT 1 FROM missions WHERE mission_id = ?1", [mission_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !any_new && mission_exists {
+        record_crawl(conn, mission_id, level, now, false)?;
+        return Ok(false);
+    }
+
+    // Only fetch jobfiles we haven't parsed before (all of them on `force`).
+    // Each yields one analysis's composite verdict + center; the first one
+    // that names a storm also supplies TDR's own authoritative storm name
+    // (+ ATCF) for a Level 1b mission — Level 2 names it in the path slug.
+    let mut analyses: Vec<(JobfileAnalysis, String)> = Vec::new();
+    let mut jobfile_storm: Option<(String, Option<String>)> = None;
+    for (url, name) in jobfile_urls.iter().filter(|(u, n)| is_new_jobfile(u, n)) {
+        let Some(text) = fetch_jobfile_text(http, url).await else { continue };
+        if jobfile_storm.is_none() {
+            jobfile_storm = parse_jobfile_storm(&text);
+        }
+        match parse_jobfile_analysis(&text, name) {
+            Some(a) => analyses.push((a, url.clone())),
+            None => tracing::warn!("{mission_id} ({}): couldn't parse jobfile {name}", level.as_str()),
+        }
+    }
+    // A training/ferry dir with no name, or a re-list that fetched no new
+    // jobfile, leaves `storm_name` NULL here — the upsert's COALESCE keeps
+    // whatever's already stored.
     let (storm_name, storm_id): (Option<String>, Option<String>) = match level {
         Level::L2 => (level2_storm_slug.map(title_case), None),
-        Level::L1b => match fetch_jobfile_storm(http, mission_url, &hrefs).await {
+        Level::L1b => match jobfile_storm {
             Some((name, atcf)) => (Some(name), atcf),
             None => (None, None),
         },
     };
     let (aircraft, tail_num) = aircraft_from_mission_id(mission_id);
-    let fetched_at = now_unix();
+    let fetched_at = now;
 
     conn.execute_batch("BEGIN")?;
     let res = (|| -> rusqlite::Result<()> {
@@ -462,16 +683,22 @@ async fn harvest_mission_dir(
         for (start, stop, url) in &legs {
             leg_stmt.execute(rusqlite::params![mission_id, level.as_str(), start, stop, url, fetched_at])?;
         }
+
+        for (a, url) in &analyses {
+            upsert_analysis(conn, mission_id, level, a, url, fetched_at)?;
+        }
+        record_crawl(conn, mission_id, level, now, true)?;
         Ok(())
     })();
     match res {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
             tracing::info!(
-                "{mission_id} ({}): indexed {} product file(s), {} leg(s)",
+                "{mission_id} ({}): indexed {} product file(s), {} leg(s), {} new jobfile analysis(es)",
                 level.as_str(),
                 files.len(),
-                legs.len()
+                legs.len(),
+                analyses.len()
             );
             Ok(true)
         }
@@ -480,6 +707,42 @@ async fn harvest_mission_dir(
             Err(e.into())
         }
     }
+}
+
+/// Upserts one analysis's jobfile metadata. Split out for unit testing.
+fn upsert_analysis(
+    conn: &Connection,
+    mission_id: &str,
+    level: Level,
+    a: &JobfileAnalysis,
+    source_url: &str,
+    fetched_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO analyses \
+         (mission_id, level, analysis_time, center_time, center_lat, center_lon, storm_dir_deg, storm_speed_kt, \
+          acceptable_for_composite, source_url, fetched_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+         ON CONFLICT(mission_id, level, analysis_time) DO UPDATE SET \
+           center_time=excluded.center_time, center_lat=excluded.center_lat, center_lon=excluded.center_lon, \
+           storm_dir_deg=excluded.storm_dir_deg, storm_speed_kt=excluded.storm_speed_kt, \
+           acceptable_for_composite=excluded.acceptable_for_composite, \
+           source_url=excluded.source_url, fetched_at=excluded.fetched_at",
+        rusqlite::params![
+            mission_id,
+            level.as_str(),
+            a.analysis_time,
+            a.center_time,
+            a.center_lat,
+            a.center_lon,
+            a.storm_dir_deg,
+            a.storm_speed_kt,
+            a.acceptable_for_composite.map(|v| v as i64),
+            source_url,
+            fetched_at,
+        ],
+    )?;
+    Ok(())
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────────
@@ -738,5 +1001,105 @@ mod tests {
         assert_eq!(aircraft_from_mission_id("20240630H1").1, Some("N42".into()));
         assert_eq!(aircraft_from_mission_id("20240630I1").1, Some("N43".into()));
         assert_eq!(aircraft_from_mission_id("20240630N1").1, Some("N49".into()));
+    }
+
+    /// Trimmed from the real 20251028H1 1420 jobfile (Melissa), which HRD
+    /// marked not acceptable for composite.
+    const MELISSA_1420_JOBFILE: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><flight id="20251028H1" mission="2313A MELISSA" storm="AL132025" mode="0">"#,
+        "<centerTime>142007</centerTime><latDeg>17.655</latDeg><latMin>0</latMin><latUnits>0</latUnits>",
+        "<lonDeg>76.850</lonDeg><lonMin>0</lonMin><lonUnits>0</lonUnits><lonHemisphere>0</lonHemisphere>",
+        "<stmDir>20.00</stmDir><stmMotion>6.00</stmMotion><eventType>3</eventType><acceptable>0</acceptable></flight>",
+        "Flight ID: 20251028H1\nCenter lat, lon:     17.655,    -76.850\nAcceptable for composite: 0 (no)\n",
+    );
+
+    #[test]
+    fn parses_analysis_from_real_jobfile() {
+        let a = parse_jobfile_analysis(MELISSA_1420_JOBFILE, "20251028144029_20251028H1_142007_jobfile.tar.gz").unwrap();
+        assert_eq!(a.analysis_time, "1420");
+        assert_eq!(a.center_time, "142007");
+        assert_eq!(a.center_lat, Some(17.655));
+        assert_eq!(a.center_lon, Some(-76.850));
+        assert_eq!(a.storm_dir_deg, Some(20.0));
+        assert_eq!(a.storm_speed_kt, Some(6.0));
+        assert_eq!(a.acceptable_for_composite, Some(false));
+    }
+
+    #[test]
+    fn analysis_falls_back_to_xml_center_and_filename_time() {
+        // No summary member and no <centerTime>: center from latDeg/lonDeg
+        // (lonHemisphere 0 = west), time from the filename suffix.
+        let text = "<flight mission=\"0114A MILTON\"><latDeg>22.540</latDeg><lonDeg>94.740</lonDeg>\
+                    <lonHemisphere>0</lonHemisphere><acceptable>1</acceptable></flight>";
+        let a = parse_jobfile_analysis(text, "20241006I1_121155_jobfile.tar.gz").unwrap();
+        assert_eq!(a.analysis_time, "1211");
+        assert_eq!(a.center_lat, Some(22.54));
+        assert_eq!(a.center_lon, Some(-94.74));
+        assert_eq!(a.acceptable_for_composite, Some(true));
+        // Summary-only acceptability.
+        let a = parse_jobfile_analysis("Acceptable for composite: 1 (yes)", "x_134908_jobfile.tar.gz").unwrap();
+        assert_eq!(a.acceptable_for_composite, Some(true));
+        // No time anywhere -> not an analysis we can key.
+        assert!(parse_jobfile_analysis("<acceptable>1</acceptable>", "junk.tar.gz").is_none());
+    }
+
+    #[test]
+    fn jobfile_names_sorts_reruns_after_originals() {
+        let hrefs = vec![
+            "20251028144029_20251028H1_142007_jobfile.tar.gz".to_string(),
+            "251028H1_1349_xy.nc.gz".to_string(),
+            "20251028140823_20251028H1_134908_jobfile.tar.gz".to_string(),
+        ];
+        assert_eq!(
+            jobfile_names(&hrefs),
+            vec![
+                "20251028140823_20251028H1_134908_jobfile.tar.gz".to_string(),
+                "20251028144029_20251028H1_142007_jobfile.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_analysis_overwrites_a_rerun() {
+        let conn = mem_conn();
+        upsert_mission(&conn, "20251028H1", 2025, None, None, Some("Melissa"), None, 1, 0, 100).unwrap();
+        let mut a = parse_jobfile_analysis(MELISSA_1420_JOBFILE, "x").unwrap();
+        upsert_analysis(&conn, "20251028H1", Level::L1b, &a, "https://example/a", 100).unwrap();
+        a.acceptable_for_composite = Some(true);
+        upsert_analysis(&conn, "20251028H1", Level::L1b, &a, "https://example/b", 200).unwrap();
+
+        let rows = tdr::get_mission_analyses(&conn, "20251028H1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].acceptable_for_composite, Some(true));
+        assert_eq!(rows[0].source_url, "https://example/b");
+    }
+
+    #[test]
+    fn indexed_missions_keep_being_rescanned_until_stable() {
+        let conn = mem_conn();
+        let now = 1_000_000_000;
+        // Never indexed at this level -> crawl.
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L1b, false, now));
+
+        upsert_mission(&conn, "20251028H1", 2025, None, None, None, None, 1, 0, now).unwrap();
+        // Indexed before crawl_state existed (no row) -> re-list once.
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L1b, false, now));
+
+        // Indexed and changed recently (a partial, in-progress mission) -> re-list.
+        record_crawl(&conn, "20251028H1", Level::L1b, now, true).unwrap();
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L1b, false, now + 3600));
+
+        // Quiet re-lists don't reset the clock...
+        record_crawl(&conn, "20251028H1", Level::L1b, now + 86_400, false).unwrap();
+        // ...so once it's been quiet past the window, it's skipped.
+        let later = now + STABLE_AFTER_SECS + 1;
+        assert!(should_skip_crawl(&conn, "20251028H1", Level::L1b, false, later));
+        // `force` always crawls; the other level is tracked independently.
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L1b, true, later));
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L2, false, later));
+
+        // A new file showing up restarts the window.
+        record_crawl(&conn, "20251028H1", Level::L1b, later, true).unwrap();
+        assert!(!should_skip_crawl(&conn, "20251028H1", Level::L1b, false, later + 1));
     }
 }

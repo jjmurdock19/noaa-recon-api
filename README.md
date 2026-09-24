@@ -911,7 +911,7 @@ crates/
                                    cappi_slice() (one x/y plane from a flattened x,y,level,time array),
                                    vertical_profile_slice() (the radius/height plane from a vert_* file),
                                    colorscale_for_field() (dBZ / wind-speed / diverging-wind defaults),
-                                   latlon_offset_km()/geo_mosaic()/combine_mode_for_field() (storm-center
+                                   distance_bearing_km()/storm_centered_mosaic()/combine_mode_for_field() (storm-relative
                                    alignment + max/mean cell-combine for composite's mode=time/
                                    time_volume), plane_slice() (bilinear cross-section along an
                                    arbitrary line through a volume, for GET /v1/tdr/plane_slice), and
@@ -957,7 +957,7 @@ crates/
                                    ingest-logic-lives-in-services/ split as storms.rs/recon.rs) AND
                                    sweep/volume/composite/plane_slice (fetch/cache -> tdr_nc.rs ->
                                    slice -> JSON). composite's mode=time/time_volume mosaic every
-                                   analysis time via crates/core sweep.rs's geo_mosaic(); plane_slice
+                                   analysis time via crates/core sweep.rs's storm_centered_mosaic(); plane_slice
                                    cuts an arbitrary line through a volume via sweep.rs's plane_slice().
                                    All live.
         raw.rs                          501 stub, same message as the Python branch.

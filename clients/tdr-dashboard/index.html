@@ -522,8 +522,8 @@ const VIEW_HINTS = {
   sweep: '2D sweep plots one horizontal CAPPI or the along-track vertical profile.',
   volume: '3D volume renders the full xy/xy_rel field as a continuous volumetric solid (GPU raymarched through every CAPPI level at once) — drag to orbit, scroll to zoom. Only xy-family products have a level axis, so vertical profiles aren’t selectable here.',
   compositeAltitude: 'Altitude max-projection collapses one analysis time’s whole level axis into a single plane (like classic composite reflectivity).',
-  compositeTime: 'Time mosaic aligns every analysis time by its storm center (ORIGIN_LATITUDE/LONGITUDE) and mosaics one CAPPI level into a single storm-spanning composite.',
-  compositeVolume: '3D composite mosaics every analysis time’s *entire* level axis by storm center into one storm-spanning volumetric composite — same alignment as the 2D time mosaic, extended to every CAPPI level, GPU raymarched the same way as 3D volume.',
+  compositeTime: 'Time mosaic re-plots every composite-acceptable analysis time around one shared storm center (by distance and radial from each analysis’s own center) and composites one CAPPI level into a single storm-relative image.',
+  compositeVolume: '3D composite re-plots every composite-acceptable analysis time’s *entire* level axis around one shared storm center into one storm-relative volumetric composite — same alignment as the 2D time mosaic, extended to every CAPPI level, GPU raymarched the same way as 3D volume.',
 };
 
 // Pseudo analysis_time value: picking it in the time dropdown swaps in a

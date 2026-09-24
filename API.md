@@ -621,7 +621,7 @@ This phase only indexes file **metadata** (mission → product → source URL)
 | `GET /v1/tdr/{year}` | Every storm with missions that year: `{storm_name, storm_id, mission_count}[]`. `storm_name` is TDR's own stored value — captured at ingest time from a same-host source (the Level 1b mission's own jobfile, or the Level 2 storm-slug path), not resolved against any other database — or `"Unknown"` if ingest found none and no admin has corrected it. |
 | `GET /v1/tdr/{year}/{storm_name}` | Every mission for that storm: `{mission_id, aircraft, tail_num, storm_name, storm_id, storm_locked, has_level1b, has_level2}[]`. `storm_locked` is `true` once an admin has corrected the mission's storm identity via the console — a locked mission is never touched by ingest again (see `POST /v1/admin/tdr/missions` below). |
 | `GET /v1/tdr/centers` | The **TDR-derived storm center at each CAPPI altitude** for one analysis time (`mission_id` + `analysis_time`; optional `level`, `product`, and the `rmin_km`/`rmax_km`/`max_offset_km`/`min_tangential_wind_ms`/`continuity_km` tuning knobs). Per level the center maximizes the azimuthal-mean tangential wind from the `U`/`V` field (HRD symmetric-circulation criterion); an anchor level plus level-to-level continuity make the track follow the vortex's tilt, and edge-pinned fits are dropped. Returns `{..., centers: [{level_km, lat, lon, x_km, y_km, tangential_wind_ms, rmw_km}]}` — center fields `null` where no coherent center exists (weak/disorganized storms come back all-`null` by design). The gridded synthesis only stores one `ORIGIN_LATITUDE/LONGITUDE` for the whole volume; this recovers the height-varying center. See "TDR-derived storm centers" in README.md for the algorithm. |
-| `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., storm_name, storm_id, storm_locked, file_count, files: [{id, level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}], legs: [{id, level, start_time, stop_time, source_url}]}`. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). Each file/leg's `id` is only useful for `DELETE /v1/admin/tdr/files/{id}` / `.../legs/{id}` below. |
+| `GET /v1/tdr/mission/{mission_id}` | One mission's full product index: `{..., storm_name, storm_id, storm_locked, file_count, files: [{id, level, product, format, analysis_time, storm_relative, fall_speed_removed, source_url}], legs: [{id, level, start_time, stop_time, source_url}], analyses: [{level, analysis_time, center_time, center_lat, center_lon, storm_dir_deg, storm_speed_kt, acceptable_for_composite, source_url}]}`. `analyses` is one row per analysis time's jobfile — HRD's *acceptable for composite* verdict (`null` if the jobfile carried none) and the storm center/motion that analysis was built around; `/tdr/composite` filters and centers on it. `product` is one of `xy`, `xy_rel`, `vert_inbound`, `vert_inbound_rel`, `vert_inbound_fall`, `vert_outbound`, `vert_outbound_rel`, `vert_outbound_fall`, `awips_maxdb`, `awips_wind` — the plain/`_rel`/`_fall` variants of a vertical profile are genuinely separate files at the same analysis time, not the same file with a flag. `source_url` points directly at the original NOAA host (not proxied through this API yet). Each file/leg's `id` is only useful for `DELETE /v1/admin/tdr/files/{id}` / `.../legs/{id}` below. |
 
 ```bash
 curl "https://joshmurdock.net/api/v1/tdr/2024/Beryl"
@@ -774,10 +774,33 @@ heatmap code as `/tdr/sweep` — pick with `mode`:
 | `mode` | What it does |
 |---|---|
 | `altitude` | Collapses one analysis time's whole level axis into a single "composite reflectivity"-style plane — max value per x/y column. Requires `analysis_time`. |
-| `time` | Mosaics one CAPPI level across *every* analysis time in the mission into one storm-centered image. Each file's grid is re-centered on wherever the storm was *at that analysis time* — this reads each file's `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE`, converts them to a local km offset from the first (earliest) usable file's origin, and forward-scatters every sweep onto one shared output grid sized to the union of them all. Needs at least 2 analysis times with an origin to align by. |
-| `time_volume` | The 3D counterpart to `mode=time`: instead of collapsing to one CAPPI level first, mosaics **every** level, same storm-center alignment, run once per level — a genuine 3D composite shaped like `/tdr/volume` rather than sweep-shaped. |
+| `time` | Storm-relative composite of one CAPPI level across the mission's analysis times (see "Which analyses" and "Centering" below). |
+| `time_volume` | The 3D counterpart to `mode=time`: instead of collapsing to one CAPPI level first, composites **every** level, same filtering and centering, run once per level — a genuine 3D composite shaped like `/tdr/volume` rather than sweep-shaped. |
 
-Where two sweeps land on the same output cell in `mode=time`/`time_volume`,
+**Which analyses** (`time`/`time_volume`): each analysis time's own
+jobfile carries HRD's *acceptable for composite* flag
+(`<acceptable>0|1</acceptable>`), indexed at ingest (see `analyses` on
+`GET /v1/tdr/mission/{id}`). Any analysis flagged `0` is left out — its grid
+typically isn't centered on the storm. An analysis with no flag on record is
+kept. Level 2 uses its own jobfile's flag, falling back to Level 1b's for the
+same analysis time. Every exclusion is listed in
+`detail.analysis_times_excluded` with a reason.
+
+**Centering** (`time`/`time_volume`): the composite is built around **one**
+storm center — the `reference_time` analysis's (default: the earliest one
+used). Each analysis's own center is its jobfile's center lat/lon (else the
+file's `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE`, which the synthesis builds each
+grid around). Every output cell at some distance + radial from the reference
+center is filled from the same distance + radial about each analysis's own
+center, bilinearly sampled, so the core lines up across analyses no matter
+how far the storm moved between them (rather than being smeared along its
+earth-relative track). Output `x`/`y` are km east/north of the reference
+center, on the reference analysis's own grid nodes; `origin_lat`/`origin_lon`
+geolocate that center. `detail.analysis_centers` lists each analysis's center
+and its `distance_km`/`bearing_deg` from the reference — i.e. the storm's
+displacement.
+
+Where several analyses cover the same output cell in `mode=time`/`time_volume`,
 they're genuinely combined, not overlaid last-write-wins: **max** for
 `reflectivity` (the standard composite-reflectivity convention), **mean**
 for every other field (so one extreme analysis time doesn't dominate a
@@ -795,6 +818,7 @@ wind/vorticity composite). The resolved mode is echoed back in
 | `analysis_time` | string | required for `mode=altitude` | Ignored for `time`/`time_volume` (they use every indexed time). |
 | `level` | string | resolved | `1b` or `2`, same default rule as `/tdr/sweep`. Ignored (forced to `1b`) when `qc=true`. |
 | `z` | float | `2.0` | `mode=time` only — which CAPPI level to mosaic. Ignored for `mode=time_volume` (mosaics every level) and `mode=altitude` (collapses every level). |
+| `reference_time` | string | earliest used | `mode=time`/`time_volume` only — the analysis time (HHMM) whose storm center everything is aligned around. Must be one of the analyses actually used (not an excluded one). |
 | `qc` | bool | `false` | Same meaning as `/tdr/sweep`'s, run per analysis-time file *before* mosaicking — see "Custom QC" below. Scoped to checks A/B/C/E there (no cross-consistency check against `xy_rel`, to avoid multiplying that fetch by every analysis time in the mosaic). |
 
 ```bash
@@ -815,8 +839,19 @@ curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product
   "mode": "time",
   "detail": {
     "z_km": 2.0,
+    "centering": "storm-relative: ...",
     "analysis_times_used": ["1201", "1215", "..."],
+    "analysis_times_excluded": [
+      {"analysis_time": "1240", "reason": "jobfile marks this analysis not acceptable for composite"}
+    ],
+    "reference_analysis_time": "1201",
+    "reference_center": {"lat": 10.53, "lon": -53.96, "source": "jobfile"},
     "reference_origin": {"lat": 10.53, "lon": -53.96},
+    "analysis_centers": [
+      {"analysis_time": "1215", "lat": 10.58, "lon": -54.12, "source": "jobfile",
+       "center_in_grid_km": {"x": 0.0, "y": 0.0},
+       "from_reference": {"distance_km": 18.4, "bearing_deg": 288.1}}
+    ],
     "combine_mode": "max"
   },
   "x": ["..."], "y": ["..."], "data": [["..."]],
@@ -833,7 +868,10 @@ curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product
   "mode": "time_volume",
   "detail": {
     "analysis_times_used": ["1201", "1215", "..."],
-    "reference_origin": {"lat": 10.53, "lon": -53.96},
+    "analysis_times_excluded": ["..."],
+    "reference_analysis_time": "1201",
+    "reference_center": {"lat": 10.53, "lon": -53.96, "source": "jobfile"},
+    "analysis_centers": ["..."],
     "combine_mode": "max"
   },
   "levels_km": [0.5, 1.0, "..."],
@@ -845,10 +883,11 @@ curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product
 ### Error responses
 
 - `400` — unknown `mode`; unknown `product` (not `xy`/`xy_rel`); missing
-  `analysis_time` for `mode=altitude`; fewer than 2 analysis times had an
-  `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE` to align by (`time`/`time_volume`);
-  fewer than 2 analysis times share a common CAPPI level grid
-  (`time_volume` only).
+  `analysis_time` for `mode=altitude`; every analysis time is marked not
+  acceptable for composite (`time`/`time_volume`); `reference_time` isn't
+  one of the analyses used. In `time_volume`, analyses whose CAPPI level grid
+  differs from the reference's are dropped and listed in
+  `detail.analysis_times_excluded` rather than erroring.
 - `404` — unknown `mission_id`, or no matching files on record.
 - `502` — the upstream NOAA host couldn't be reached.
 
@@ -1109,7 +1148,7 @@ https://joshmurdock.net/api/
 | `/v1/admin/prefetch` | POST | Bulk-load a timeframe into cache — see below. Returns a job immediately; poll for progress. |
 | `/v1/admin/prefetch/{job_id}` | GET | Poll a prefetch job's progress. |
 | `/v1/admin/prefetch` | GET | List all prefetch jobs (in-memory — lost on process restart). |
-| `/v1/admin/archive-update/{archive}` | POST | Needs `archive.update`. Run the named ingest immediately — `archive` is `storms`, `recon_met`, or `tdr`. Same code path as the corresponding systemd timer, just triggered on demand. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). `?years=2015,2016` (`tdr` only) reaches further back than the default shallow (current-1, current) window. `?force=true` (`tdr` only) re-crawls missions already indexed in scope instead of skipping them — e.g. to re-derive `storm_name` after a parsing fix — rather than only picking up new ones; a `storm_locked` mission (see "TDR mission management") is still never touched. `force` is meaningfully heavier (re-fetches every in-scope mission's listing/jobfile) so it's opt-in. |
+| `/v1/admin/archive-update/{archive}` | POST | Needs `archive.update`. Run the named ingest immediately — `archive` is `storms`, `recon_met`, or `tdr`. Same code path as the corresponding systemd timer, just triggered on demand. `409` if that archive's update is already running (singleton per archive, not job-id-keyed like `/prefetch`). `?years=2015,2016` (`tdr` only) reaches further back than the default shallow (current-1, current) window. `?force=true` (`tdr` only) re-crawls and re-parses missions already indexed in scope — e.g. to re-derive `storm_name` after a parsing fix — instead of only picking up new files. Without it, a mission is still re-listed every run (and any newly-published files/jobfiles indexed) until it has gone 14 days with nothing new, so a mission first indexed mid-flight fills in on its own; a `storm_locked` mission (see "TDR mission management") is still never touched. `force` is meaningfully heavier (re-fetches every in-scope mission's listing/jobfile) so it's opt-in. |
 | `/v1/admin/archive-update/{archive}` | GET | Poll that archive's update status: `{status: idle\|queued\|running\|done\|error, started_at, finished_at, summary, error}`. While `running` it also carries `progress: {phase, detail, done, total, updated_at}` — the phase the ingest is in, the item it's on, and how far through the phase it is. `total` is null for a phase whose size isn't known yet, and `updated_at` is the liveness clock: a timestamp that stops advancing means the job is wedged, which the counter alone can't distinguish from a slow single item. |
 | `/v1/admin/self-update/status` | GET | Cached "is an update available" check plus any in-progress apply job. |
 | `/v1/admin/self-update/check` | POST | Needs `selfupdate.check`. Force an immediate GitHub check, bypassing the periodic timer. |

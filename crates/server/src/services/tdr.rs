@@ -6,7 +6,7 @@
 //! Storm identity, though, is entirely TDR's own: `storm_name`/`storm_id` are
 //! stored columns captured at ingest time from a same-host source (the Level
 //! 1b mission's own `*_jobfile.tar.gz`, or the Level 2 storm-slug path — see
-//! `tdr_ingest.rs::fetch_jobfile_storm`), not resolved via a join against the
+//! `tdr_ingest.rs::parse_jobfile_storm`), not resolved via a join against the
 //! recon MET index. That used to be joined live at read time, but the recon
 //! index's own storm-name reconciliation (`recon_ingest.rs`) could — and did —
 //! silently overwrite a correct TDR-sourced name with "Training / Research"
@@ -87,6 +87,42 @@ CREATE TABLE IF NOT EXISTS legs (
     UNIQUE(mission_id, level, start_time, stop_time)
 );
 CREATE INDEX IF NOT EXISTS idx_tdr_legs_mission ON legs(mission_id);
+
+-- One row per analysis time, lifted from that analysis's own
+-- `*_{HHMMSS}_jobfile.tar.gz` (see tdr_ingest.rs::parse_jobfile_analysis).
+-- analysis_time is the HHMM of the jobfile's centerTime — the same key the
+-- xy/vert files for that analysis use in `files.analysis_time`.
+-- acceptable_for_composite is HRD's own <acceptable> flag (NULL when the
+-- jobfile didn't carry one); center_lat/center_lon is the storm center the
+-- analysis grid was built around.
+CREATE TABLE IF NOT EXISTS analyses (
+    id                       INTEGER PRIMARY KEY,
+    mission_id               TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    level                    TEXT NOT NULL,
+    analysis_time            TEXT NOT NULL,
+    center_time              TEXT NOT NULL,
+    center_lat               REAL,
+    center_lon               REAL,
+    storm_dir_deg            REAL,
+    storm_speed_kt           REAL,
+    acceptable_for_composite INTEGER,
+    source_url               TEXT NOT NULL,
+    fetched_at               INTEGER NOT NULL,
+    UNIQUE(mission_id, level, analysis_time)
+);
+CREATE INDEX IF NOT EXISTS idx_tdr_analyses_mission ON analyses(mission_id);
+
+-- Per (mission, level) crawl bookkeeping for ingest's skip rule: a mission
+-- dir keeps getting re-listed until it has gone `STABLE_AFTER_SECS` (see
+-- tdr_ingest.rs) without a new file showing up, so a mission first indexed
+-- mid-flight (or mid-upload, for Level 2) still picks up its later files.
+CREATE TABLE IF NOT EXISTS crawl_state (
+    mission_id      TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    level           TEXT NOT NULL,
+    last_crawled_at INTEGER NOT NULL,
+    last_changed_at INTEGER NOT NULL,
+    PRIMARY KEY (mission_id, level)
+);
 ";
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,6 +208,38 @@ impl LegRecord {
             level: row.get("level")?,
             start_time: row.get("start_time")?,
             stop_time: row.get("stop_time")?,
+            source_url: row.get("source_url")?,
+        })
+    }
+}
+
+/// One analysis time's jobfile metadata — see the `analyses` table doc
+/// comment in `SCHEMA`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisRecord {
+    pub level: String,
+    pub analysis_time: String,
+    pub center_time: String,
+    pub center_lat: Option<f64>,
+    pub center_lon: Option<f64>,
+    pub storm_dir_deg: Option<f64>,
+    pub storm_speed_kt: Option<f64>,
+    /// `None` when the jobfile carried no `<acceptable>` flag at all.
+    pub acceptable_for_composite: Option<bool>,
+    pub source_url: String,
+}
+
+impl AnalysisRecord {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            level: row.get("level")?,
+            analysis_time: row.get("analysis_time")?,
+            center_time: row.get("center_time")?,
+            center_lat: row.get("center_lat")?,
+            center_lon: row.get("center_lon")?,
+            storm_dir_deg: row.get("storm_dir_deg")?,
+            storm_speed_kt: row.get("storm_speed_kt")?,
+            acceptable_for_composite: row.get::<_, Option<i64>>("acceptable_for_composite")?.map(|v| v != 0),
             source_url: row.get("source_url")?,
         })
     }
@@ -383,6 +451,22 @@ pub fn get_mission_legs(conn: &Connection, mission_id: &str) -> rusqlite::Result
     )?;
     let rows = stmt.query_map([mission_id], LegRecord::from_row)?;
     rows.collect()
+}
+
+/// A mission's per-analysis jobfile metadata (both levels), chronological.
+pub fn get_mission_analyses(conn: &Connection, mission_id: &str) -> rusqlite::Result<Vec<AnalysisRecord>> {
+    let mut stmt = conn.prepare("SELECT * FROM analyses WHERE mission_id = ?1 ORDER BY analysis_time, level")?;
+    let rows = stmt.query_map([mission_id], AnalysisRecord::from_row)?;
+    rows.collect()
+}
+
+/// The jobfile metadata that governs one analysis time at `level`: that
+/// level's own jobfile if it has one, otherwise the other level's for the
+/// same analysis time (Level 2 is a reprocessing of the same analysis, so a
+/// Level 1b verdict/center is the best available fallback, and vice versa).
+pub fn analysis_for<'a>(analyses: &'a [AnalysisRecord], level: &str, analysis_time: &str) -> Option<&'a AnalysisRecord> {
+    let same_time = || analyses.iter().filter(|a| a.analysis_time == analysis_time);
+    same_time().find(|a| a.level == level).or_else(|| same_time().next())
 }
 
 /// Every analysis_time's netCDF file for one (mission, level, product) —

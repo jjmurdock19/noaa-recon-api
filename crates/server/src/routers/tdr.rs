@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use noaa_recon_core::qc;
+use noaa_recon_core::sweep;
 use noaa_recon_core::sweep::colorscale_for_field;
 
 use crate::error::{ApiError, ApiResult};
@@ -218,6 +219,9 @@ async fn get_mission(
         "file_count": files.len(),
         "files": files_json,
         "legs": legs_json,
+        // Per-analysis jobfile metadata (composite acceptability, storm
+        // center, motion) — see tdr_ingest.rs::parse_jobfile_analysis.
+        "analyses": tdr::get_mission_analyses(&conn, &mission_id)?,
     })))
 }
 
@@ -457,8 +461,8 @@ struct CompositeQuery {
     product: String,
     field: String,
     /// `altitude`: max-value projection across every CAPPI level at one
-    /// analysis time. `time`: max-value mosaic of one CAPPI level across
-    /// every analysis time in the mission, aligned by storm center.
+    /// analysis time. `time`: storm-relative mosaic of one CAPPI level across
+    /// every composite-acceptable analysis time in the mission.
     /// `time_volume`: same storm-center alignment as `time`, but mosaics
     /// *every* CAPPI level instead of collapsing to one — a genuine 3D
     /// composite, volume-shaped like `GET /v1/tdr/volume` rather than
@@ -469,6 +473,11 @@ struct CompositeQuery {
     /// `mode=time` only — which CAPPI level to mosaic. Defaults to 2.0km.
     /// Ignored for `mode=time_volume`, which mosaics every level.
     z: Option<f32>,
+    /// `mode=time`/`time_volume` — the analysis time (HHMM) whose storm
+    /// center every other analysis is aligned around, and which the
+    /// response's `origin_lat`/`origin_lon` geolocate. Must be one of the
+    /// analyses actually used. Defaults to the earliest one.
+    reference_time: Option<String>,
     /// Same meaning as `SweepQuery::qc`, run per analysis-time file *before*
     /// mosaicking (never on the combined mosaic — a synthesis-stage artifact
     /// shouldn't get smeared across the composite). Scoped to checks A/B/C/E
@@ -484,23 +493,24 @@ struct CompositeQuery {
 ///
 /// - `mode=altitude`: collapses one analysis time's whole level axis into a
 ///   single "composite reflectivity"-style plane (max value per x/y column).
-/// - `mode=time`: builds one big storm-centered mosaic out of one CAPPI
-///   level across *every* analysis time in the mission. Each file's grid is
-///   centered on wherever the storm was *at that analysis time*, so pixel
-///   (x,y) means a different earth location file-to-file — this reads each
-///   file's `ORIGIN_LATITUDE`/`ORIGIN_LONGITUDE` global attrs, converts them
-///   to a local km offset from the first file's origin
-///   ([`noaa_recon_core::sweep::latlon_offset_km`]), and forward-scatters
-///   every sweep onto one shared output grid sized to the union of all of
-///   them ([`noaa_recon_core::sweep::geo_mosaic`]) — literally "take the
-///   centers, align them" into one storm-spanning composite, not just a
-///   same-cell overlay. Where two sweeps' grids land on the same output
-///   cell, they're genuinely combined per
+/// - `mode=time`: builds one storm-relative composite out of one CAPPI
+///   level across the mission's analysis times. Analyses whose jobfile marks
+///   them **not acceptable for composite** are left out entirely
+///   ([`select_composite_files`]). The rest are aligned on **one** storm
+///   center — `reference_time`'s, default the earliest: each analysis's own
+///   center comes from its jobfile (else its grid origin, see
+///   [`analysis_center`]), and every output cell at some distance + radial
+///   from the reference center is filled from the same distance + radial
+///   about each analysis's own center
+///   ([`noaa_recon_core::sweep::storm_centered_mosaic`]). So the storm's
+///   core lines up across every analysis however far it moved between them,
+///   rather than being smeared across the earth-relative track. Output
+///   `x`/`y` are km east/north of the reference center. Where several
+///   analyses cover a cell they're combined per
 ///   [`noaa_recon_core::sweep::combine_mode_for_field`] — maxed for
 ///   reflectivity (the standard composite-reflectivity convention),
 ///   averaged for everything else (wind/vorticity fields, where an extreme
-///   from one analysis time shouldn't dominate the composite) — never a
-///   last-write-wins overlay.
+///   from one analysis time shouldn't dominate the composite).
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
     let want_qc = q.qc.unwrap_or(false);
     let conn = conn(&state)?;
@@ -525,7 +535,8 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 q.product, q.mission_id
             )));
         }
-        return get_composite_time_volume(mission, level, files, &cache_dir, &q, want_qc).await;
+        let analyses = tdr::get_mission_analyses(&conn, &q.mission_id)?;
+        return get_composite_time_volume(mission, level, files, analyses, &cache_dir, &q, want_qc).await;
     }
 
     let mut qc_report = qc::QcReport::default();
@@ -575,15 +586,17 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     q.product, q.mission_id
                 )));
             }
+            let analyses = tdr::get_mission_analyses(&conn, &q.mission_id)?;
+            let (included, excluded) = select_composite_files(files, &analyses, &level)?;
             let requested_z = q.z.unwrap_or(2.0);
 
-            // Read every analysis time's slice first (need them all in hand
-            // before we know the reference origin to offset the rest from).
-            // Custom QC runs per slice, here, before mosaicking — never on
-            // the combined mosaic, so a synthesis-stage artifact in one
-            // analysis time can't get smeared across the composite.
-            let mut slices = Vec::with_capacity(files.len());
-            for file in &files {
+            // Read every included analysis time's slice first (need them all
+            // in hand before centering). Custom QC runs per slice, here,
+            // before mosaicking — never on the combined mosaic, so a
+            // synthesis-stage artifact in one analysis time can't get smeared
+            // across the composite.
+            let mut slices = Vec::with_capacity(included.len());
+            for (file, analysis) in &included {
                 let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
                 let nc_path = tdr_nc::fetch_and_cache(&cache_dir, &file.source_url, &cache_key)
                     .await
@@ -597,49 +610,30 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                     let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, &qc::QcParams::default());
                     qc_report.merge(r);
                 }
-                slices.push((file.analysis_time.clone(), slice));
+                let center = analysis_center(slice.origin_lat, slice.origin_lon, analysis.as_ref());
+                slices.push((file.analysis_time.clone(), slice, center));
             }
 
-            // Skip any file missing an ORIGIN_LATITUDE/LONGITUDE — no anchor
-            // to align it by, so silently including it would mean guessing.
-            let mut usable: Vec<_> =
-                slices.iter().filter(|(_, s)| s.origin_lat.is_some() && s.origin_lon.is_some()).collect();
-            if usable.len() < 2 {
-                return Err(ApiError::bad_request(format!(
-                    "Only {} of {} analysis time(s) had an ORIGIN_LATITUDE/LONGITUDE to align by — \
-                     a time mosaic needs at least 2.",
-                    usable.len(),
-                    slices.len()
-                )));
-            }
-            usable.sort_by(|a, b| a.0.cmp(&b.0));
-            let (lat0, lon0) = (usable[0].1.origin_lat.unwrap(), usable[0].1.origin_lon.unwrap());
-
-            let times_used: Vec<String> = usable.iter().map(|(t, _)| t.clone()).collect();
-            let planes: Vec<noaa_recon_core::sweep::GeoPlane> = usable
+            let times: Vec<String> = slices.iter().map(|(t, _, _)| t.clone()).collect();
+            let centers: Vec<&AnalysisCenter> = slices.iter().map(|(_, _, c)| c).collect();
+            let reference = reference_index(&times, q.reference_time.as_deref())?;
+            let planes: Vec<sweep::StormPlane> = slices
                 .iter()
-                .map(|(_, s)| {
-                    let (offset_x_km, offset_y_km) =
-                        noaa_recon_core::sweep::latlon_offset_km(s.origin_lat.unwrap(), s.origin_lon.unwrap(), lat0, lon0);
-                    noaa_recon_core::sweep::GeoPlane { x: &s.x, y: &s.y, data: &s.data, offset_x_km, offset_y_km }
+                .map(|(_, s, c)| sweep::StormPlane {
+                    x: &s.x,
+                    y: &s.y,
+                    data: &s.data,
+                    center_x_km: c.x_km,
+                    center_y_km: c.y_km,
                 })
                 .collect();
-            let combine_mode = noaa_recon_core::sweep::combine_mode_for_field(&q.field);
-            let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes, combine_mode);
-            (
-                mission,
-                level,
-                mosaic.x,
-                mosaic.y,
-                mosaic.data,
-                json!({
-                    "z_km": requested_z,
-                    "analysis_times_used": times_used,
-                    "reference_origin": {"lat": lat0, "lon": lon0},
-                    "combine_mode": if combine_mode == noaa_recon_core::sweep::CombineMode::Max { "max" } else { "mean" },
-                }),
-                Some((lat0, lon0)),
-            )
+            let combine_mode = sweep::combine_mode_for_field(&q.field);
+            let mosaic = sweep::storm_centered_mosaic(&planes, reference, combine_mode);
+
+            let mut detail = centering_detail(&times, &centers, reference, &excluded, combine_mode);
+            detail["z_km"] = json!(requested_z);
+            let origin = centers[reference].lat.zip(centers[reference].lon);
+            (mission, level, mosaic.x, mosaic.y, mosaic.data, detail, origin)
         }
         other => {
             return Err(ApiError::bad_request(format!(
@@ -673,13 +667,140 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
     Ok(Json(response))
 }
 
+/// Splits a mission's files for a `mode=time`/`time_volume` composite into
+/// the analysis times it may use and the ones it must leave out: any
+/// analysis whose jobfile marks it **not acceptable for composite** (HRD's
+/// own `<acceptable>0</acceptable>` — typically a grid that wasn't centered
+/// on the storm) is excluded; one with no verdict on record is kept. Each
+/// kept file comes back paired with its jobfile metadata (see
+/// [`tdr::analysis_for`]) for centering. Errors when nothing's left.
+fn select_composite_files(
+    files: Vec<tdr::FileRecord>,
+    analyses: &[tdr::AnalysisRecord],
+    level: &str,
+) -> ApiResult<(Vec<(tdr::FileRecord, Option<tdr::AnalysisRecord>)>, Vec<Value>)> {
+    let total = files.len();
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    for file in files {
+        let analysis = tdr::analysis_for(analyses, level, &file.analysis_time).cloned();
+        if analysis.as_ref().and_then(|a| a.acceptable_for_composite) == Some(false) {
+            excluded.push(json!({
+                "analysis_time": file.analysis_time,
+                "reason": "jobfile marks this analysis not acceptable for composite",
+            }));
+            continue;
+        }
+        included.push((file, analysis));
+    }
+    if included.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "All {total} analysis time(s) are marked not acceptable for composite in their jobfiles — nothing to composite."
+        )));
+    }
+    Ok((included, excluded))
+}
+
+/// One analysis's storm center: where it is on the earth (when known), and
+/// where it sits inside that analysis's own grid.
+struct AnalysisCenter {
+    lat: Option<f32>,
+    lon: Option<f32>,
+    x_km: f32,
+    y_km: f32,
+    /// `"jobfile"` or `"grid_origin"`.
+    source: &'static str,
+}
+
+/// An analysis's storm center — its jobfile center when on record, placed
+/// inside the grid by its distance + radial from the grid origin
+/// ([`sweep::center_in_grid_km`]); otherwise the grid origin itself
+/// (`ORIGIN_LATITUDE/LONGITUDE`), which the TDR synthesis builds each grid
+/// around. With no origin attribute either, the grid's own `(0, 0)` still is
+/// the analysis center by construction — just not geolocated.
+fn analysis_center(origin_lat: Option<f32>, origin_lon: Option<f32>, analysis: Option<&tdr::AnalysisRecord>) -> AnalysisCenter {
+    let jobfile = analysis.and_then(|a| Some((a.center_lat? as f32, a.center_lon? as f32)));
+    match (jobfile, origin_lat.zip(origin_lon)) {
+        (Some((lat, lon)), Some((olat, olon))) => {
+            let (x_km, y_km) = sweep::center_in_grid_km(olat, olon, lat, lon);
+            AnalysisCenter { lat: Some(lat), lon: Some(lon), x_km, y_km, source: "jobfile" }
+        }
+        (Some((lat, lon)), None) => AnalysisCenter { lat: Some(lat), lon: Some(lon), x_km: 0.0, y_km: 0.0, source: "jobfile" },
+        (None, origin) => AnalysisCenter {
+            lat: origin.map(|o| o.0),
+            lon: origin.map(|o| o.1),
+            x_km: 0.0,
+            y_km: 0.0,
+            source: "grid_origin",
+        },
+    }
+}
+
+/// The composite's one reference center: `reference_time` if the caller
+/// asked for one, otherwise the earliest analysis time used.
+fn reference_index(times: &[String], requested: Option<&str>) -> ApiResult<usize> {
+    match requested {
+        Some(t) => times.iter().position(|x| x == t).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "reference_time '{t}' isn't one of the analysis times in this composite: {times:?}"
+            ))
+        }),
+        None => Ok(0),
+    }
+}
+
+/// The `detail` object shared by `mode=time` and `mode=time_volume`: which
+/// analyses were used/excluded, the reference center everything was aligned
+/// on, and each analysis's own center with its distance + radial from the
+/// reference (i.e. how far the storm moved relative to it).
+fn centering_detail(
+    times: &[String],
+    centers: &[&AnalysisCenter],
+    reference: usize,
+    excluded: &[Value],
+    combine_mode: sweep::CombineMode,
+) -> Value {
+    let r = centers[reference];
+    let per_analysis: Vec<Value> = times
+        .iter()
+        .zip(centers)
+        .map(|(t, c)| {
+            let from_reference = match (r.lat, r.lon, c.lat, c.lon) {
+                (Some(rlat), Some(rlon), Some(lat), Some(lon)) => {
+                    let (distance_km, bearing_deg) = sweep::distance_bearing_km(rlat, rlon, lat, lon);
+                    json!({"distance_km": distance_km, "bearing_deg": bearing_deg})
+                }
+                _ => Value::Null,
+            };
+            json!({
+                "analysis_time": t,
+                "lat": c.lat,
+                "lon": c.lon,
+                "source": c.source,
+                "center_in_grid_km": {"x": c.x_km, "y": c.y_km},
+                "from_reference": from_reference,
+            })
+        })
+        .collect();
+    json!({
+        "centering": "storm-relative: every analysis re-plotted by distance + radial from its own storm center around one shared reference center",
+        "analysis_times_used": times,
+        "analysis_times_excluded": excluded,
+        "reference_analysis_time": times[reference],
+        "reference_center": {"lat": r.lat, "lon": r.lon, "source": r.source},
+        "reference_origin": {"lat": r.lat, "lon": r.lon},
+        "analysis_centers": per_analysis,
+        "combine_mode": if combine_mode == sweep::CombineMode::Max { "max" } else { "mean" },
+    })
+}
+
 /// `mode=time_volume` — the 3D counterpart to `mode=time`: instead of
 /// collapsing to one CAPPI level before mosaicking, this reads every
 /// analysis time's *entire* volume and mosaics level-by-level (same
-/// storm-center alignment as `mode=time`, run once per level), so the
-/// result is a genuine 3D composite the dashboard can feed straight into
-/// the same volumetric raymarch renderer as `GET /v1/tdr/volume` — hence
-/// the volume-shaped (not sweep-shaped) response.
+/// acceptability filter and storm-relative centering as `mode=time`, run
+/// once per level), so the result is a genuine 3D composite the dashboard can
+/// feed straight into the same volumetric raymarch renderer as
+/// `GET /v1/tdr/volume` — hence the volume-shaped (not sweep-shaped) response.
 // Takes mission/level/files already resolved (owned, not a `&Connection` —
 // rusqlite's Connection isn't Sync, so a reference to it can't cross the
 // `.await`s below without making the whole handler's future non-Send; the
@@ -688,17 +809,20 @@ async fn get_composite_time_volume(
     mission: tdr::Mission,
     level: String,
     files: Vec<tdr::FileRecord>,
+    analyses: Vec<tdr::AnalysisRecord>,
     cache_dir: &std::path::Path,
     q: &CompositeQuery,
     want_qc: bool,
 ) -> ApiResult<Json<Value>> {
-    // Read every analysis time's whole volume first — need them all in hand
-    // before we know the reference origin and canonical level grid. Custom
+    let (included, mut excluded) = select_composite_files(files, &analyses, &level)?;
+
+    // Read every included analysis time's whole volume first — need them all
+    // in hand before centering and picking the canonical level grid. Custom
     // QC (no D/cross-consistency check — see `CompositeQuery::qc`) runs on
     // each volume here, before mosaicking.
     let mut qc_report = qc::QcReport::default();
-    let mut volumes = Vec::with_capacity(files.len());
-    for file in &files {
+    let mut volumes = Vec::with_capacity(included.len());
+    for (file, analysis) in &included {
         let cache_key = format!("{}_{level}_{}_{}", q.mission_id, q.product, file.analysis_time);
         let nc_path = tdr_nc::fetch_and_cache(cache_dir, &file.source_url, &cache_key)
             .await
@@ -712,54 +836,50 @@ async fn get_composite_time_volume(
             let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, &qc::QcParams::default());
             qc_report.merge(r);
         }
-        volumes.push((file.analysis_time.clone(), volume));
+        let center = analysis_center(volume.origin_lat, volume.origin_lon, analysis.as_ref());
+        volumes.push((file.analysis_time.clone(), volume, center));
     }
 
-    // Same reasoning as mode=time: no origin, no anchor to align by.
-    let mut usable: Vec<_> = volumes.iter().filter(|(_, v)| v.origin_lat.is_some() && v.origin_lon.is_some()).collect();
-    if usable.len() < 2 {
-        return Err(ApiError::bad_request(format!(
-            "Only {} of {} analysis time(s) had an ORIGIN_LATITUDE/LONGITUDE to align by — \
-             a time mosaic needs at least 2.",
-            usable.len(),
-            volumes.len()
-        )));
-    }
-    usable.sort_by(|a, b| a.0.cmp(&b.0));
-    let (lat0, lon0) = (usable[0].1.origin_lat.unwrap(), usable[0].1.origin_lon.unwrap());
-
-    // Every volume needs the same level grid to mosaic level-by-level —
-    // drop any whose levels don't match the reference (first usable) rather
+    // Every volume needs the reference analysis's level grid to mosaic
+    // level-by-level — drop (and report) any whose levels don't match rather
     // than guessing how to reconcile mismatched CAPPI grids.
-    let reference_levels = usable[0].1.levels.clone();
+    let all_times: Vec<String> = volumes.iter().map(|(t, _, _)| t.clone()).collect();
+    let reference_levels = volumes[reference_index(&all_times, q.reference_time.as_deref())?].1.levels.clone();
     let levels_match = |levels: &[f32]| {
         levels.len() == reference_levels.len()
             && levels.iter().zip(&reference_levels).all(|(a, b)| (a - b).abs() < 0.01)
     };
-    let usable: Vec<_> = usable.into_iter().filter(|(_, v)| levels_match(&v.levels)).collect();
-    if usable.len() < 2 {
-        return Err(ApiError::bad_request(
-            "Fewer than 2 analysis times share a common CAPPI level grid — can't build a 3D time mosaic."
-                .to_string(),
-        ));
-    }
+    let usable: Vec<_> = volumes
+        .iter()
+        .filter(|(t, v, _)| {
+            let ok = levels_match(&v.levels);
+            if !ok {
+                excluded.push(json!({"analysis_time": t, "reason": "CAPPI level grid differs from the reference analysis"}));
+            }
+            ok
+        })
+        .collect();
 
-    let times_used: Vec<String> = usable.iter().map(|(t, _)| t.clone()).collect();
+    let times: Vec<String> = usable.iter().map(|(t, _, _)| t.clone()).collect();
+    let centers: Vec<&AnalysisCenter> = usable.iter().map(|(_, _, c)| c).collect();
+    let reference = reference_index(&times, q.reference_time.as_deref())?;
     let n_levels = reference_levels.len();
-    let combine_mode = noaa_recon_core::sweep::combine_mode_for_field(&q.field);
+    let combine_mode = sweep::combine_mode_for_field(&q.field);
     let mut mosaic_x = Vec::new();
     let mut mosaic_y = Vec::new();
     let mut data_out: Vec<Vec<Vec<Option<f64>>>> = Vec::with_capacity(n_levels);
     for li in 0..n_levels {
-        let planes: Vec<noaa_recon_core::sweep::GeoPlane> = usable
+        let planes: Vec<sweep::StormPlane> = usable
             .iter()
-            .map(|(_, v)| {
-                let (offset_x_km, offset_y_km) =
-                    noaa_recon_core::sweep::latlon_offset_km(v.origin_lat.unwrap(), v.origin_lon.unwrap(), lat0, lon0);
-                noaa_recon_core::sweep::GeoPlane { x: &v.x, y: &v.y, data: &v.data[li], offset_x_km, offset_y_km }
+            .map(|(_, v, c)| sweep::StormPlane {
+                x: &v.x,
+                y: &v.y,
+                data: &v.data[li],
+                center_x_km: c.x_km,
+                center_y_km: c.y_km,
             })
             .collect();
-        let mosaic = noaa_recon_core::sweep::geo_mosaic(&planes, combine_mode);
+        let mosaic = sweep::storm_centered_mosaic(&planes, reference, combine_mode);
         if li == 0 {
             mosaic_x = mosaic.x;
             mosaic_y = mosaic.y;
@@ -767,6 +887,8 @@ async fn get_composite_time_volume(
         data_out.push(mosaic.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect());
     }
 
+    let detail = centering_detail(&times, &centers, reference, &excluded, combine_mode);
+    let r = centers[reference];
     let cs = colorscale_for_field(&q.field);
     let mut response = json!({
         "mission_id": mission.mission_id,
@@ -775,17 +897,13 @@ async fn get_composite_time_volume(
         "product": q.product,
         "field": q.field,
         "mode": "time_volume",
-        "detail": {
-            "analysis_times_used": times_used,
-            "reference_origin": {"lat": lat0, "lon": lon0},
-            "combine_mode": if combine_mode == noaa_recon_core::sweep::CombineMode::Max { "max" } else { "mean" },
-        },
+        "detail": detail,
         "x": mosaic_x,
         "y": mosaic_y,
         "levels_km": reference_levels,
         "data": data_out,
-        "origin_lat": lat0,
-        "origin_lon": lon0,
+        "origin_lat": r.lat,
+        "origin_lon": r.lon,
         "colorscale": cs.stops,
         "zmin": cs.zmin,
         "zmax": cs.zmax,

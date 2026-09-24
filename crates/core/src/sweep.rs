@@ -228,16 +228,56 @@ pub fn latlon_offset_km(lat: f32, lon: f32, lat0: f32, lon0: f32) -> (f32, f32) 
     (dx, dy)
 }
 
-/// One sweep to be placed into a [`geo_mosaic`] — its own grid plus how far
-/// (km) that grid's origin sits from the mosaic's shared reference point
-/// (see [`latlon_offset_km`]).
-pub struct GeoPlane<'a> {
+/// Great-circle distance (km) and initial bearing (degrees clockwise from
+/// true north, `[0, 360)`) from `(lat0, lon0)` to `(lat, lon)` — haversine
+/// distance plus the standard forward-azimuth formula. Used to express a
+/// point as a (range, radial) pair about a storm center, which is what
+/// [`storm_centered_mosaic`] composites on.
+pub fn distance_bearing_km(lat0: f32, lon0: f32, lat: f32, lon: f32) -> (f32, f32) {
+    const EARTH_RADIUS_KM: f64 = 6371.0088;
+    let (phi0, phi) = ((lat0 as f64).to_radians(), (lat as f64).to_radians());
+    let dphi = phi - phi0;
+    let dlambda = ((lon - lon0) as f64).to_radians();
+
+    let a = (dphi / 2.0).sin().powi(2) + phi0.cos() * phi.cos() * (dlambda / 2.0).sin().powi(2);
+    let dist = 2.0 * EARTH_RADIUS_KM * a.sqrt().min(1.0).asin();
+
+    let y = dlambda.sin() * phi.cos();
+    let x = phi0.cos() * phi.sin() - phi0.sin() * phi.cos() * dlambda.cos();
+    let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
+    (dist as f32, bearing as f32)
+}
+
+/// A (range, radial) pair to a local tangent-plane `(east, north)` km
+/// offset. Bearing is degrees clockwise from north, matching
+/// [`distance_bearing_km`].
+pub fn offset_from_range_bearing(range_km: f32, bearing_deg: f32) -> (f32, f32) {
+    let b = bearing_deg.to_radians();
+    (range_km * b.sin(), range_km * b.cos())
+}
+
+/// Where a storm center at `(center_lat, center_lon)` sits inside a TDR grid
+/// whose `x`/`y` are km east/north of `(origin_lat, origin_lon)` — the
+/// center's great-circle distance and radial from the grid origin
+/// ([`distance_bearing_km`]), projected onto the grid's tangent plane. For a
+/// real-time analysis the jobfile center *is* the grid origin (confirmed
+/// against live files), so this is `(0, 0)`; it only matters when the two
+/// ever disagree.
+pub fn center_in_grid_km(origin_lat: f32, origin_lon: f32, center_lat: f32, center_lon: f32) -> (f32, f32) {
+    let (range, bearing) = distance_bearing_km(origin_lat, origin_lon, center_lat, center_lon);
+    offset_from_range_bearing(range, bearing)
+}
+
+/// One analysis time's plane to be placed into a [`storm_centered_mosaic`]:
+/// its own grid, plus where *that analysis's* storm center sits in the
+/// grid's own km coordinates (see [`center_in_grid_km`]).
+pub struct StormPlane<'a> {
     pub x: &'a [f32],
     pub y: &'a [f32],
     /// `data[yi][xi]`, same orientation as [`cappi_slice`].
     pub data: &'a [Vec<Option<f32>>],
-    pub offset_x_km: f32,
-    pub offset_y_km: f32,
+    pub center_x_km: f32,
+    pub center_y_km: f32,
 }
 
 pub struct Mosaic {
@@ -247,7 +287,7 @@ pub struct Mosaic {
     pub data: Vec<Vec<Option<f32>>>,
 }
 
-/// How [`geo_mosaic`] resolves two sweeps landing on the same output cell.
+/// How [`storm_centered_mosaic`] resolves several analyses covering the same output cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CombineMode {
     /// Keep the largest value seen at that cell — the classic "composite
@@ -279,83 +319,123 @@ pub fn combine_mode_for_field(field: &str) -> CombineMode {
     }
 }
 
-/// Forward-scatters several storm-centered sweeps, each shifted by its own
-/// (lat,lon)-derived offset from a shared reference point, onto one shared
-/// output grid — the "align by storm center, build one composite" mosaic
-/// backing `GET /v1/tdr/composite?mode=time`. Where two sweeps land on the
-/// same output cell, `mode` decides how their values combine (see
-/// [`CombineMode`]) — this is genuine per-cell combination, not last-sweep-
-/// wins layering: every plane that touches a cell contributes to it.
-///
-/// Assumes every plane shares the same grid spacing (true for TDR's fixed
-/// analysis resolution) — spacing is read from the first plane. Returns an
-/// empty mosaic if `planes` is empty.
-pub fn geo_mosaic(planes: &[GeoPlane], mode: CombineMode) -> Mosaic {
-    let Some(first) = planes.first() else {
-        return Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
-    };
-    let dx_spacing = if first.x.len() >= 2 { (first.x[1] - first.x[0]).abs() } else { 1.0 };
-    let dy_spacing = if first.y.len() >= 2 { (first.y[1] - first.y[0]).abs() } else { 1.0 };
+/// Pulls a coordinate that's outside `coords`' span by only float round-off
+/// (under 0.1% of a grid spacing) back onto the edge, so the outermost ring
+/// of a plane isn't dropped just because `center + offset` came out a hair
+/// past the last node. Anything genuinely outside is left alone.
+fn snap_to_extent(v: f32, coords: &[f32], spacing: f32) -> f32 {
+    let (Some(&lo), Some(&hi)) = (coords.first(), coords.last()) else { return v };
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    let eps = spacing * 1e-3;
+    if v < lo && v > lo - eps {
+        lo
+    } else if v > hi && v < hi + eps {
+        hi
+    } else {
+        v
+    }
+}
 
+/// Storm-relative composite of several analysis times — the mosaic behind
+/// `GET /v1/tdr/composite?mode=time`/`time_volume`.
+///
+/// Every analysis is re-plotted around **one** shared storm center rather
+/// than at its earth-relative position: the output grid's `(0, 0)` is the
+/// reference center, and each output cell — some range and radial from
+/// that center — is filled by sampling every plane at the *same* range and
+/// radial from its *own* storm center (`center_x_km`/`center_y_km`),
+/// bilinearly ([`bilinear_sample`]). On the grid's tangent plane that
+/// (range, radial) pair is just the cell's `(east, north)` offset, so it's
+/// applied in that form directly (a trig round trip would only add float
+/// error that drops edge cells). So the eye of every analysis lands on the
+/// same output cell no matter how far the storm moved between them — an
+/// earth-relative mosaic would instead smear a moving storm into several
+/// offset eyes.
+///
+/// Inverse-mapping (output cell -> source sample) rather than forward-
+/// scattering source cells means no holes or double-counting when a center
+/// isn't exactly on a grid node. Where several planes cover a cell, `mode`
+/// decides how they combine (see [`CombineMode`]); every plane that covers
+/// a cell contributes.
+///
+/// The output grid spans the union of every plane's extent about its own
+/// center, at the finest grid spacing among the planes, on the node lattice
+/// of `planes[reference]` (the analysis whose center is the reference):
+/// TDR grids don't put a node on the center itself (nodes sit at ±1, ±3, …
+/// km), so a lattice snapped to the center would land every output cell
+/// between source nodes and bilinearly blur the whole field. On the
+/// reference's own lattice the reference is reproduced exactly, and any
+/// analysis centered the same way within its grid is sampled on its nodes
+/// too. Returns an empty mosaic if `planes` is empty.
+pub fn storm_centered_mosaic(planes: &[StormPlane], reference: usize, mode: CombineMode) -> Mosaic {
+    let empty = || Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
+    let Some(reference) = planes.get(reference).or(planes.first()) else { return empty() };
+    let spacing = |c: &[f32]| if c.len() >= 2 { (c[1] - c[0]).abs() } else { f32::INFINITY };
+    let finite_or_one = |v: f32| if v.is_finite() && v > 0.0 { v } else { 1.0 };
+    let dx_spacing = finite_or_one(planes.iter().map(|p| spacing(p.x)).fold(f32::INFINITY, f32::min));
+    let dy_spacing = finite_or_one(planes.iter().map(|p| spacing(p.y)).fold(f32::INFINITY, f32::min));
+
+    // Extent of each plane measured from its own storm center.
     let (mut gx_min, mut gx_max) = (f32::INFINITY, f32::NEG_INFINITY);
     let (mut gy_min, mut gy_max) = (f32::INFINITY, f32::NEG_INFINITY);
     for p in planes {
-        for &x in p.x {
-            gx_min = gx_min.min(x + p.offset_x_km);
-            gx_max = gx_max.max(x + p.offset_x_km);
+        if let (Some(&x0), Some(&x1)) = (p.x.first(), p.x.last()) {
+            gx_min = gx_min.min(x0.min(x1) - p.center_x_km);
+            gx_max = gx_max.max(x0.max(x1) - p.center_x_km);
         }
-        for &y in p.y {
-            gy_min = gy_min.min(y + p.offset_y_km);
-            gy_max = gy_max.max(y + p.offset_y_km);
+        if let (Some(&y0), Some(&y1)) = (p.y.first(), p.y.last()) {
+            gy_min = gy_min.min(y0.min(y1) - p.center_y_km);
+            gy_max = gy_max.max(y0.max(y1) - p.center_y_km);
         }
     }
     if !gx_min.is_finite() || !gy_min.is_finite() {
-        return Mosaic { x: Vec::new(), y: Vec::new(), data: Vec::new() };
+        return empty();
     }
-
-    let nx_out = (((gx_max - gx_min) / dx_spacing).round() as usize) + 1;
-    let ny_out = (((gy_max - gy_min) / dy_spacing).round() as usize) + 1;
-    let x_out: Vec<f32> = (0..nx_out).map(|i| gx_min + i as f32 * dx_spacing).collect();
-    let y_out: Vec<f32> = (0..ny_out).map(|i| gy_min + i as f32 * dy_spacing).collect();
-
-    // Mean needs a running sum+count per cell alongside the max-so-far;
-    // cheap to track both and pick the one `mode` asked for at the end.
-    let mut sum_out = vec![vec![0.0f32; nx_out]; ny_out];
-    let mut count_out = vec![vec![0u32; nx_out]; ny_out];
-    let mut max_out: Vec<Vec<Option<f32>>> = vec![vec![None; nx_out]; ny_out];
-
-    for p in planes {
-        for (yi, y) in p.y.iter().enumerate() {
-            for (xi, x) in p.x.iter().enumerate() {
-                let Some(v) = p.data[yi][xi] else { continue };
-                let shifted_x = x + p.offset_x_km;
-                let shifted_y = y + p.offset_y_km;
-                let out_xi = ((shifted_x - gx_min) / dx_spacing).round();
-                let out_yi = ((shifted_y - gy_min) / dy_spacing).round();
-                if out_xi < 0.0 || out_yi < 0.0 {
-                    continue;
-                }
-                let (out_xi, out_yi) = (out_xi as usize, out_yi as usize);
-                if out_xi >= nx_out || out_yi >= ny_out {
-                    continue;
-                }
-                sum_out[out_yi][out_xi] += v;
-                count_out[out_yi][out_xi] += 1;
-                max_out[out_yi][out_xi] = Some(max_out[out_yi][out_xi].map_or(v, |b: f32| b.max(v)));
-            }
-        }
-    }
-
-    let data_out = match mode {
-        CombineMode::Max => max_out,
-        CombineMode::Mean => (0..ny_out)
-            .map(|yi| {
-                (0..nx_out)
-                    .map(|xi| (count_out[yi][xi] > 0).then(|| sum_out[yi][xi] / count_out[yi][xi] as f32))
-                    .collect()
-            })
-            .collect(),
+    // Output nodes sit at `phase + i * spacing`, where `phase` is where the
+    // reference plane's own nodes fall relative to its center.
+    let phase = |coords: &[f32], center: f32, spacing: f32| {
+        coords.first().map_or(0.0, |&c0| (c0 - center).rem_euclid(spacing))
     };
+    let (px, py) = (
+        phase(reference.x, reference.center_x_km, dx_spacing),
+        phase(reference.y, reference.center_y_km, dy_spacing),
+    );
+    // Small slack so round-off in `phase` can't drop the outermost node.
+    let (sx, sy) = (dx_spacing * 1e-3, dy_spacing * 1e-3);
+    let (ix_min, ix_max) =
+        (((gx_min - px - sx) / dx_spacing).ceil() as i64, ((gx_max - px + sx) / dx_spacing).floor() as i64);
+    let (iy_min, iy_max) =
+        (((gy_min - py - sy) / dy_spacing).ceil() as i64, ((gy_max - py + sy) / dy_spacing).floor() as i64);
+    if ix_max < ix_min || iy_max < iy_min {
+        return empty();
+    }
+    let x_out: Vec<f32> = (ix_min..=ix_max).map(|i| px + i as f32 * dx_spacing).collect();
+    let y_out: Vec<f32> = (iy_min..=iy_max).map(|i| py + i as f32 * dy_spacing).collect();
+
+    let data_out = y_out
+        .iter()
+        .map(|&oy| {
+            x_out
+                .iter()
+                .map(|&ox| {
+                    let (mut sum, mut count, mut max) = (0.0f32, 0u32, None::<f32>);
+                    for p in planes {
+                        // Same range + radial (east/north offset) from this analysis's own center.
+                        let sx = snap_to_extent(p.center_x_km + ox, p.x, dx_spacing);
+                        let sy = snap_to_extent(p.center_y_km + oy, p.y, dy_spacing);
+                        let Some(v) = bilinear_sample(p.data, p.x, p.y, sx, sy) else { continue };
+                        sum += v;
+                        count += 1;
+                        max = Some(max.map_or(v, |b| b.max(v)));
+                    }
+                    match mode {
+                        CombineMode::Max => max,
+                        CombineMode::Mean => (count > 0).then(|| sum / count as f32),
+                    }
+                })
+                .collect()
+        })
+        .collect();
 
     Mosaic { x: x_out, y: y_out, data: data_out }
 }
@@ -822,49 +902,140 @@ mod tests {
         assert!(dx.abs() < 1e-4);
     }
 
-    #[test]
-    fn geo_mosaic_aligns_and_max_composites_shifted_planes() {
-        // Two 1x1 planes on a 1km grid, second shifted +1km in x.
-        let x = [0.0f32, 1.0];
-        let y = [0.0f32];
-        let a = vec![vec![Some(3.0), None]];
-        let b = vec![vec![Some(5.0), Some(9.0)]];
-        let planes = vec![
-            GeoPlane { x: &x, y: &y, data: &a, offset_x_km: 0.0, offset_y_km: 0.0 },
-            GeoPlane { x: &x, y: &y, data: &b, offset_x_km: 1.0, offset_y_km: 0.0 },
-        ];
-        let mosaic = geo_mosaic(&planes, CombineMode::Max);
-        // Combined x extent: plane a covers [0,1], plane b (shifted) covers [1,2] -> [0,1,2].
-        assert_eq!(mosaic.x, vec![0.0, 1.0, 2.0]);
-        assert_eq!(mosaic.y, vec![0.0]);
-        // col0 (x=0): only a's x=0 -> 3.0. col1 (x=1): a's x=1 (missing) + b's x=0 (5.0) -> 5.0.
-        // col2 (x=2): only b's x=1 -> 9.0.
-        assert_eq!(mosaic.data[0], vec![Some(3.0), Some(5.0), Some(9.0)]);
+    /// A 5x5, 1 km grid (-2..2 km) whose only data is a 50.0 "eye wall" cell
+    /// at `(eye_x, eye_y)`; everything else is 10.0.
+    fn eye_plane(eye_x: f32, eye_y: f32) -> (Vec<f32>, Vec<Vec<Option<f32>>>) {
+        let c: Vec<f32> = (-2..=2).map(|i| i as f32).collect();
+        let data = c
+            .iter()
+            .map(|&y| c.iter().map(|&x| Some(if x == eye_x && y == eye_y { 50.0 } else { 10.0 })).collect())
+            .collect();
+        (c, data)
     }
 
     #[test]
-    fn geo_mosaic_mean_averages_overlapping_cells_instead_of_maxing() {
-        // Same layout as the Max test above, but col1 (x=1) is where a's
-        // missing value and b's 5.0 would collide with a *second* real
-        // reading — use two planes that both have real data at the same
-        // output cell so Mean has something to average.
-        let x = [0.0f32, 1.0];
-        let y = [0.0f32];
-        let a = vec![vec![Some(3.0), Some(7.0)]];
-        let b = vec![vec![Some(5.0), Some(9.0)]];
+    fn storm_centered_mosaic_aligns_every_analysis_on_its_own_center() {
+        // Two analyses of the same storm: the feature sits 1 km north of each
+        // one's center, but the second grid's center is 1 km east of its origin
+        // (the storm moved). Aligned by center, both features hit (0, 1).
+        let (c, a) = eye_plane(0.0, 1.0);
+        let (_, b) = eye_plane(1.0, 1.0);
         let planes = vec![
-            GeoPlane { x: &x, y: &y, data: &a, offset_x_km: 0.0, offset_y_km: 0.0 },
-            GeoPlane { x: &x, y: &y, data: &b, offset_x_km: 1.0, offset_y_km: 0.0 },
+            StormPlane { x: &c, y: &c, data: &a, center_x_km: 0.0, center_y_km: 0.0 },
+            StormPlane { x: &c, y: &c, data: &b, center_x_km: 1.0, center_y_km: 0.0 },
         ];
-        let mosaic = geo_mosaic(&planes, CombineMode::Mean);
-        // col1 (x=1) is the overlap: a's x=1 (7.0) and b's x=0 (5.0) -> mean 6.0.
-        assert_eq!(mosaic.data[0], vec![Some(3.0), Some(6.0), Some(9.0)]);
+        let mosaic = storm_centered_mosaic(&planes, 0, CombineMode::Max);
+        // Union of extents about each center: x in [-3, 2], y in [-2, 2].
+        assert_eq!(mosaic.x, vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0]);
+        assert_eq!(mosaic.y, vec![-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let xi = mosaic.x.iter().position(|&v| v == 0.0).unwrap();
+        let yi = mosaic.y.iter().position(|&v| v == 1.0).unwrap();
+        assert_eq!(mosaic.data[yi][xi], Some(50.0));
+        // Nowhere else did a feature land — no second, offset "eye".
+        let hot = mosaic.data.iter().flatten().filter(|v| **v == Some(50.0)).count();
+        assert_eq!(hot, 1);
+        // x = -3 is only covered by the shifted plane's x = -2 column.
+        assert_eq!(mosaic.data[yi][0], Some(10.0));
     }
 
     #[test]
-    fn geo_mosaic_empty_input_returns_empty() {
-        let mosaic = geo_mosaic(&[], CombineMode::Max);
+    fn storm_centered_mosaic_mean_averages_overlapping_analyses() {
+        let c = [-1.0f32, 0.0, 1.0];
+        let a = vec![vec![Some(2.0); 3]; 3];
+        let b = vec![vec![Some(6.0); 3]; 3];
+        let planes = vec![
+            StormPlane { x: &c, y: &c, data: &a, center_x_km: 0.0, center_y_km: 0.0 },
+            StormPlane { x: &c, y: &c, data: &b, center_x_km: 0.0, center_y_km: 0.0 },
+        ];
+        let mosaic = storm_centered_mosaic(&planes, 0, CombineMode::Mean);
+        assert!(mosaic.data.iter().flatten().all(|v| *v == Some(4.0)));
+    }
+
+    #[test]
+    fn storm_centered_mosaic_interpolates_an_off_node_center() {
+        // Reference centered on a node; the second analysis's center sits
+        // half a km east of one, so at the reference center it's sampled
+        // halfway between its 0.0 and 10.0 columns.
+        let c = [-1.0f32, 0.0, 1.0];
+        let zeros = vec![vec![Some(0.0); 3]; 3];
+        let data = vec![vec![Some(0.0), Some(0.0), Some(10.0)]; 3];
+        let planes = vec![
+            StormPlane { x: &c, y: &c, data: &zeros, center_x_km: 0.0, center_y_km: 0.0 },
+            StormPlane { x: &c, y: &c, data: &data, center_x_km: 0.5, center_y_km: 0.0 },
+        ];
+        let mosaic = storm_centered_mosaic(&planes, 0, CombineMode::Max);
+        let xi = mosaic.x.iter().position(|&v| v == 0.0).unwrap();
+        let yi = mosaic.y.iter().position(|&v| v == 0.0).unwrap();
+        assert!((mosaic.data[yi][xi].unwrap() - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn storm_centered_mosaic_reproduces_the_reference_on_its_own_lattice() {
+        // TDR-style grid: 2 km spacing, nodes at odd km, no node at the
+        // center. The output must keep those nodes, not resample between them.
+        let c: Vec<f32> = (-3..=2).map(|i| i as f32 * 2.0 + 1.0).collect(); // -5,-3,-1,1,3,5
+        let data: Vec<Vec<Option<f32>>> =
+            (0..c.len()).map(|yi| (0..c.len()).map(|xi| Some((yi * 10 + xi) as f32)).collect()).collect();
+        let planes = vec![StormPlane { x: &c, y: &c, data: &data, center_x_km: 0.0, center_y_km: 0.0 }];
+        let mosaic = storm_centered_mosaic(&planes, 0, CombineMode::Max);
+        assert_eq!(mosaic.x, c);
+        assert_eq!(mosaic.y, c);
+        for (row_out, row_in) in mosaic.data.iter().zip(&data) {
+            for (a, b) in row_out.iter().zip(row_in) {
+                assert!((a.unwrap() - b.unwrap()).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn storm_centered_mosaic_empty_input_returns_empty() {
+        let mosaic = storm_centered_mosaic(&[], 0, CombineMode::Max);
         assert!(mosaic.x.is_empty() && mosaic.y.is_empty() && mosaic.data.is_empty());
+    }
+
+    #[test]
+    fn distance_bearing_km_matches_known_geometry() {
+        // 1 degree due north is ~111.2 km at bearing 0.
+        let (d, b) = distance_bearing_km(25.0, -80.0, 26.0, -80.0);
+        assert!((d - 111.19).abs() < 0.1, "{d}");
+        assert!(b.abs() < 1e-3 || (b - 360.0).abs() < 1e-3, "{b}");
+        // Due east along the equator: bearing 90.
+        let (d, b) = distance_bearing_km(0.0, 0.0, 0.0, 1.0);
+        assert!((d - 111.19).abs() < 0.1, "{d}");
+        assert!((b - 90.0).abs() < 1e-3, "{b}");
+        // Due west: bearing 270.
+        let (_, b) = distance_bearing_km(17.687, -78.035, 17.687, -79.0);
+        assert!((b - 270.0).abs() < 0.2, "{b}");
+    }
+
+    #[test]
+    fn offset_from_range_bearing_points_the_right_way() {
+        let (e, n) = offset_from_range_bearing(10.0, 0.0);
+        assert!(e.abs() < 1e-4 && (n - 10.0).abs() < 1e-4);
+        let (e, n) = offset_from_range_bearing(10.0, 90.0);
+        assert!((e - 10.0).abs() < 1e-4 && n.abs() < 1e-4);
+        let (e, n) = offset_from_range_bearing(5.0, 225.0);
+        assert!((e + 3.5355).abs() < 1e-3 && (n + 3.5355).abs() < 1e-3);
+    }
+
+    #[test]
+    fn storm_centered_mosaic_keeps_edge_cells_despite_round_off() {
+        // A center that isn't exactly representable: edge cells land a hair
+        // past the grid's last node and must still be sampled.
+        let c = [-1.0f32, 0.0, 1.0];
+        let data = vec![vec![Some(7.0); 3]; 3];
+        let planes = vec![StormPlane { x: &c, y: &c, data: &data, center_x_km: 0.1, center_y_km: -0.3 }];
+        let mosaic = storm_centered_mosaic(&planes, 0, CombineMode::Max);
+        assert!(!mosaic.x.is_empty());
+        assert!(mosaic.data.iter().flatten().all(|v| v.is_some_and(|v| (v - 7.0).abs() < 1e-4)));
+    }
+
+    #[test]
+    fn center_in_grid_km_is_zero_at_origin_and_east_is_positive_x() {
+        let (x, y) = center_in_grid_km(17.687, -78.035, 17.687, -78.035);
+        assert!(x.abs() < 1e-4 && y.abs() < 1e-4);
+        let (x, y) = center_in_grid_km(17.687, -78.035, 17.687, -77.935);
+        assert!(x > 10.0 && y.abs() < 0.1, "({x}, {y})");
     }
 
     #[test]
