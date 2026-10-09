@@ -65,6 +65,7 @@ proxy" bug (see the admin console's `API_BASE` pattern in
 | `GET /v1/tdr/sweep` | 🟢 Live (post-2021 Cartesian-grid files only — see below) |
 | `GET /v1/tdr/volume` | 🟢 Live |
 | `GET /v1/tdr/composite` (`mode=altitude`, `mode=time`, `mode=time_volume`) | 🟢 Live |
+| `GET /v1/tdr/composite/all` (`mode=time`, `mode=time_volume`, acceptability filter off) | 🟢 Live |
 | `GET /v1/tdr/plane_slice` | 🟢 Live |
 | `GET /v1/raw/netcdf` | 🟡 Planned |
 | `GET /demo/netcdf-three/` (static 3D client) | 🟢 Live (sample data only until raw passthrough ships) |
@@ -784,7 +785,8 @@ jobfile carries HRD's *acceptable for composite* flag
 typically isn't centered on the storm. An analysis with no flag on record is
 kept. Level 2 uses its own jobfile's flag, falling back to Level 1b's for the
 same analysis time. Every exclusion is listed in
-`detail.analysis_times_excluded` with a reason.
+`detail.analysis_times_excluded` with a reason. To composite every analysis
+regardless of the flag, use [`GET /v1/tdr/composite/all`](#get-v1tdrcompositeall-) instead.
 
 **Centering** (`time`/`time_volume`): the composite is built around **one**
 storm center — the `reference_time` analysis's (default: the earliest one
@@ -890,6 +892,37 @@ curl "https://joshmurdock.net/api/v1/tdr/composite?mission_id=20240630I1&product
   `detail.analysis_times_excluded` rather than erroring.
 - `404` — unknown `mission_id`, or no matching files on record.
 - `502` — the upstream NOAA host couldn't be reached.
+
+---
+
+## `GET /v1/tdr/composite/all` 🟢
+
+Same as `GET /v1/tdr/composite` with `mode=time` or `mode=time_volume`, except
+it **ignores** the jobfiles' *acceptable for composite* flag: every analysis
+time in the flight goes into one mosaic, including ones HRD marked
+`<acceptable>0</acceptable>`. Use it when you want the whole flight in the
+mosaic anyway. Flagged grids are often off-center on the storm, so expect a
+blurrier core than the filtered composite gives.
+
+Query parameters, centering, cell-combining, QC and the response shape are
+all identical to `/tdr/composite`. `reference_time` may now name a flagged
+analysis. `mode=altitude` returns `400`, because it only uses one analysis
+time and the flag never applies to it; use `/tdr/composite` for that.
+
+The response's `detail` gains one list:
+
+- `detail.analysis_times_unsuitable_included` — the analysis times whose
+  jobfile marks them not acceptable for composite but which were mosaicked
+  anyway. (`/tdr/composite` also returns this key, always as `[]`.)
+
+`detail.analysis_times_excluded` can still be non-empty in `time_volume`:
+analyses whose CAPPI level grid differs from the reference's are dropped
+there, the same as on `/tdr/composite`.
+
+```bash
+curl "https://joshmurdock.net/api/v1/tdr/composite/all?mission_id=20240630I1&product=xy_rel&field=reflectivity&mode=time&z=2.0"
+curl "https://joshmurdock.net/api/v1/tdr/composite/all?mission_id=20240630I1&product=xy_rel&field=reflectivity&mode=time_volume"
+```
 
 ---
 

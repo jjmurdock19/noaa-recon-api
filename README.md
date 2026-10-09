@@ -462,7 +462,7 @@ flowchart LR
 
     subgraph "noaa-recon-api (Rust / axum)"
         D["/v1/satellite/tile<br/>/v1/satellite/status<br/>/v1/satellite/colortable"]
-        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep, /v1/tdr/volume<br/>/v1/tdr/composite, /v1/tdr/plane_slice<br/>/v1/tdr/centers"]
+        E["/v1/tdr/years, /v1/tdr/:year<br/>/v1/tdr/mission/:id<br/>/v1/tdr/sweep, /v1/tdr/volume<br/>/v1/tdr/composite, /v1/tdr/composite/all<br/>/v1/tdr/plane_slice<br/>/v1/tdr/centers"]
         F["/v1/raw/netcdf (planned)"]
         G[ResultCache<br/>lock-file + TTL]
         H["crates/server services/goes.rs<br/>(decode + S3 fetch)"]

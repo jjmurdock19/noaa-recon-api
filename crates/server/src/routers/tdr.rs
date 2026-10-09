@@ -108,6 +108,7 @@ pub fn router() -> Router<AppState> {
         .route("/tdr/sweep", get(get_sweep))
         .route("/tdr/volume", get(get_volume))
         .route("/tdr/composite", get(get_composite))
+        .route("/tdr/composite/all", get(get_composite_all))
         .route("/tdr/plane_slice", get(get_plane_slice))
         .route("/tdr/centers", get(get_centers))
         .route("/tdr/:year", get(list_storms_for_year))
@@ -512,8 +513,32 @@ struct CompositeQuery {
 ///   averaged for everything else (wind/vorticity fields, where an extreme
 ///   from one analysis time shouldn't dominate the composite).
 async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
+    build_composite(&state, &q, false).await
+}
+
+/// `GET /v1/tdr/composite/all` — same query and response as
+/// `GET /v1/tdr/composite`'s `mode=time`/`time_volume`, but **ignores** the
+/// jobfiles' "not acceptable for composite" verdict: every analysis time in
+/// the flight goes into the one mosaic. The analyses that would normally have
+/// been dropped are listed in `detail.analysis_times_unsuitable_included`.
+/// `mode=altitude` is rejected — it only ever uses one analysis time, so the
+/// filter never applies to it.
+async fn get_composite_all(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
+    if q.mode == "altitude" {
+        return Err(ApiError::bad_request(
+            "mode=altitude uses a single analysis time, so the acceptability filter never applies — use /v1/tdr/composite."
+                .to_string(),
+        ));
+    }
+    build_composite(&state, &q, true).await
+}
+
+/// Shared body of [`get_composite`] / [`get_composite_all`].
+/// `include_unsuitable` keeps analyses whose jobfile marks them not
+/// acceptable for composite (see [`select_composite_files`]).
+async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitable: bool) -> ApiResult<Json<Value>> {
     let want_qc = q.qc.unwrap_or(false);
-    let conn = conn(&state)?;
+    let conn = conn(state)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
 
     if q.mode == "time_volume" {
@@ -536,7 +561,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
             )));
         }
         let analyses = tdr::get_mission_analyses(&conn, &q.mission_id)?;
-        return get_composite_time_volume(mission, level, files, analyses, &cache_dir, &q, want_qc).await;
+        return get_composite_time_volume(mission, level, files, analyses, &cache_dir, q, want_qc, include_unsuitable).await;
     }
 
     let mut qc_report = qc::QcReport::default();
@@ -587,7 +612,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
                 )));
             }
             let analyses = tdr::get_mission_analyses(&conn, &q.mission_id)?;
-            let (included, excluded) = select_composite_files(files, &analyses, &level)?;
+            let (included, excluded, unsuitable) = select_composite_files(files, &analyses, &level, include_unsuitable)?;
             let requested_z = q.z.unwrap_or(2.0);
 
             // Read every included analysis time's slice first (need them all
@@ -630,7 +655,7 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
             let combine_mode = sweep::combine_mode_for_field(&q.field);
             let mosaic = sweep::storm_centered_mosaic(&planes, reference, combine_mode);
 
-            let mut detail = centering_detail(&times, &centers, reference, &excluded, combine_mode);
+            let mut detail = centering_detail(&times, &centers, reference, &excluded, &unsuitable, combine_mode);
             detail["z_km"] = json!(requested_z);
             let origin = centers[reference].lat.zip(centers[reference].lon);
             (mission, level, mosaic.x, mosaic.y, mosaic.data, detail, origin)
@@ -674,17 +699,29 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
 /// on the storm) is excluded; one with no verdict on record is kept. Each
 /// kept file comes back paired with its jobfile metadata (see
 /// [`tdr::analysis_for`]) for centering. Errors when nothing's left.
+///
+/// With `include_unsuitable` (`GET /v1/tdr/composite/all`) nothing is
+/// excluded; the flagged analysis times are kept and returned in the third
+/// list instead, so the response can say which ones overrode the verdict.
+#[allow(clippy::type_complexity)]
 fn select_composite_files(
     files: Vec<tdr::FileRecord>,
     analyses: &[tdr::AnalysisRecord],
     level: &str,
-) -> ApiResult<(Vec<(tdr::FileRecord, Option<tdr::AnalysisRecord>)>, Vec<Value>)> {
+    include_unsuitable: bool,
+) -> ApiResult<(Vec<(tdr::FileRecord, Option<tdr::AnalysisRecord>)>, Vec<Value>, Vec<String>)> {
     let total = files.len();
     let mut included = Vec::new();
     let mut excluded = Vec::new();
+    let mut unsuitable = Vec::new();
     for file in files {
         let analysis = tdr::analysis_for(analyses, level, &file.analysis_time).cloned();
         if analysis.as_ref().and_then(|a| a.acceptable_for_composite) == Some(false) {
+            if include_unsuitable {
+                unsuitable.push(file.analysis_time.clone());
+                included.push((file, analysis));
+                continue;
+            }
             excluded.push(json!({
                 "analysis_time": file.analysis_time,
                 "reason": "jobfile marks this analysis not acceptable for composite",
@@ -698,7 +735,7 @@ fn select_composite_files(
             "All {total} analysis time(s) are marked not acceptable for composite in their jobfiles — nothing to composite."
         )));
     }
-    Ok((included, excluded))
+    Ok((included, excluded, unsuitable))
 }
 
 /// One analysis's storm center: where it is on the earth (when known), and
@@ -758,6 +795,7 @@ fn centering_detail(
     centers: &[&AnalysisCenter],
     reference: usize,
     excluded: &[Value],
+    unsuitable_included: &[String],
     combine_mode: sweep::CombineMode,
 ) -> Value {
     let r = centers[reference];
@@ -786,6 +824,7 @@ fn centering_detail(
         "centering": "storm-relative: every analysis re-plotted by distance + radial from its own storm center around one shared reference center",
         "analysis_times_used": times,
         "analysis_times_excluded": excluded,
+        "analysis_times_unsuitable_included": unsuitable_included,
         "reference_analysis_time": times[reference],
         "reference_center": {"lat": r.lat, "lon": r.lon, "source": r.source},
         "reference_origin": {"lat": r.lat, "lon": r.lon},
@@ -805,6 +844,7 @@ fn centering_detail(
 // rusqlite's Connection isn't Sync, so a reference to it can't cross the
 // `.await`s below without making the whole handler's future non-Send; the
 // caller does the DB lookups synchronously and hands off owned data).
+#[allow(clippy::too_many_arguments)]
 async fn get_composite_time_volume(
     mission: tdr::Mission,
     level: String,
@@ -813,8 +853,9 @@ async fn get_composite_time_volume(
     cache_dir: &std::path::Path,
     q: &CompositeQuery,
     want_qc: bool,
+    include_unsuitable: bool,
 ) -> ApiResult<Json<Value>> {
-    let (included, mut excluded) = select_composite_files(files, &analyses, &level)?;
+    let (included, mut excluded, unsuitable) = select_composite_files(files, &analyses, &level, include_unsuitable)?;
 
     // Read every included analysis time's whole volume first — need them all
     // in hand before centering and picking the canonical level grid. Custom
@@ -887,7 +928,7 @@ async fn get_composite_time_volume(
         data_out.push(mosaic.data.iter().map(|row| row.iter().map(|v| v.map(|x| x as f64)).collect()).collect());
     }
 
-    let detail = centering_detail(&times, &centers, reference, &excluded, combine_mode);
+    let detail = centering_detail(&times, &centers, reference, &excluded, &unsuitable, combine_mode);
     let r = centers[reference];
     let cs = colorscale_for_field(&q.field);
     let mut response = json!({
