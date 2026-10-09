@@ -302,7 +302,7 @@ pub fn apply_qc_to_slice(
 ) -> qc::QcReport {
     let examined = qc::count_valid(&slice.data);
     let wind_clutter = match wind_speed {
-        Some(w) if qc::wind_clutter_applies(field) => qc::qc_wind_clutter(&mut slice.data, &w.data, params),
+        Some(w) if qc::wind_clutter_applies(field) => qc::qc_wind_clutter(&mut slice.data, &w.data, &slice.x, &slice.y, slice.z_km, params),
         _ => 0,
     };
     let mut report = qc::qc_plane_xy(&mut slice.data, &slice.x, &slice.y, params);
@@ -330,8 +330,8 @@ pub fn apply_qc_to_volume(
     let examined: usize = volume.data.iter().map(|level| qc::count_valid(level)).sum();
     let mut wind_clutter = 0;
     if let Some(w) = wind_speed.filter(|_| qc::wind_clutter_applies(field)) {
-        for (level, wind_level) in volume.data.iter_mut().zip(w.data.iter()) {
-            wind_clutter += qc::qc_wind_clutter(level, wind_level, params);
+        for ((level, wind_level), &z_km) in volume.data.iter_mut().zip(w.data.iter()).zip(&volume.levels) {
+            wind_clutter += qc::qc_wind_clutter(level, wind_level, &volume.x, &volume.y, Some(z_km), params);
         }
     }
     let mut report = qc::qc_volume(&mut volume.data, &volume.x, &volume.y, params);
@@ -347,25 +347,31 @@ pub fn apply_qc_to_volume(
     report
 }
 
+/// Whether a QC run with `qc_params` (`None` = QC off) needs a wind-speed
+/// grid for `field` — only when the wind-clutter check is on and applies.
+fn wants_qc_wind(field: &str, qc_params: Option<qc::QcParams>) -> bool {
+    qc_params.is_some_and(|p| p.clutter_enabled) && qc::wind_clutter_applies(field)
+}
+
 /// The wind-speed slice Custom QC's wind-clutter check pairs with a
 /// `field` slice read at `requested_z_km` from the same file — `None` when
-/// QC is off or the check doesn't apply to `field`, so nothing extra is
-/// decoded then.
+/// QC is off (`qc_params` is `None`), the check is disabled, or it doesn't
+/// apply to `field`, so nothing extra is decoded then.
 pub fn read_qc_wind_slice(
     path: &Path,
     field: &str,
     requested_z_km: Option<f32>,
-    want_qc: bool,
+    qc_params: Option<qc::QcParams>,
 ) -> anyhow::Result<Option<FieldSlice>> {
-    if !want_qc || !qc::wind_clutter_applies(field) {
+    if !wants_qc_wind(field, qc_params) {
         return Ok(None);
     }
     read_xy_slice(path, "wind_speed", requested_z_km).map(Some)
 }
 
 /// Same as [`read_qc_wind_slice`] for a full volume.
-pub fn read_qc_wind_volume(path: &Path, field: &str, want_qc: bool) -> anyhow::Result<Option<FieldVolume>> {
-    if !want_qc || !qc::wind_clutter_applies(field) {
+pub fn read_qc_wind_volume(path: &Path, field: &str, qc_params: Option<qc::QcParams>) -> anyhow::Result<Option<FieldVolume>> {
+    if !wants_qc_wind(field, qc_params) {
         return Ok(None);
     }
     read_xy_volume(path, "wind_speed").map(Some)
@@ -374,8 +380,12 @@ pub fn read_qc_wind_volume(path: &Path, field: &str, want_qc: bool) -> anyhow::R
 /// Same as [`read_qc_wind_slice`] for a `mode=altitude` composite: the
 /// column-max wind speed, so a column whose strongest wind is clutter-strength
 /// pairs with that column's max reflectivity.
-pub fn read_qc_wind_altitude_composite(path: &Path, field: &str, want_qc: bool) -> anyhow::Result<Option<FieldSlice>> {
-    if !want_qc || !qc::wind_clutter_applies(field) {
+pub fn read_qc_wind_altitude_composite(
+    path: &Path,
+    field: &str,
+    qc_params: Option<qc::QcParams>,
+) -> anyhow::Result<Option<FieldSlice>> {
+    if !wants_qc_wind(field, qc_params) {
         return Ok(None);
     }
     read_xy_altitude_composite(path, "wind_speed").map(Some)

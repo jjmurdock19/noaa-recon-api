@@ -1040,6 +1040,17 @@ Behavior when `qc=true`:
 curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&analysis_time=1201&field=reflectivity&qc=true"
 ```
 
+**Tuning.** Every `qc=true` route accepts optional `qc_*` overrides (ignored
+without `qc=true`; `400` if out of range): `qc_mad_k`, `qc_window`,
+`qc_min_neighbors`, `qc_min_coverage`, `qc_ring_width_km`,
+`qc_clutter_enabled`, `qc_clutter_min_wind_ms`,
+`qc_clutter_wind_frac_of_peak`, `qc_clutter_wind_search_km`,
+`qc_clutter_max_height_km`, `qc_clutter_cutoff_low_dbz`,
+`qc_clutter_cutoff_high_dbz`, `qc_clutter_ref_low_dbz`,
+`qc_clutter_ref_high_dbz`. `GET /v1/tdr/qc/params` lists each one's default,
+bounds and description. Every QC response echoes the values used as
+`qc_params`.
+
 ```json
 {
   "...": "same shape as a plain /tdr/sweep response, plus:",

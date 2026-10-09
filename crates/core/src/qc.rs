@@ -42,7 +42,7 @@ const MAD_SCALE: f32 = 1.4826;
 /// conventions, not values pulled from the TDR literature — see the module
 /// doc comment on why every check here is necessarily *new* territory (no
 /// paper describes QC on the finished grid to calibrate against).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct QcParams {
     /// Outlier threshold, in MAD units, shared by despiking, vertical
     /// continuity, the azimuthal-ring check, and cross-consistency. Default
@@ -68,9 +68,24 @@ pub struct QcParams {
     /// Azimuthal-ring annulus width in km (default 2.0 — matches the
     /// existing radius-of-max-wind binning convention in `sweep.rs`).
     pub ring_width_km: f32,
+    /// F (wind clutter): run the check at all. Default true.
+    pub clutter_enabled: bool,
     /// F (wind clutter): wind speed (m/s) at or above which a weak echo in
     /// the same cell is treated as a phantom return. Default 25 m/s (~50 kt).
     pub clutter_min_wind_ms: f32,
+    /// F: when > 0, the wind threshold drops to this fraction of the plane's
+    /// peak wind speed if that's lower than `clutter_min_wind_ms` — so a
+    /// weaker storm's "strong" winds still count. Default 0 (off).
+    pub clutter_wind_frac_of_peak: f32,
+    /// F: when > 0, a weak echo with no wind value of its own borrows the
+    /// strongest wind within this many km. The synthesis often keeps phantom
+    /// reflectivity while producing no wind there at all, so without this
+    /// those cells are never tested. Default 0 (off).
+    pub clutter_wind_search_km: f32,
+    /// F: when set, the check only runs on CAPPI levels at or below this
+    /// height (km), sparing weak upper-level echo. Default unset (all
+    /// levels). Ignored for an altitude composite, which has no single level.
+    pub clutter_max_height_km: Option<f32>,
     /// F: the dBZ cutoff for a weak storm — used when the plane's genuine
     /// echoes have a median at or below `clutter_ref_low_dbz`. Default 2.0,
     /// the top of the 0-2 dBZ band the phantoms usually sit in.
@@ -96,7 +111,11 @@ impl Default for QcParams {
             min_neighbors: 8,
             min_coverage: 4,
             ring_width_km: 2.0,
+            clutter_enabled: true,
             clutter_min_wind_ms: 25.0,
+            clutter_wind_frac_of_peak: 0.0,
+            clutter_wind_search_km: 0.0,
+            clutter_max_height_km: None,
             clutter_cutoff_low_dbz: 2.0,
             clutter_cutoff_high_dbz: 5.0,
             clutter_ref_low_dbz: 15.0,
@@ -499,28 +518,98 @@ pub fn wind_clutter_cutoff_dbz(reflectivity: &[Vec<Option<f32>>], params: &QcPar
     params.clutter_cutoff_low_dbz + t * (params.clutter_cutoff_high_dbz - params.clutter_cutoff_low_dbz)
 }
 
-/// Masks reflectivity cells at or below [`wind_clutter_cutoff_dbz`] where
-/// `wind_speed` at the same cell is at least `clutter_min_wind_ms`.
-/// `wind_speed` must be the same grid as `reflectivity` (same file, same
-/// level); a cell with no wind on record is left alone (no evidence either
-/// way), and a shape mismatch returns 0 rather than guessing an alignment.
-pub fn qc_wind_clutter(reflectivity: &mut [Vec<Option<f32>>], wind_speed: &[Vec<Option<f32>>], params: &QcParams) -> usize {
-    if reflectivity.len() != wind_speed.len() || reflectivity.iter().zip(wind_speed).any(|(r, w)| r.len() != w.len()) {
-        return 0;
+/// The wind speed (m/s) at or above which check F counts a cell's wind as
+/// strong for this plane: `clutter_min_wind_ms`, lowered to
+/// `clutter_wind_frac_of_peak` x the plane's peak wind when that's enabled
+/// and smaller.
+pub fn wind_clutter_threshold_ms(wind_speed: &[Vec<Option<f32>>], params: &QcParams) -> f32 {
+    if params.clutter_wind_frac_of_peak <= 0.0 {
+        return params.clutter_min_wind_ms;
     }
-    let cutoff = wind_clutter_cutoff_dbz(reflectivity, params);
-    let mut flagged = 0;
-    for (row, wind_row) in reflectivity.iter_mut().zip(wind_speed) {
-        for (cell, wind) in row.iter_mut().zip(wind_row) {
-            if let (Some(dbz), Some(ws)) = (*cell, *wind) {
-                if dbz <= cutoff && ws >= params.clutter_min_wind_ms {
-                    *cell = None;
-                    flagged += 1;
-                }
+    let peak = wind_speed.iter().flatten().filter_map(|v| *v).fold(f32::NEG_INFINITY, f32::max);
+    if peak.is_finite() {
+        params.clutter_min_wind_ms.min(params.clutter_wind_frac_of_peak * peak)
+    } else {
+        params.clutter_min_wind_ms
+    }
+}
+
+/// Strongest valid wind within `radius_km` of cell `(yi, xi)`, using the
+/// grid's own km coordinates. `None` if there's none in range.
+fn max_wind_within(wind_speed: &[Vec<Option<f32>>], x: &[f32], y: &[f32], yi: usize, xi: usize, radius_km: f32) -> Option<f32> {
+    let step = |c: &[f32]| if c.len() > 1 { (c[1] - c[0]).abs().max(f32::EPSILON) } else { f32::INFINITY };
+    let kx = (radius_km / step(x)).ceil().min(x.len() as f32) as usize;
+    let ky = (radius_km / step(y)).ceil().min(y.len() as f32) as usize;
+    let mut best: Option<f32> = None;
+    for nyi in yi.saturating_sub(ky)..(yi + ky + 1).min(wind_speed.len()) {
+        for nxi in xi.saturating_sub(kx)..(xi + kx + 1).min(wind_speed[nyi].len()) {
+            let Some(w) = wind_speed[nyi][nxi] else { continue };
+            if (x[nxi] - x[xi]).hypot(y[nyi] - y[yi]) <= radius_km {
+                best = Some(best.map_or(w, |b: f32| b.max(w)));
             }
         }
     }
-    flagged
+    best
+}
+
+/// Masks reflectivity cells at or below [`wind_clutter_cutoff_dbz`] whose
+/// wind speed is at least [`wind_clutter_threshold_ms`]. `wind_speed` must
+/// be the same grid as `reflectivity` (same file, same level), with `x`/`y`
+/// its km coordinates. A cell with no wind of its own borrows the strongest
+/// wind within `clutter_wind_search_km` when that's enabled; otherwise it's
+/// left alone (no evidence either way). `z_km` is the plane's height, for
+/// `clutter_max_height_km` — `None` (an altitude composite) skips that limit.
+/// A shape mismatch, or `clutter_enabled = false`, returns 0.
+pub fn qc_wind_clutter(
+    reflectivity: &mut [Vec<Option<f32>>],
+    wind_speed: &[Vec<Option<f32>>],
+    x: &[f32],
+    y: &[f32],
+    z_km: Option<f32>,
+    params: &QcParams,
+) -> usize {
+    if !params.clutter_enabled {
+        return 0;
+    }
+    if let (Some(z), Some(max)) = (z_km, params.clutter_max_height_km) {
+        if z > max {
+            return 0;
+        }
+    }
+    if reflectivity.len() != wind_speed.len()
+        || reflectivity.len() != y.len()
+        || reflectivity.iter().zip(wind_speed).any(|(r, w)| r.len() != w.len() || r.len() != x.len())
+    {
+        return 0;
+    }
+    let cutoff = wind_clutter_cutoff_dbz(reflectivity, params);
+    let threshold = wind_clutter_threshold_ms(wind_speed, params);
+    let search = params.clutter_wind_search_km;
+
+    // Flag first, then mask — the neighborhood search reads `wind_speed`
+    // only, so order doesn't matter for correctness, but this keeps the
+    // shape of every other pass in this module.
+    let mut flags = Vec::new();
+    for (yi, row) in reflectivity.iter().enumerate() {
+        for (xi, cell) in row.iter().enumerate() {
+            let Some(dbz) = *cell else { continue };
+            if dbz > cutoff {
+                continue;
+            }
+            let ws = match wind_speed[yi][xi] {
+                Some(w) => Some(w),
+                None if search > 0.0 => max_wind_within(wind_speed, x, y, yi, xi, search),
+                None => None,
+            };
+            if ws.is_some_and(|w| w >= threshold) {
+                flags.push((yi, xi));
+            }
+        }
+    }
+    for &(yi, xi) in &flags {
+        reflectivity[yi][xi] = None;
+    }
+    flags.len()
 }
 
 #[cfg(test)]
@@ -686,6 +775,9 @@ mod tests {
         (vec![vec![Some(base); 10]; 10], vec![vec![Some(wind); 10]; 10])
     }
 
+    /// km coordinates for the 10x10 test grids — 2 km spacing.
+    const XY: [f32; 10] = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0];
+
     #[test]
     fn wind_clutter_cutoff_scales_with_storm_strength() {
         let p = QcParams::default();
@@ -723,7 +815,7 @@ mod tests {
         wind[4][4] = Some(40.0);
         refl[5][5] = Some(1.0); // weak, no wind on record -> kept
         wind[5][5] = None;
-        assert_eq!(qc_wind_clutter(&mut refl, &wind, &p), 1);
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &XY, &XY, None, &p), 1);
         assert_eq!(refl[2][2], None);
         assert_eq!(refl[3][3], Some(1.0));
         assert_eq!(refl[4][4], Some(30.0));
@@ -735,12 +827,12 @@ mod tests {
         let p = QcParams::default();
         let (mut weak, wind) = refl_and_wind(12.0, 40.0);
         weak[0][0] = Some(4.0);
-        qc_wind_clutter(&mut weak, &wind, &p);
+        qc_wind_clutter(&mut weak, &wind, &XY, &XY, None, &p);
         assert_eq!(weak[0][0], Some(4.0)); // cutoff 2 dBZ
 
         let (mut strong, wind) = refl_and_wind(35.0, 40.0);
         strong[0][0] = Some(4.0);
-        qc_wind_clutter(&mut strong, &wind, &p);
+        qc_wind_clutter(&mut strong, &wind, &XY, &XY, None, &p);
         assert_eq!(strong[0][0], None); // cutoff 5 dBZ
     }
 
@@ -749,6 +841,48 @@ mod tests {
         let p = QcParams::default();
         let (mut refl, _) = refl_and_wind(1.0, 0.0);
         let wind = vec![vec![Some(40.0); 9]; 10];
-        assert_eq!(qc_wind_clutter(&mut refl, &wind, &p), 0);
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &XY, &XY, None, &p), 0);
+    }
+
+    #[test]
+    fn wind_clutter_search_borrows_nearby_wind_for_cells_without_any() {
+        let (mut refl, mut wind) = refl_and_wind(35.0, 10.0);
+        refl[5][5] = Some(0.5);
+        wind[5][5] = None;
+        wind[5][7] = Some(40.0); // 4 km away
+        let off = QcParams::default();
+        assert_eq!(qc_wind_clutter(&mut refl.clone(), &wind, &XY, &XY, None, &off), 0);
+        let near = QcParams { clutter_wind_search_km: 3.0, ..Default::default() };
+        assert_eq!(qc_wind_clutter(&mut refl.clone(), &wind, &XY, &XY, None, &near), 0);
+        let far = QcParams { clutter_wind_search_km: 4.0, ..Default::default() };
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &XY, &XY, None, &far), 1);
+        assert_eq!(refl[5][5], None);
+    }
+
+    #[test]
+    fn wind_clutter_threshold_can_follow_the_planes_peak_wind() {
+        // Peak 30 m/s; a 22 m/s cell isn't "strong" at the fixed 25 m/s
+        // threshold, but is at 70% of peak (21 m/s).
+        let (mut refl, mut wind) = refl_and_wind(35.0, 10.0);
+        wind[0][0] = Some(30.0);
+        refl[3][3] = Some(1.0);
+        wind[3][3] = Some(22.0);
+        assert_eq!(wind_clutter_threshold_ms(&wind, &QcParams::default()), 25.0);
+        let frac = QcParams { clutter_wind_frac_of_peak: 0.7, ..Default::default() };
+        assert!((wind_clutter_threshold_ms(&wind, &frac) - 21.0).abs() < 1e-4);
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &XY, &XY, None, &frac), 1);
+    }
+
+    #[test]
+    fn wind_clutter_respects_max_height_and_enabled() {
+        let (mut refl, mut wind) = refl_and_wind(35.0, 10.0);
+        refl[2][2] = Some(1.0);
+        wind[2][2] = Some(40.0);
+        let capped = QcParams { clutter_max_height_km: Some(6.0), ..Default::default() };
+        assert_eq!(qc_wind_clutter(&mut refl.clone(), &wind, &XY, &XY, Some(8.0), &capped), 0);
+        assert_eq!(qc_wind_clutter(&mut refl.clone(), &wind, &XY, &XY, None, &capped), 1);
+        let off = QcParams { clutter_enabled: false, ..Default::default() };
+        assert_eq!(qc_wind_clutter(&mut refl.clone(), &wind, &XY, &XY, Some(2.0), &off), 0);
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &XY, &XY, Some(2.0), &capped), 1);
     }
 }

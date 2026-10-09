@@ -39,14 +39,175 @@ strong winds, but cannot correct upstream radar or synthesis errors, and hasn't 
 Level 2. Treat as a supplementary diagnostic.";
 
 /// Inserts the QC fields into an already-built sweep/volume/composite
-/// response object when a QC pass actually ran.
-fn insert_qc_fields(response: &mut Value, report: Option<qc::QcReport>) {
+/// response object when a QC pass actually ran — including `qc_params`, the
+/// exact tuning that produced it (defaults filled in), so a client can show
+/// what's in effect without tracking defaults itself.
+fn insert_qc_fields(response: &mut Value, report: Option<qc::QcReport>, params: Option<qc::QcParams>) {
     if let Some(report) = report {
         let obj = response.as_object_mut().expect("response is always a JSON object");
         obj.insert("qc_applied".into(), json!(true));
         obj.insert("qc_summary".into(), serde_json::to_value(report).unwrap());
+        obj.insert("qc_params".into(), serde_json::to_value(params.unwrap_or_default()).unwrap());
         obj.insert("qc_disclaimer".into(), json!(QC_DISCLAIMER));
     }
+}
+
+/// One tunable Custom QC knob. The query parameter is `name`; the
+/// [`qc::QcParams`] field it sets is `name` minus its `qc_` prefix. Drives
+/// both [`QcTuning::resolve`]'s range checks and `GET /v1/tdr/qc/params`.
+struct QcKnob {
+    name: &'static str,
+    /// `"float"`, `"int"`, or `"bool"` (bounds unused for bool).
+    kind: &'static str,
+    min: f32,
+    max: f32,
+    description: &'static str,
+}
+
+const QC_KNOBS: &[QcKnob] = &[
+    QcKnob { name: "qc_mad_k", kind: "float", min: 0.5, max: 20.0,
+        description: "Outlier threshold in MAD-sigma units for despike, vertical, azimuthal and cross-consistency checks. Lower = more aggressive." },
+    QcKnob { name: "qc_window", kind: "int", min: 1.0, max: 10.0,
+        description: "Despike/edge-trim neighborhood half-width in cells (2 = 5x5 window). Also the vertical-continuity window in levels." },
+    QcKnob { name: "qc_min_neighbors", kind: "int", min: 1.0, max: 440.0,
+        description: "Valid neighbors needed before a cell is despike/azimuthal/cross-consistency tested; also the genuine-echo count needed for the wind-clutter median." },
+    QcKnob { name: "qc_min_coverage", kind: "int", min: 0.0, max: 440.0,
+        description: "Cells with fewer valid neighbors than this are edge-trimmed regardless of value. Must be <= qc_min_neighbors. 0 disables edge trim." },
+    QcKnob { name: "qc_ring_width_km", kind: "float", min: 0.5, max: 50.0,
+        description: "Azimuthal-ring annulus width (km)." },
+    QcKnob { name: "qc_clutter_enabled", kind: "bool", min: 0.0, max: 1.0,
+        description: "Run the wind-clutter check (reflectivity only)." },
+    QcKnob { name: "qc_clutter_min_wind_ms", kind: "float", min: 0.0, max: 100.0,
+        description: "Wind speed (m/s) at or above which a weak echo counts as a phantom." },
+    QcKnob { name: "qc_clutter_wind_frac_of_peak", kind: "float", min: 0.0, max: 1.0,
+        description: "If > 0, the wind threshold drops to this fraction of the level's peak wind when that's lower than qc_clutter_min_wind_ms. 0 = off." },
+    QcKnob { name: "qc_clutter_wind_search_km", kind: "float", min: 0.0, max: 50.0,
+        description: "If > 0, a weak echo with no wind of its own uses the strongest wind within this many km. 0 = off (such cells are never flagged)." },
+    QcKnob { name: "qc_clutter_max_height_km", kind: "float", min: 0.0, max: 20.0,
+        description: "Only run the wind-clutter check on levels at or below this height (km). Omit for all levels." },
+    QcKnob { name: "qc_clutter_cutoff_low_dbz", kind: "float", min: -20.0, max: 20.0,
+        description: "dBZ cutoff for a weak storm (genuine-echo median <= qc_clutter_ref_low_dbz). Cells at or below the cutoff under strong wind are removed." },
+    QcKnob { name: "qc_clutter_cutoff_high_dbz", kind: "float", min: -20.0, max: 20.0,
+        description: "dBZ cutoff for a strong storm (median >= qc_clutter_ref_high_dbz). Also the floor a cell must exceed to count as a genuine echo in that median." },
+    QcKnob { name: "qc_clutter_ref_low_dbz", kind: "float", min: -10.0, max: 60.0,
+        description: "Genuine-echo median (dBZ) at or below which the low cutoff applies." },
+    QcKnob { name: "qc_clutter_ref_high_dbz", kind: "float", min: -10.0, max: 60.0,
+        description: "Genuine-echo median (dBZ) at or above which the high cutoff applies; linear in between." },
+];
+
+/// Optional Custom QC tuning, read from the same query string as the main
+/// query struct (a second `Query` extractor — `#[serde(flatten)]` can't parse
+/// numbers out of a query string). Every field overrides the matching
+/// [`qc::QcParams`] default; see [`QC_KNOBS`] for bounds. Ignored unless
+/// `qc=true`.
+#[derive(Deserialize)]
+struct QcTuning {
+    qc_mad_k: Option<f32>,
+    qc_window: Option<usize>,
+    qc_min_neighbors: Option<usize>,
+    qc_min_coverage: Option<usize>,
+    qc_ring_width_km: Option<f32>,
+    qc_clutter_enabled: Option<bool>,
+    qc_clutter_min_wind_ms: Option<f32>,
+    qc_clutter_wind_frac_of_peak: Option<f32>,
+    qc_clutter_wind_search_km: Option<f32>,
+    qc_clutter_max_height_km: Option<f32>,
+    qc_clutter_cutoff_low_dbz: Option<f32>,
+    qc_clutter_cutoff_high_dbz: Option<f32>,
+    qc_clutter_ref_low_dbz: Option<f32>,
+    qc_clutter_ref_high_dbz: Option<f32>,
+}
+
+/// `value`, if given, after checking it against `name`'s [`QC_KNOBS`] bounds.
+fn bounded<T: Copy + Into<f64>>(name: &str, value: Option<T>) -> ApiResult<Option<T>> {
+    let Some(v) = value else { return Ok(None) };
+    let knob = QC_KNOBS.iter().find(|k| k.name == name).expect("every QcTuning field has a QC_KNOBS entry");
+    let f: f64 = v.into();
+    if !f.is_finite() || f < knob.min as f64 || f > knob.max as f64 {
+        return Err(ApiError::bad_request(format!("{name}={f} is out of range [{}, {}]", knob.min, knob.max)));
+    }
+    Ok(Some(v))
+}
+
+impl QcTuning {
+    /// The [`qc::QcParams`] to run with — `None` when `want_qc` is false (no
+    /// QC, nothing validated). `400` on any out-of-range or inconsistent
+    /// value rather than silently clamping it.
+    fn resolve(&self, want_qc: bool) -> ApiResult<Option<qc::QcParams>> {
+        if !want_qc {
+            return Ok(None);
+        }
+        let usize_knob = |name: &str, v: Option<usize>| -> ApiResult<Option<usize>> {
+            Ok(bounded(name, v.map(|n| n.min(u32::MAX as usize) as u32))?.map(|n| n as usize))
+        };
+        let d = qc::QcParams::default();
+        let p = qc::QcParams {
+            mad_k: bounded("qc_mad_k", self.qc_mad_k)?.unwrap_or(d.mad_k),
+            window: usize_knob("qc_window", self.qc_window)?.unwrap_or(d.window),
+            min_neighbors: usize_knob("qc_min_neighbors", self.qc_min_neighbors)?.unwrap_or(d.min_neighbors),
+            min_coverage: usize_knob("qc_min_coverage", self.qc_min_coverage)?.unwrap_or(d.min_coverage),
+            ring_width_km: bounded("qc_ring_width_km", self.qc_ring_width_km)?.unwrap_or(d.ring_width_km),
+            clutter_enabled: self.qc_clutter_enabled.unwrap_or(d.clutter_enabled),
+            clutter_min_wind_ms: bounded("qc_clutter_min_wind_ms", self.qc_clutter_min_wind_ms)?
+                .unwrap_or(d.clutter_min_wind_ms),
+            clutter_wind_frac_of_peak: bounded("qc_clutter_wind_frac_of_peak", self.qc_clutter_wind_frac_of_peak)?
+                .unwrap_or(d.clutter_wind_frac_of_peak),
+            clutter_wind_search_km: bounded("qc_clutter_wind_search_km", self.qc_clutter_wind_search_km)?
+                .unwrap_or(d.clutter_wind_search_km),
+            clutter_max_height_km: bounded("qc_clutter_max_height_km", self.qc_clutter_max_height_km)?
+                .or(d.clutter_max_height_km),
+            clutter_cutoff_low_dbz: bounded("qc_clutter_cutoff_low_dbz", self.qc_clutter_cutoff_low_dbz)?
+                .unwrap_or(d.clutter_cutoff_low_dbz),
+            clutter_cutoff_high_dbz: bounded("qc_clutter_cutoff_high_dbz", self.qc_clutter_cutoff_high_dbz)?
+                .unwrap_or(d.clutter_cutoff_high_dbz),
+            clutter_ref_low_dbz: bounded("qc_clutter_ref_low_dbz", self.qc_clutter_ref_low_dbz)?
+                .unwrap_or(d.clutter_ref_low_dbz),
+            clutter_ref_high_dbz: bounded("qc_clutter_ref_high_dbz", self.qc_clutter_ref_high_dbz)?
+                .unwrap_or(d.clutter_ref_high_dbz),
+        };
+        if p.min_coverage > p.min_neighbors {
+            return Err(ApiError::bad_request(format!(
+                "qc_min_coverage ({}) must be <= qc_min_neighbors ({})",
+                p.min_coverage, p.min_neighbors
+            )));
+        }
+        if p.clutter_cutoff_low_dbz > p.clutter_cutoff_high_dbz {
+            return Err(ApiError::bad_request(format!(
+                "qc_clutter_cutoff_low_dbz ({}) must be <= qc_clutter_cutoff_high_dbz ({})",
+                p.clutter_cutoff_low_dbz, p.clutter_cutoff_high_dbz
+            )));
+        }
+        if p.clutter_ref_low_dbz > p.clutter_ref_high_dbz {
+            return Err(ApiError::bad_request(format!(
+                "qc_clutter_ref_low_dbz ({}) must be <= qc_clutter_ref_high_dbz ({})",
+                p.clutter_ref_low_dbz, p.clutter_ref_high_dbz
+            )));
+        }
+        Ok(Some(p))
+    }
+}
+
+/// `GET /v1/tdr/qc/params` — every Custom QC tuning knob with its default,
+/// bounds and description, for building tuning controls. Defaults come from
+/// [`qc::QcParams::default`], so this never drifts from what a `qc=true`
+/// request actually runs with.
+async fn get_qc_params() -> Json<Value> {
+    let defaults = serde_json::to_value(qc::QcParams::default()).unwrap();
+    let knobs: Vec<Value> = QC_KNOBS
+        .iter()
+        .map(|k| {
+            let field = k.name.trim_start_matches("qc_");
+            let bounds = if k.kind == "bool" { json!(null) } else { json!({"min": k.min, "max": k.max}) };
+            json!({
+                "name": k.name,
+                "type": k.kind,
+                "default": defaults[field],
+                "bounds": bounds,
+                "description": k.description,
+            })
+        })
+        .collect();
+    Json(json!({ "params": knobs, "disclaimer": QC_DISCLAIMER }))
 }
 
 /// Fetches + decodes the paired `xy_rel` file for the D (cross-consistency)
@@ -112,6 +273,7 @@ pub fn router() -> Router<AppState> {
         .route("/tdr/composite/all", get(get_composite_all))
         .route("/tdr/plane_slice", get(get_plane_slice))
         .route("/tdr/centers", get(get_centers))
+        .route("/tdr/qc/params", get(get_qc_params))
         .route("/tdr/:year", get(list_storms_for_year))
         .route("/tdr/:year/*storm_name", get(list_missions_for_storm))
 }
@@ -256,7 +418,11 @@ struct SweepQuery {
     qc: Option<bool>,
 }
 
-async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -> ApiResult<Json<Value>> {
+async fn get_sweep(
+    State(state): State<AppState>,
+    Query(q): Query<SweepQuery>,
+    Query(tuning): Query<QcTuning>,
+) -> ApiResult<Json<Value>> {
     let is_vert = q.product.starts_with("vert_");
     if !is_vert && !q.product.starts_with("xy") {
         return Err(ApiError::bad_request(format!(
@@ -265,6 +431,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
         )));
     }
     let want_qc = q.qc.unwrap_or(false);
+    let qc_params = tuning.resolve(want_qc)?;
     check_qc_product(want_qc, &q.product)?;
 
     let conn = conn(&state)?;
@@ -308,7 +475,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
             Ok((tdr_nc::read_vert_slice(&nc_path, &field)?, None))
         } else {
             let slice = tdr_nc::read_xy_slice(&nc_path, &field, requested_z)?;
-            Ok((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, requested_z, want_qc)?))
+            Ok((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, requested_z, qc_params)?))
         }
     })
     .await
@@ -316,7 +483,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_slice(&mut slice, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_slice(&mut slice, &q.field, counterpart.as_ref(), wind.as_ref(), &qc_params.unwrap_or_default()))
     } else {
         None
     };
@@ -343,7 +510,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
         "origin_lat": slice.origin_lat,
         "origin_lon": slice.origin_lon,
     });
-    insert_qc_fields(&mut response, qc_report);
+    insert_qc_fields(&mut response, qc_report, qc_params);
     Ok(Json(response))
 }
 
@@ -393,8 +560,13 @@ fn resolve_mission_and_file(
     Ok((mission, file, level))
 }
 
-async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>) -> ApiResult<Json<Value>> {
+async fn get_volume(
+    State(state): State<AppState>,
+    Query(q): Query<VolumeQuery>,
+    Query(tuning): Query<QcTuning>,
+) -> ApiResult<Json<Value>> {
     let want_qc = q.qc.unwrap_or(false);
+    let qc_params = tuning.resolve(want_qc)?;
     let conn = conn(&state)?;
     let (mission, file, level) =
         resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time, want_qc)?;
@@ -415,14 +587,14 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
     let field = q.field.clone();
     let (mut volume, wind) = tokio::task::spawn_blocking(move || {
         let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
-        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, qc_params)?))
     })
     .await
     .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc_params.unwrap_or_default()))
     } else {
         None
     };
@@ -452,7 +624,7 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
         "origin_lat": volume.origin_lat,
         "origin_lon": volume.origin_lon,
     });
-    insert_qc_fields(&mut response, qc_report);
+    insert_qc_fields(&mut response, qc_report, qc_params);
     Ok(Json(response))
 }
 
@@ -517,8 +689,12 @@ struct CompositeQuery {
 ///   reflectivity (the standard composite-reflectivity convention),
 ///   averaged for everything else (wind/vorticity fields, where an extreme
 ///   from one analysis time shouldn't dominate the composite).
-async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
-    build_composite(&state, &q, false).await
+async fn get_composite(
+    State(state): State<AppState>,
+    Query(q): Query<CompositeQuery>,
+    Query(tuning): Query<QcTuning>,
+) -> ApiResult<Json<Value>> {
+    build_composite(&state, &q, &tuning, false).await
 }
 
 /// `GET /v1/tdr/composite/all` — same query and response as
@@ -528,21 +704,31 @@ async fn get_composite(State(state): State<AppState>, Query(q): Query<CompositeQ
 /// been dropped are listed in `detail.analysis_times_unsuitable_included`.
 /// `mode=altitude` is rejected — it only ever uses one analysis time, so the
 /// filter never applies to it.
-async fn get_composite_all(State(state): State<AppState>, Query(q): Query<CompositeQuery>) -> ApiResult<Json<Value>> {
+async fn get_composite_all(
+    State(state): State<AppState>,
+    Query(q): Query<CompositeQuery>,
+    Query(tuning): Query<QcTuning>,
+) -> ApiResult<Json<Value>> {
     if q.mode == "altitude" {
         return Err(ApiError::bad_request(
             "mode=altitude uses a single analysis time, so the acceptability filter never applies — use /v1/tdr/composite."
                 .to_string(),
         ));
     }
-    build_composite(&state, &q, true).await
+    build_composite(&state, &q, &tuning, true).await
 }
 
 /// Shared body of [`get_composite`] / [`get_composite_all`].
 /// `include_unsuitable` keeps analyses whose jobfile marks them not
 /// acceptable for composite (see [`select_composite_files`]).
-async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitable: bool) -> ApiResult<Json<Value>> {
+async fn build_composite(
+    state: &AppState,
+    q: &CompositeQuery,
+    tuning: &QcTuning,
+    include_unsuitable: bool,
+) -> ApiResult<Json<Value>> {
     let want_qc = q.qc.unwrap_or(false);
+    let qc_params = tuning.resolve(want_qc)?;
     let conn = conn(state)?;
     let cache_dir = state.paths.cache_root.join("tdr_nc");
 
@@ -566,7 +752,7 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
             )));
         }
         let analyses = tdr::get_mission_analyses(&conn, &q.mission_id)?;
-        return get_composite_time_volume(mission, level, files, analyses, &cache_dir, q, want_qc, include_unsuitable).await;
+        return get_composite_time_volume(mission, level, files, analyses, &cache_dir, q, qc_params, include_unsuitable).await;
     }
 
     let mut qc_report = qc::QcReport::default();
@@ -584,7 +770,7 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
             let field = q.field.clone();
             let (mut slice, wind) = tokio::task::spawn_blocking(move || {
                 let slice = tdr_nc::read_xy_altitude_composite(&nc_path, &field)?;
-                Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_altitude_composite(&nc_path, &field, want_qc)?))
+                Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_altitude_composite(&nc_path, &field, qc_params)?))
             })
             .await
             .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
@@ -592,7 +778,7 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
             if want_qc {
                 // No D (cross-consistency) check for composites — see
                 // `CompositeQuery::qc`'s doc comment.
-                qc_report = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc::QcParams::default());
+                qc_report = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc_params.unwrap_or_default());
             }
             let origin = slice.origin_lat.zip(slice.origin_lon);
             (mission, level, slice.x, slice.y, slice.data, json!({"analysis_time": analysis_time}), origin)
@@ -637,13 +823,13 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
                 let field = q.field.clone();
                 let (mut slice, wind) = tokio::task::spawn_blocking(move || {
                     let slice = tdr_nc::read_xy_slice(&nc_path, &field, Some(requested_z))?;
-                    Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, Some(requested_z), want_qc)?))
+                    Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, Some(requested_z), qc_params)?))
                 })
                 .await
                 .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
                 .map_err(|e| ApiError::bad_request(e.to_string()))?;
                 if want_qc {
-                    let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc::QcParams::default());
+                    let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc_params.unwrap_or_default());
                     qc_report.merge(r);
                 }
                 let center = analysis_center(slice.origin_lat, slice.origin_lon, analysis.as_ref());
@@ -699,7 +885,7 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
         "zmax": cs.zmax,
         "units": cs.units,
     });
-    insert_qc_fields(&mut response, want_qc.then_some(qc_report));
+    insert_qc_fields(&mut response, want_qc.then_some(qc_report), qc_params);
     Ok(Json(response))
 }
 
@@ -863,9 +1049,10 @@ async fn get_composite_time_volume(
     analyses: Vec<tdr::AnalysisRecord>,
     cache_dir: &std::path::Path,
     q: &CompositeQuery,
-    want_qc: bool,
+    qc_params: Option<qc::QcParams>,
     include_unsuitable: bool,
 ) -> ApiResult<Json<Value>> {
+    let want_qc = qc_params.is_some();
     let (included, mut excluded, unsuitable) = select_composite_files(files, &analyses, &level, include_unsuitable)?;
 
     // Read every included analysis time's whole volume first — need them all
@@ -882,13 +1069,13 @@ async fn get_composite_time_volume(
         let field = q.field.clone();
         let (mut volume, wind) = tokio::task::spawn_blocking(move || {
             let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
-            Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+            Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, qc_params)?))
         })
         .await
         .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if want_qc {
-            let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, wind.as_ref(), &qc::QcParams::default());
+            let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, wind.as_ref(), &qc_params.unwrap_or_default());
             qc_report.merge(r);
         }
         let center = analysis_center(volume.origin_lat, volume.origin_lon, analysis.as_ref());
@@ -964,7 +1151,7 @@ async fn get_composite_time_volume(
         "zmax": cs.zmax,
         "units": cs.units,
     });
-    insert_qc_fields(&mut response, want_qc.then_some(qc_report));
+    insert_qc_fields(&mut response, want_qc.then_some(qc_report), qc_params);
     Ok(Json(response))
 }
 
@@ -1005,8 +1192,13 @@ struct PlaneSliceQuery {
 /// ([`noaa_recon_core::sweep::plane_slice`]), so the cross-section is
 /// smooth regardless of the line's angle through the grid — not just
 /// snapped to the nearest existing column.
-async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSliceQuery>) -> ApiResult<Json<Value>> {
+async fn get_plane_slice(
+    State(state): State<AppState>,
+    Query(q): Query<PlaneSliceQuery>,
+    Query(tuning): Query<QcTuning>,
+) -> ApiResult<Json<Value>> {
     let want_qc = q.qc.unwrap_or(false);
+    let qc_params = tuning.resolve(want_qc)?;
     let conn = conn(&state)?;
     let (mission, file, level) =
         resolve_mission_and_file(&conn, &q.mission_id, &q.level, &q.product, &q.analysis_time, want_qc)?;
@@ -1027,14 +1219,14 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
     let field = q.field.clone();
     let (mut volume, wind) = tokio::task::spawn_blocking(move || {
         let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
-        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, qc_params)?))
     })
     .await
     .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc_params.unwrap_or_default()))
     } else {
         None
     };
@@ -1074,7 +1266,7 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
         "origin_lat": volume.origin_lat,
         "origin_lon": volume.origin_lon,
     });
-    insert_qc_fields(&mut response, qc_report);
+    insert_qc_fields(&mut response, qc_report, qc_params);
     Ok(Json(response))
 }
 
