@@ -1000,9 +1000,10 @@ edges, storm-relative-transform errors) that no raw-radial QC could ever
 see, since they only exist after the variational solve. It cannot correct
 anything upstream of that.
 
-Five checks, each a robust (median/MAD-based, not a fixed physical
-threshold) statistical-outlier test against a cell's own local context, so
-it self-calibrates per mission/field:
+Six checks. The first five are robust (median/MAD-based, not a fixed
+physical threshold) statistical-outlier tests against a cell's own local
+context, so they self-calibrate per mission/field. The sixth, wind clutter,
+is a physical-threshold check for one specific known artifact:
 
 | Check | What it flags |
 |---|---|
@@ -1011,6 +1012,7 @@ it self-calibrates per mission/field:
 | Azimuthal-ring consistency | A cell whose value departs from its own radius-annulus's typical value (binned around the grid origin, which is already storm-centered by construction). |
 | Cross-consistency | *Opportunistic* — only runs when the paired `xy_rel` (or `xy`) file exists for the same mission/level/analysis_time. Flags cells that disagree with their counterpart beyond what the field's own expected relationship allows (near-zero for `reflectivity`/`w`/`vort`; a constant storm-motion offset for `u`/`v`; skipped for `radial_wind`/`tangential_wind`, different projections by definition). |
 | Low-coverage edge trim | A cell with too few valid neighbors to be trustworthy, regardless of its value — targets the exact weakness Gamache's automated-QC report calls out: it over-trims relative to manual QC, worst near the inner eyewall edge. |
+| Wind clutter | `field=reflectivity` only. Strong winds produce phantom weak returns, usually 0-2 dBZ and almost never above 5 dBZ. They come in coherent patches, so the outlier tests above can't see them. This check masks any reflectivity cell at or below a dBZ cutoff where the same file's wind speed at that cell is at least 25 m/s. The cutoff scales with the storm: take the median of the plane's genuine echoes (cells above 5 dBZ, so the phantoms don't drag it down); a median of 15 dBZ or less gives a 2 dBZ cutoff, 30 dBZ or more gives 5 dBZ, linear in between. Volumes get a cutoff per CAPPI level. Runs before the other checks, so they never see the phantoms. Wind speed comes from the file's `WIND_SPEED` variable, or `sqrt(U² + V²)` on files without it. |
 
 A flagged cell is set to `null` — never interpolated or fabricated, same
 convention as an ordinary `missing_value`-masked cell.
@@ -1023,7 +1025,8 @@ Behavior when `qc=true`:
 - The response gets three extra fields: `"qc_applied": true`,
   `"qc_summary": {cells_examined, cells_flagged_despike,
   cells_flagged_vertical, cells_flagged_azimuthal,
-  cells_flagged_cross_consistency, cells_flagged_edge}`, and a
+  cells_flagged_cross_consistency, cells_flagged_edge,
+  cells_flagged_wind_clutter}`, and a
   `"qc_disclaimer"` string carrying the same caveat as this section — so
   any API consumer sees it, not just the dashboard's own banner. All three
   are omitted entirely when `qc` isn't set.
@@ -1047,7 +1050,8 @@ curl "https://joshmurdock.net/api/v1/tdr/sweep?mission_id=20240630I1&product=xy&
     "cells_flagged_vertical": 0,
     "cells_flagged_azimuthal": 5,
     "cells_flagged_cross_consistency": 3,
-    "cells_flagged_edge": 214
+    "cells_flagged_edge": 214,
+    "cells_flagged_wind_clutter": 380
   },
   "qc_disclaimer": "Custom QC (Experimental): ..."
 }

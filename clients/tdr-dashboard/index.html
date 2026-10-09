@@ -590,8 +590,8 @@ real-time Level 1b <b>xy</b> grid, offered regardless of whether Level 2 is also
 available for this mission (Level 2 is already NOAA/HRD's own QC'd reanalysis — Custom
 QC exists to help before that's ready). It flags and masks statistical outliers in the
 already-synthesized grid — spatial spikes, vertical discontinuities, azimuthal
-inconsistencies, low-coverage edges, and (when a storm-relative counterpart file exists)
-cross-grid mismatches — using the same fixed <b>xy</b> product under the hood. It is
+inconsistencies, low-coverage edges, weak phantom reflectivity (&lt;5 dBZ) under strong
+winds, and (when a storm-relative counterpart file exists) cross-grid mismatches — using the same fixed <b>xy</b> product under the hood. It is
 <b>not</b> an official NOAA/NHC/HRD product and has not been validated against Level 2 —
 see the banner shown when it's selected before relying on it.</p>
 <p><b>CAPPI altitude</b> — picks one horizontal slice at a specific altitude out of the
@@ -672,7 +672,8 @@ function updateQcDisclaimer() {
     + `<div style="color:var(--text-muted);">A locally-implemented, automated QC pass applied on top of `
     + `NOAA/HRD's real-time Level 1b grid. Not an official NOAA/NHC/HRD product, and not reviewed or `
     + `endorsed by them. Flags and masks statistical outliers in the finished grid (spatial spikes, `
-    + `vertical discontinuities, azimuthal inconsistencies, low-coverage edges, and — when a `
+    + `vertical discontinuities, azimuthal inconsistencies, low-coverage edges, weak phantom `
+    + `reflectivity under strong winds, and — when a `
     + `storm-relative counterpart file exists — cross-grid mismatches) but cannot correct upstream radar `
     + `or synthesis errors, and hasn't been validated against Level 2. Treat as a supplementary `
     + `diagnostic, not an authoritative wind analysis — prefer Level 2 once available, and consult NHC `

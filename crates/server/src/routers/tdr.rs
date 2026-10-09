@@ -34,8 +34,9 @@ fn check_qc_product(qc: bool, product: &str) -> ApiResult<()> {
 /// `clients/tdr-dashboard/index.html`'s disclaimer copy, which this mirrors).
 const QC_DISCLAIMER: &str = "Custom QC (Experimental): a locally-implemented, automated QC pass on top of \
 NOAA/HRD's real-time Level 1b grid. Not an official NOAA/NHC/HRD product, and not reviewed or endorsed by \
-them. Flags and masks statistical outliers in the finished grid but cannot correct upstream radar or \
-synthesis errors, and hasn't been validated against Level 2. Treat as a supplementary diagnostic.";
+them. Flags and masks statistical outliers in the finished grid, plus weak phantom reflectivity under \
+strong winds, but cannot correct upstream radar or synthesis errors, and hasn't been validated against \
+Level 2. Treat as a supplementary diagnostic.";
 
 /// Inserts the QC fields into an already-built sweep/volume/composite
 /// response object when a QC pass actually ran.
@@ -302,11 +303,12 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
 
     let field = q.field.clone();
     let requested_z = q.z;
-    let mut slice = tokio::task::spawn_blocking(move || {
+    let (mut slice, wind) = tokio::task::spawn_blocking(move || -> anyhow::Result<(tdr_nc::FieldSlice, Option<tdr_nc::FieldSlice>)> {
         if is_vert {
-            tdr_nc::read_vert_slice(&nc_path, &field)
+            Ok((tdr_nc::read_vert_slice(&nc_path, &field)?, None))
         } else {
-            tdr_nc::read_xy_slice(&nc_path, &field, requested_z)
+            let slice = tdr_nc::read_xy_slice(&nc_path, &field, requested_z)?;
+            Ok((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, requested_z, want_qc)?))
         }
     })
     .await
@@ -314,7 +316,7 @@ async fn get_sweep(State(state): State<AppState>, Query(q): Query<SweepQuery>) -
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_slice(&mut slice, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_slice(&mut slice, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
     } else {
         None
     };
@@ -411,13 +413,16 @@ async fn get_volume(State(state): State<AppState>, Query(q): Query<VolumeQuery>)
     };
 
     let field = q.field.clone();
-    let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
-        .await
-        .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (mut volume, wind) = tokio::task::spawn_blocking(move || {
+        let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
+        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
     } else {
         None
     };
@@ -577,14 +582,17 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
                 .await
                 .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
             let field = q.field.clone();
-            let mut slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_altitude_composite(&nc_path, &field))
-                .await
-                .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let (mut slice, wind) = tokio::task::spawn_blocking(move || {
+                let slice = tdr_nc::read_xy_altitude_composite(&nc_path, &field)?;
+                Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_altitude_composite(&nc_path, &field, want_qc)?))
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
             if want_qc {
                 // No D (cross-consistency) check for composites — see
                 // `CompositeQuery::qc`'s doc comment.
-                qc_report = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, &qc::QcParams::default());
+                qc_report = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc::QcParams::default());
             }
             let origin = slice.origin_lat.zip(slice.origin_lon);
             (mission, level, slice.x, slice.y, slice.data, json!({"analysis_time": analysis_time}), origin)
@@ -627,12 +635,15 @@ async fn build_composite(state: &AppState, q: &CompositeQuery, include_unsuitabl
                     .await
                     .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
                 let field = q.field.clone();
-                let mut slice = tokio::task::spawn_blocking(move || tdr_nc::read_xy_slice(&nc_path, &field, Some(requested_z)))
-                    .await
-                    .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                let (mut slice, wind) = tokio::task::spawn_blocking(move || {
+                    let slice = tdr_nc::read_xy_slice(&nc_path, &field, Some(requested_z))?;
+                    Ok::<_, anyhow::Error>((slice, tdr_nc::read_qc_wind_slice(&nc_path, &field, Some(requested_z), want_qc)?))
+                })
+                .await
+                .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
                 if want_qc {
-                    let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, &qc::QcParams::default());
+                    let r = tdr_nc::apply_qc_to_slice(&mut slice, &q.field, None, wind.as_ref(), &qc::QcParams::default());
                     qc_report.merge(r);
                 }
                 let center = analysis_center(slice.origin_lat, slice.origin_lon, analysis.as_ref());
@@ -869,12 +880,15 @@ async fn get_composite_time_volume(
             .await
             .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch/decompress source file: {e}")))?;
         let field = q.field.clone();
-        let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
-            .await
-            .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let (mut volume, wind) = tokio::task::spawn_blocking(move || {
+            let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
+            Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("composite task panicked: {e}")))?
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if want_qc {
-            let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, &qc::QcParams::default());
+            let r = tdr_nc::apply_qc_to_volume(&mut volume, &q.field, None, wind.as_ref(), &qc::QcParams::default());
             qc_report.merge(r);
         }
         let center = analysis_center(volume.origin_lat, volume.origin_lon, analysis.as_ref());
@@ -1011,13 +1025,16 @@ async fn get_plane_slice(State(state): State<AppState>, Query(q): Query<PlaneSli
     };
 
     let field = q.field.clone();
-    let mut volume = tokio::task::spawn_blocking(move || tdr_nc::read_xy_volume(&nc_path, &field))
-        .await
-        .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (mut volume, wind) = tokio::task::spawn_blocking(move || {
+        let volume = tdr_nc::read_xy_volume(&nc_path, &field)?;
+        Ok::<_, anyhow::Error>((volume, tdr_nc::read_qc_wind_volume(&nc_path, &field, want_qc)?))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("volume read task panicked: {e}")))?
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let qc_report = if want_qc {
-        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), &qc::QcParams::default()))
+        Some(tdr_nc::apply_qc_to_volume(&mut volume, &q.field, counterpart.as_ref(), wind.as_ref(), &qc::QcParams::default()))
     } else {
         None
     };

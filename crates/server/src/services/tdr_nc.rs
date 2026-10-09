@@ -146,11 +146,37 @@ fn read_xy_volume_raw(path: &Path, field: &str) -> anyhow::Result<XyVolumeRaw> {
         .ok_or_else(|| anyhow::anyhow!("missing 'level' variable"))?
         .get_values(..)?;
 
-    let field_var = ds.variable(var_name).ok_or_else(|| anyhow::anyhow!("missing '{var_name}' variable"))?;
-    let missing = missing_value(&field_var);
-    let flat: Vec<f32> = field_var.get_values(..)?;
+    let (flat, missing) = match ds.variable(var_name) {
+        Some(field_var) => (field_var.get_values(..)?, missing_value(&field_var)),
+        // Custom QC's wind-clutter check needs wind speed from every xy
+        // file, so derive it from U/V on any file that doesn't ship it.
+        None if field == "wind_speed" => wind_speed_from_uv(&ds)?,
+        None => anyhow::bail!("missing '{var_name}' variable"),
+    };
 
     Ok(XyVolumeRaw { x, y, levels, flat, missing, origin_lat, origin_lon, storm_name_attr: storm_name_attr(&ds) })
+}
+
+/// `sqrt(U² + V²)` cell-for-cell, missing wherever either component is —
+/// reported with U's own missing value so the usual masking applies.
+fn wind_speed_from_uv(ds: &netcdf::File) -> anyhow::Result<(Vec<f32>, f32)> {
+    let u_var = ds.variable("U").ok_or_else(|| anyhow::anyhow!("missing 'WIND_SPEED' variable, and no 'U' to derive it from"))?;
+    let v_var = ds.variable("V").ok_or_else(|| anyhow::anyhow!("missing 'WIND_SPEED' variable, and no 'V' to derive it from"))?;
+    let (u_missing, v_missing) = (missing_value(&u_var), missing_value(&v_var));
+    let u: Vec<f32> = u_var.get_values(..)?;
+    let v: Vec<f32> = v_var.get_values(..)?;
+    let flat = u
+        .iter()
+        .zip(&v)
+        .map(|(&u, &v)| {
+            if sweep::is_missing(u, u_missing) || sweep::is_missing(v, v_missing) {
+                u_missing
+            } else {
+                u.hypot(v)
+            }
+        })
+        .collect();
+    Ok((flat, u_missing))
 }
 
 /// Reads one field's *entire* volume (every CAPPI level, not just one) from
@@ -259,6 +285,10 @@ fn storm_name_attr(ds: &netcdf::File) -> Option<String> {
 /// `routers/tdr.rs`). `counterpart` is the paired `xy_rel`/`xy` file's
 /// already-decoded data for the same field, if the router found and fetched
 /// one; the D (cross-consistency) check only runs when it's `Some`.
+/// `wind_speed` is the same file's wind speed on the same grid (see
+/// [`read_qc_wind_slice`]); the F (wind-clutter) check runs first when it's
+/// `Some` and `field` is reflectivity, so the statistical checks never see
+/// the phantom echoes it removes.
 ///
 /// xy-specific (needs `x`/`y` grid coords for the azimuthal-ring check) — a
 /// `vert_*` profile goes through `noaa_recon_core::qc::qc_plane_vert`
@@ -267,26 +297,46 @@ pub fn apply_qc_to_slice(
     slice: &mut FieldSlice,
     field: &str,
     counterpart: Option<&FieldSlice>,
+    wind_speed: Option<&FieldSlice>,
     params: &qc::QcParams,
 ) -> qc::QcReport {
+    let examined = qc::count_valid(&slice.data);
+    let wind_clutter = match wind_speed {
+        Some(w) if qc::wind_clutter_applies(field) => qc::qc_wind_clutter(&mut slice.data, &w.data, params),
+        _ => 0,
+    };
     let mut report = qc::qc_plane_xy(&mut slice.data, &slice.x, &slice.y, params);
+    report.cells_examined = examined;
+    report.cells_flagged_wind_clutter = wind_clutter;
     if let Some(counterpart) = counterpart {
         report.cells_flagged_cross_consistency = qc::qc_cross_consistency(&mut slice.data, &counterpart.data, field, params);
     }
     report
 }
 
-/// Same as [`apply_qc_to_slice`] for a full `xy`/`xy_rel` volume — despike +
-/// azimuthal-ring + edge trim per level, then vertical continuity across
-/// levels, then (if a counterpart volume was fetched) cross-consistency per
-/// level against the matching level in `counterpart`.
+/// Same as [`apply_qc_to_slice`] for a full `xy`/`xy_rel` volume — wind
+/// clutter per level (each level gets its own dBZ cutoff, since reflectivity
+/// falls off with height), then despike + azimuthal-ring + edge trim per
+/// level, then vertical continuity across levels, then (if a counterpart
+/// volume was fetched) cross-consistency per level against the matching
+/// level in `counterpart`.
 pub fn apply_qc_to_volume(
     volume: &mut FieldVolume,
     field: &str,
     counterpart: Option<&FieldVolume>,
+    wind_speed: Option<&FieldVolume>,
     params: &qc::QcParams,
 ) -> qc::QcReport {
+    let examined: usize = volume.data.iter().map(|level| qc::count_valid(level)).sum();
+    let mut wind_clutter = 0;
+    if let Some(w) = wind_speed.filter(|_| qc::wind_clutter_applies(field)) {
+        for (level, wind_level) in volume.data.iter_mut().zip(w.data.iter()) {
+            wind_clutter += qc::qc_wind_clutter(level, wind_level, params);
+        }
+    }
     let mut report = qc::qc_volume(&mut volume.data, &volume.x, &volume.y, params);
+    report.cells_examined = examined;
+    report.cells_flagged_wind_clutter = wind_clutter;
     if let Some(counterpart) = counterpart {
         let mut cross_flagged = 0;
         for (level, counterpart_level) in volume.data.iter_mut().zip(counterpart.data.iter()) {
@@ -295,6 +345,40 @@ pub fn apply_qc_to_volume(
         report.cells_flagged_cross_consistency = cross_flagged;
     }
     report
+}
+
+/// The wind-speed slice Custom QC's wind-clutter check pairs with a
+/// `field` slice read at `requested_z_km` from the same file — `None` when
+/// QC is off or the check doesn't apply to `field`, so nothing extra is
+/// decoded then.
+pub fn read_qc_wind_slice(
+    path: &Path,
+    field: &str,
+    requested_z_km: Option<f32>,
+    want_qc: bool,
+) -> anyhow::Result<Option<FieldSlice>> {
+    if !want_qc || !qc::wind_clutter_applies(field) {
+        return Ok(None);
+    }
+    read_xy_slice(path, "wind_speed", requested_z_km).map(Some)
+}
+
+/// Same as [`read_qc_wind_slice`] for a full volume.
+pub fn read_qc_wind_volume(path: &Path, field: &str, want_qc: bool) -> anyhow::Result<Option<FieldVolume>> {
+    if !want_qc || !qc::wind_clutter_applies(field) {
+        return Ok(None);
+    }
+    read_xy_volume(path, "wind_speed").map(Some)
+}
+
+/// Same as [`read_qc_wind_slice`] for a `mode=altitude` composite: the
+/// column-max wind speed, so a column whose strongest wind is clutter-strength
+/// pairs with that column's max reflectivity.
+pub fn read_qc_wind_altitude_composite(path: &Path, field: &str, want_qc: bool) -> anyhow::Result<Option<FieldSlice>> {
+    if !want_qc || !qc::wind_clutter_applies(field) {
+        return Ok(None);
+    }
+    read_xy_altitude_composite(path, "wind_speed").map(Some)
 }
 
 /// Reads one field from an `xy`/`xy_rel` volume file and slices out the

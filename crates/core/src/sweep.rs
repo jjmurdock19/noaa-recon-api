@@ -26,7 +26,7 @@
 /// dataset uses a `missing_value` attribute (commonly `-999.9`), not
 /// `_FillValue`, and the same sentinel convention shows up throughout its
 /// global attributes (`AZBIEL`, `THRESH`, etc. all default to -999).
-fn is_missing(v: f32, missing: f32) -> bool {
+pub fn is_missing(v: f32, missing: f32) -> bool {
     v.is_nan() || (missing.is_finite() && (v - missing).abs() < 0.01)
 }
 

@@ -14,11 +14,14 @@
 //! errors) that no raw-radial QC could ever see, since they only exist after
 //! the variational solve. It cannot correct anything upstream.
 //!
-//! Every check here is a robust (median/MAD-based) statistical outlier test
+//! Checks A-E are robust (median/MAD-based) statistical outlier tests
 //! against the cell's own local context — never a fixed physical threshold —
-//! so it self-calibrates per mission/field instead of assuming one hardcoded
+//! so they self-calibrate per mission/field instead of assuming one hardcoded
 //! number is right for a category-1 depression and a category-5 eyewall
-//! alike. A flagged cell is set to `None`, never interpolated or fabricated,
+//! alike. Check F ([`qc_wind_clutter`]) is the one physical-threshold check:
+//! phantom weak echoes under strong winds sit at a known, narrow dBZ band
+//! that a local-outlier test can't see (they come in coherent patches, so
+//! they *are* their own local context). A flagged cell is set to `None`, never interpolated or fabricated,
 //! matching the missing-value convention already used throughout
 //! `services/tdr_nc.rs`.
 //!
@@ -65,11 +68,40 @@ pub struct QcParams {
     /// Azimuthal-ring annulus width in km (default 2.0 — matches the
     /// existing radius-of-max-wind binning convention in `sweep.rs`).
     pub ring_width_km: f32,
+    /// F (wind clutter): wind speed (m/s) at or above which a weak echo in
+    /// the same cell is treated as a phantom return. Default 25 m/s (~50 kt).
+    pub clutter_min_wind_ms: f32,
+    /// F: the dBZ cutoff for a weak storm — used when the plane's genuine
+    /// echoes have a median at or below `clutter_ref_low_dbz`. Default 2.0,
+    /// the top of the 0-2 dBZ band the phantoms usually sit in.
+    pub clutter_cutoff_low_dbz: f32,
+    /// F: the dBZ cutoff for a strong storm — used when the plane's genuine
+    /// echoes have a median at or above `clutter_ref_high_dbz`. Default 5.0,
+    /// the observed upper bound of the phantoms. Also the floor a cell must
+    /// exceed to count as a "genuine echo" in that median.
+    pub clutter_cutoff_high_dbz: f32,
+    /// F: median genuine-echo reflectivity (dBZ) at or below which the low
+    /// cutoff applies. Default 15.
+    pub clutter_ref_low_dbz: f32,
+    /// F: median genuine-echo reflectivity (dBZ) at or above which the high
+    /// cutoff applies; linear in between. Default 30.
+    pub clutter_ref_high_dbz: f32,
 }
 
 impl Default for QcParams {
     fn default() -> Self {
-        Self { mad_k: 3.5, window: 2, min_neighbors: 8, min_coverage: 4, ring_width_km: 2.0 }
+        Self {
+            mad_k: 3.5,
+            window: 2,
+            min_neighbors: 8,
+            min_coverage: 4,
+            ring_width_km: 2.0,
+            clutter_min_wind_ms: 25.0,
+            clutter_cutoff_low_dbz: 2.0,
+            clutter_cutoff_high_dbz: 5.0,
+            clutter_ref_low_dbz: 15.0,
+            clutter_ref_high_dbz: 30.0,
+        }
     }
 }
 
@@ -85,6 +117,7 @@ pub struct QcReport {
     pub cells_flagged_azimuthal: usize,
     pub cells_flagged_cross_consistency: usize,
     pub cells_flagged_edge: usize,
+    pub cells_flagged_wind_clutter: usize,
 }
 
 impl QcReport {
@@ -97,10 +130,11 @@ impl QcReport {
         self.cells_flagged_azimuthal += other.cells_flagged_azimuthal;
         self.cells_flagged_cross_consistency += other.cells_flagged_cross_consistency;
         self.cells_flagged_edge += other.cells_flagged_edge;
+        self.cells_flagged_wind_clutter += other.cells_flagged_wind_clutter;
     }
 }
 
-fn count_valid(data: &[Vec<Option<f32>>]) -> usize {
+pub fn count_valid(data: &[Vec<Option<f32>>]) -> usize {
     data.iter().flatten().filter(|v| v.is_some()).count()
 }
 
@@ -431,6 +465,64 @@ pub fn qc_cross_consistency(
     flagged
 }
 
+// ── F: wind-driven weak-echo clutter (reflectivity only) ─────────────────
+// Strong winds produce phantom returns, typically 0-2 dBZ and almost never
+// above 5 dBZ. They arrive as spatially coherent patches, so the MAD tests
+// above treat them as normal local context. This check instead pairs each
+// reflectivity cell with the wind speed at the same cell: weak echo + strong
+// wind = phantom. How weak counts as "weak" scales with the storm — a weak
+// system's real precipitation can legitimately sit near 5 dBZ, while in a
+// strong system's high-wind region it's almost certainly clutter.
+
+/// Whether check F applies to `field` — only reflectivity has phantom weak
+/// echoes to remove. Callers use it to skip reading wind speed otherwise.
+pub fn wind_clutter_applies(field: &str) -> bool {
+    field == "reflectivity"
+}
+
+/// The dBZ cutoff for one reflectivity plane: the median of its genuine
+/// echoes (cells above `clutter_cutoff_high_dbz`, so the phantoms being
+/// hunted can't drag it down) mapped linearly from `clutter_ref_low_dbz` ->
+/// `clutter_cutoff_low_dbz` to `clutter_ref_high_dbz` ->
+/// `clutter_cutoff_high_dbz`, clamped at both ends. Falls back to the low
+/// cutoff when there are fewer than `min_neighbors` genuine echoes to take a
+/// median of.
+pub fn wind_clutter_cutoff_dbz(reflectivity: &[Vec<Option<f32>>], params: &QcParams) -> f32 {
+    let mut echoes: Vec<f32> =
+        reflectivity.iter().flatten().filter_map(|v| *v).filter(|&v| v > params.clutter_cutoff_high_dbz).collect();
+    if echoes.len() < params.min_neighbors {
+        return params.clutter_cutoff_low_dbz;
+    }
+    let med = median_sorted(&mut echoes);
+    let span = params.clutter_ref_high_dbz - params.clutter_ref_low_dbz;
+    let t = if span > f32::EPSILON { ((med - params.clutter_ref_low_dbz) / span).clamp(0.0, 1.0) } else { 1.0 };
+    params.clutter_cutoff_low_dbz + t * (params.clutter_cutoff_high_dbz - params.clutter_cutoff_low_dbz)
+}
+
+/// Masks reflectivity cells at or below [`wind_clutter_cutoff_dbz`] where
+/// `wind_speed` at the same cell is at least `clutter_min_wind_ms`.
+/// `wind_speed` must be the same grid as `reflectivity` (same file, same
+/// level); a cell with no wind on record is left alone (no evidence either
+/// way), and a shape mismatch returns 0 rather than guessing an alignment.
+pub fn qc_wind_clutter(reflectivity: &mut [Vec<Option<f32>>], wind_speed: &[Vec<Option<f32>>], params: &QcParams) -> usize {
+    if reflectivity.len() != wind_speed.len() || reflectivity.iter().zip(wind_speed).any(|(r, w)| r.len() != w.len()) {
+        return 0;
+    }
+    let cutoff = wind_clutter_cutoff_dbz(reflectivity, params);
+    let mut flagged = 0;
+    for (row, wind_row) in reflectivity.iter_mut().zip(wind_speed) {
+        for (cell, wind) in row.iter_mut().zip(wind_row) {
+            if let (Some(dbz), Some(ws)) = (*cell, *wind) {
+                if dbz <= cutoff && ws >= params.clutter_min_wind_ms {
+                    *cell = None;
+                    flagged += 1;
+                }
+            }
+        }
+    }
+    flagged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +678,77 @@ mod tests {
         let report = qc_plane_vert(&mut data, &QcParams::default());
         assert_eq!(report.cells_flagged_azimuthal, 0);
         assert_eq!(data[4][4], None, "despiking still applies to vert profiles");
+    }
+
+    /// 10x10 reflectivity plane of `base` dBZ plus a matching wind plane of
+    /// `wind` m/s.
+    fn refl_and_wind(base: f32, wind: f32) -> (Vec<Vec<Option<f32>>>, Vec<Vec<Option<f32>>>) {
+        (vec![vec![Some(base); 10]; 10], vec![vec![Some(wind); 10]; 10])
+    }
+
+    #[test]
+    fn wind_clutter_cutoff_scales_with_storm_strength() {
+        let p = QcParams::default();
+        let (weak, _) = refl_and_wind(12.0, 0.0);
+        let (mid, _) = refl_and_wind(22.5, 0.0);
+        let (strong, _) = refl_and_wind(40.0, 0.0);
+        assert_eq!(wind_clutter_cutoff_dbz(&weak, &p), 2.0);
+        assert!((wind_clutter_cutoff_dbz(&mid, &p) - 3.5).abs() < 1e-4);
+        assert_eq!(wind_clutter_cutoff_dbz(&strong, &p), 5.0);
+        // No genuine echoes at all -> low cutoff.
+        let (empty, _) = refl_and_wind(1.0, 0.0);
+        assert_eq!(wind_clutter_cutoff_dbz(&empty, &p), 2.0);
+    }
+
+    #[test]
+    fn wind_clutter_cutoff_ignores_the_phantoms_themselves() {
+        // Half the plane is 0-dBZ phantom; the cutoff should still read the
+        // strong storm from the other half rather than a diluted median.
+        let p = QcParams::default();
+        let (mut refl, _) = refl_and_wind(35.0, 0.0);
+        for row in refl.iter_mut().take(5) {
+            row.fill(Some(0.5));
+        }
+        assert_eq!(wind_clutter_cutoff_dbz(&refl, &p), 5.0);
+    }
+
+    #[test]
+    fn wind_clutter_masks_weak_echo_only_under_strong_wind() {
+        let p = QcParams::default();
+        let (mut refl, mut wind) = refl_and_wind(35.0, 10.0);
+        refl[2][2] = Some(1.0); // weak, strong wind -> phantom
+        wind[2][2] = Some(40.0);
+        refl[3][3] = Some(1.0); // weak, light wind -> kept
+        refl[4][4] = Some(30.0); // strong wind but real echo -> kept
+        wind[4][4] = Some(40.0);
+        refl[5][5] = Some(1.0); // weak, no wind on record -> kept
+        wind[5][5] = None;
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &p), 1);
+        assert_eq!(refl[2][2], None);
+        assert_eq!(refl[3][3], Some(1.0));
+        assert_eq!(refl[4][4], Some(30.0));
+        assert_eq!(refl[5][5], Some(1.0));
+    }
+
+    #[test]
+    fn wind_clutter_keeps_4dbz_in_a_weak_storm_but_not_a_strong_one() {
+        let p = QcParams::default();
+        let (mut weak, wind) = refl_and_wind(12.0, 40.0);
+        weak[0][0] = Some(4.0);
+        qc_wind_clutter(&mut weak, &wind, &p);
+        assert_eq!(weak[0][0], Some(4.0)); // cutoff 2 dBZ
+
+        let (mut strong, wind) = refl_and_wind(35.0, 40.0);
+        strong[0][0] = Some(4.0);
+        qc_wind_clutter(&mut strong, &wind, &p);
+        assert_eq!(strong[0][0], None); // cutoff 5 dBZ
+    }
+
+    #[test]
+    fn wind_clutter_skips_mismatched_grids() {
+        let p = QcParams::default();
+        let (mut refl, _) = refl_and_wind(1.0, 0.0);
+        let wind = vec![vec![Some(40.0); 9]; 10];
+        assert_eq!(qc_wind_clutter(&mut refl, &wind, &p), 0);
     }
 }
